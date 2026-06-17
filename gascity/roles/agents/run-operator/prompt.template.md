@@ -12,11 +12,11 @@ ready beads, and you execute the ready bead claimed by this session.
 
 ## Startup Claim Protocol
 
-`gc hook` is the only permitted discovery source for routed workflow work. Do
-not run broad `bd ready`, `bd list`, root-bead searches, metadata searches,
-mail inspection, session-log inspection, or repository context gathering to
-find a bead. Never claim a bead id unless it came from the immediately
-preceding `gc hook` result in this claim block.
+`gc hook --claim --json` is the only permitted discovery source for routed
+workflow work. Do not run broad `bd ready`, `bd list`, root-bead searches,
+metadata searches, mail inspection, session-log inspection, or repository
+context gathering to find a bead. Never work a bead id unless it came from the
+immediately preceding `gc hook --claim --json` result in this claim block.
 
 Your immediate first action must be to run the exact claim command below as a
 single Bash command. Do not rewrite it, compress it into an `&&` chain, or
@@ -31,8 +31,8 @@ claim race internally; wait for it to either claim a bead or drain on no work.
 bash <<'GC_CLAIM'
 set +e
 
-EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-}}"
-EXPECTED_ROUTE="${GC_TEMPLATE:-}"
+EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
+EXPECTED_ROUTE="${GC_TEMPLATE:-${GC_AGENT:-}}"
 
 if [ -z "$EXPECTED_ASSIGNEE" ]; then
   echo "CONFIG_REJECTED missing expected assignee"
@@ -79,53 +79,74 @@ print(value if isinstance(value, str) else str(value))
 
 while true; do
   WORK_ID=""
-  WORK_JSON=""
-  for _gc_hook_try in 1 2 3 4; do
-    WORK_JSON="$(gc hook 2>/dev/null)"
-    WORK_ID="$(printf '%s' "$WORK_JSON" | json_pick id)"
-    if [ -n "$WORK_ID" ]; then
-      break
-    fi
-    if [ "$_gc_hook_try" != "4" ]; then
-      sleep 5
-    fi
-  done
+  CLAIM_JSON=""
+  CLAIM_ERR="$(mktemp)"
+  CLAIM_JSON="$(gc hook --claim --json 2>"$CLAIM_ERR")"
+  CLAIM_CODE=$?
+  CLAIM_ERR_TEXT="$(sed -n '1p' "$CLAIM_ERR")"
+  rm -f "$CLAIM_ERR"
 
-  if [ -z "$WORK_ID" ]; then
+  CLAIM_ACTION="$(printf '%s' "$CLAIM_JSON" | json_pick action)"
+  WORK_ID="$(printf '%s' "$CLAIM_JSON" | json_pick bead_id)"
+  CLAIM_ASSIGNEE="$(printf '%s' "$CLAIM_JSON" | json_pick assignee)"
+  CLAIM_ROUTE="$(printf '%s' "$CLAIM_JSON" | json_pick route)"
+
+  if [ "$CLAIM_ACTION" = "drain" ]; then
     echo "NO_ROUTED_WORK"
     gc runtime drain-ack
     exit 0
   fi
 
-  CLAIM_ERR="$(mktemp)"
-  if ! CLAIM_JSON="$(BEADS_ACTOR="$EXPECTED_ASSIGNEE" bd update "$WORK_ID" --claim --json 2>"$CLAIM_ERR")"; then
-    CLAIM_ERR_TEXT="$(sed -n '1p' "$CLAIM_ERR")"
-    rm -f "$CLAIM_ERR"
+  if [ "$CLAIM_CODE" -ne 0 ] || [ "$CLAIM_ACTION" != "work" ] || [ -z "$WORK_ID" ]; then
     if [ -n "$CLAIM_ERR_TEXT" ]; then
-      echo "CLAIM_REJECTED claim command failed for $WORK_ID: $CLAIM_ERR_TEXT"
+      echo "CLAIM_REJECTED gc hook --claim failed: $CLAIM_ERR_TEXT"
     else
-      echo "CLAIM_REJECTED claim command failed for $WORK_ID"
+      echo "CLAIM_REJECTED unexpected gc hook --claim result"
     fi
     sleep 2
     continue
   fi
-  rm -f "$CLAIM_ERR"
 
-  CLAIM_ID="$(printf '%s' "$CLAIM_JSON" | json_pick id)"
-  CLAIM_STATUS="$(printf '%s' "$CLAIM_JSON" | json_pick status)"
-  CLAIM_ASSIGNEE="$(printf '%s' "$CLAIM_JSON" | json_pick assignee)"
-  CLAIM_ROUTE="$(printf '%s' "$CLAIM_JSON" | json_pick metadata:gc.routed_to)"
-  if [ -z "$CLAIM_ROUTE" ]; then
-    CLAIM_ROUTE="$(printf '%s' "$CLAIM_JSON" | json_pick metadata:gc.run_target)"
+  SHOW_ERR="$(mktemp)"
+  if ! SHOW_JSON="$(bd show "$WORK_ID" --json 2>"$SHOW_ERR")"; then
+    SHOW_ERR_TEXT="$(sed -n '1p' "$SHOW_ERR")"
+    rm -f "$SHOW_ERR"
+    if [ -n "$SHOW_ERR_TEXT" ]; then
+      echo "CLAIM_REJECTED bead read failed for $WORK_ID: $SHOW_ERR_TEXT"
+    else
+      echo "CLAIM_REJECTED bead read failed for $WORK_ID"
+    fi
+    sleep 2
+    continue
   fi
-  CLAIM_ROOT="$(printf '%s' "$CLAIM_JSON" | json_pick metadata:gc.root_bead_id)"
-  CLAIM_GROUP="$(printf '%s' "$CLAIM_JSON" | json_pick metadata:gc.continuation_group)"
+  rm -f "$SHOW_ERR"
 
-  if [ "$CLAIM_ID" != "$WORK_ID" ] || [ "$CLAIM_STATUS" != "in_progress" ]; then
+  CLAIM_ID="$(printf '%s' "$SHOW_JSON" | json_pick id)"
+  CLAIM_STATUS="$(printf '%s' "$SHOW_JSON" | json_pick status)"
+  SHOW_ASSIGNEE="$(printf '%s' "$SHOW_JSON" | json_pick assignee)"
+  if [ -n "$SHOW_ASSIGNEE" ]; then
+    CLAIM_ASSIGNEE="$SHOW_ASSIGNEE"
+  fi
+  SHOW_ROUTE="$(printf '%s' "$SHOW_JSON" | json_pick metadata:gc.routed_to)"
+  if [ -n "$SHOW_ROUTE" ]; then
+    CLAIM_ROUTE="$SHOW_ROUTE"
+  fi
+  CLAIM_ROOT="$(printf '%s' "$SHOW_JSON" | json_pick metadata:gc.root_bead_id)"
+  CLAIM_GROUP="$(printf '%s' "$SHOW_JSON" | json_pick metadata:gc.continuation_group)"
+
+  if [ "$CLAIM_ID" != "$WORK_ID" ]; then
     echo "CLAIM_REJECTED verification failed for $WORK_ID"
     sleep 2
     continue
   fi
+  case "$CLAIM_STATUS" in
+    open|in_progress) ;;
+    *)
+      echo "CLAIM_REJECTED unexpected status for $WORK_ID: $CLAIM_STATUS"
+      sleep 2
+      continue
+      ;;
+  esac
   if [ -n "$EXPECTED_ASSIGNEE" ] && [ "$CLAIM_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; then
     echo "CLAIM_REJECTED assignee mismatch for $WORK_ID"
     sleep 2
@@ -149,17 +170,23 @@ bd show "$GC_BEAD_ID"
 GC_CLAIM
 ```
 
-If claim verification fails, the claim command retries `gc hook`; do not repair
-the assignment by hand or search for work outside that command. Execute exactly
-the claimed bead's description and result contract. Close it with the requested
-`gc.outcome` metadata. If the bead does not specify a failure contract, mark an
-unrecoverable failure with `gc.outcome=fail` and a concise
-`gc.failure_class`/reason before closing it.
+If claim verification fails, the claim command retries `gc hook --claim
+--json`; do not repair the assignment by hand or search for work outside that
+command. Execute exactly the claimed bead's description and result contract.
+Close it with the requested `gc.outcome` metadata. If the bead does not specify
+a failure contract, mark an unrecoverable failure with `gc.outcome=fail` and a
+concise `gc.failure_class`/reason before closing it.
 
 If later terminal commands do not inherit shell variables, use the explicit
 `CLAIMED_BEAD_ID`, `CLAIMED_ROOT_BEAD_ID`, and
 `CLAIMED_CONTINUATION_GROUP` printed by the claim command. Never run `bd
 update` or `bd close` with an empty id.
+
+When updating or closing a bead, pass exactly one explicit claimed bead id.
+Quote every metadata assignment and close reason. Do not put freeform prose or
+bare words after the bead id; `bd` treats every extra positional argument as
+another issue id and may fuzzy-match unrelated beads. Use `bd close
+"$CLAIMED_BEAD_ID" --reason '...'` for close notes.
 
 ## Continuation Group Protocol
 
@@ -172,24 +199,19 @@ Important metadata:
 
 After closing a claimed bead, check for more routed work before draining unless
 the bead's result contract explicitly says the final action is to drain and
-exit:
+exit. Continue by running the same `GC_CLAIM` block again. The block uses
+`gc hook --claim --json`; if it returns no work, it drain-acks and exits.
 
-```bash
-gc hook
-```
-
-If `gc hook` returns no work, run this as your final command and exit:
+If you must drain explicitly, run this as your final command and exit:
 
 ```bash
 gc runtime drain-ack
 ```
 
-If `gc hook` returns work, claim it by running the same `GC_CLAIM` block again
-before reading files or gathering context. When the bead you just closed had a
-`gc.continuation_group`, continue only for work in that same continuation group
-or same `gc.root_bead_id`; otherwise drain instead of hopping to unrelated
-workflow work. If the next ready bead is teardown work, run it even if earlier
-work failed.
+When the bead you just closed had a `gc.continuation_group`, continue only for
+work in that same continuation group or same `gc.root_bead_id`; otherwise drain
+instead of hopping to unrelated workflow work. If the next ready bead is
+teardown work, run it even if earlier work failed.
 
 ## Notes
 
