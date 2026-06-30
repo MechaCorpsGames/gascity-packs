@@ -107,46 +107,16 @@ while true; do
     continue
   fi
 
-  SHOW_ERR="$(mktemp)"
-  if ! SHOW_JSON="$(bd show "$WORK_ID" --json 2>"$SHOW_ERR")"; then
-    SHOW_ERR_TEXT="$(sed -n '1p' "$SHOW_ERR")"
-    rm -f "$SHOW_ERR"
-    if [ -n "$SHOW_ERR_TEXT" ]; then
-      echo "CLAIM_REJECTED bead read failed for $WORK_ID: $SHOW_ERR_TEXT"
-    else
-      echo "CLAIM_REJECTED bead read failed for $WORK_ID"
-    fi
-    sleep 2
-    continue
-  fi
-  rm -f "$SHOW_ERR"
+  # The `gc hook --claim` JSON is the authoritative, graph-aware source: it
+  # already resolved the routed bead (including graph-resident gcg- beads) and
+  # claimed it atomically, so a successful claim IS the verification. Derive the
+  # root/group from that JSON. Never re-read with `bd show` here: bare `bd` is
+  # graph-aware only via the PATH shim and silently falls through to the Dolt bd
+  # ("no issue found") for a stale session whose shimbin predates a gc refresh,
+  # which looped CLAIM_REJECTED forever and stalled the review-loop.
+  CLAIM_ROOT="$(printf '%s' "$CLAIM_JSON" | json_pick root_bead_id)"
+  CLAIM_GROUP="$(printf '%s' "$CLAIM_JSON" | json_pick continuation_group)"
 
-  CLAIM_ID="$(printf '%s' "$SHOW_JSON" | json_pick id)"
-  CLAIM_STATUS="$(printf '%s' "$SHOW_JSON" | json_pick status)"
-  SHOW_ASSIGNEE="$(printf '%s' "$SHOW_JSON" | json_pick assignee)"
-  if [ -n "$SHOW_ASSIGNEE" ]; then
-    CLAIM_ASSIGNEE="$SHOW_ASSIGNEE"
-  fi
-  SHOW_ROUTE="$(printf '%s' "$SHOW_JSON" | json_pick metadata:gc.routed_to)"
-  if [ -n "$SHOW_ROUTE" ]; then
-    CLAIM_ROUTE="$SHOW_ROUTE"
-  fi
-  CLAIM_ROOT="$(printf '%s' "$SHOW_JSON" | json_pick metadata:gc.root_bead_id)"
-  CLAIM_GROUP="$(printf '%s' "$SHOW_JSON" | json_pick metadata:gc.continuation_group)"
-
-  if [ "$CLAIM_ID" != "$WORK_ID" ]; then
-    echo "CLAIM_REJECTED verification failed for $WORK_ID"
-    sleep 2
-    continue
-  fi
-  case "$CLAIM_STATUS" in
-    open|in_progress) ;;
-    *)
-      echo "CLAIM_REJECTED unexpected status for $WORK_ID: $CLAIM_STATUS"
-      sleep 2
-      continue
-      ;;
-  esac
   if [ -n "$EXPECTED_ASSIGNEE" ] && [ "$CLAIM_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; then
     echo "CLAIM_REJECTED assignee mismatch for $WORK_ID"
     sleep 2
