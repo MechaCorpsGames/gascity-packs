@@ -72,11 +72,7 @@ per-item summary paths, changed files, first verification commands, final proof
 commands, observed pass/fail results, and remaining risks. Keep the root
 summary concise, but do not omit accepted requirement IDs.
 
-Before closing this step, read the launcher rig root from the workflow root bead's `gc.work_dir`, then run the same validator locally from that launcher rig root:
-
-`GC_BEAD_ID=<claimed-step-id> ../assets/scripts/checks/build-artifact-valid.sh`
-
-fix every reported validation error before setting `gc.outcome=pass`. Then set
+Before closing this step, make sure the summary passes the `build-artifact-valid.sh` gate; the validation loop runs it automatically and fails the attempt on any error, so fix every reported validation error before setting `gc.outcome=pass`. Then set
 the claimed step outcome with
 `bd update "<claimed-step-id>" --set-metadata "gc.outcome=pass"`, and close
 with `bd close "<claimed-step-id>" --reason "<concise reason>"`. Do not pass

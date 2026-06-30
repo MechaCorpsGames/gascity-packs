@@ -1602,8 +1602,7 @@ class FormulaAssetTests(unittest.TestCase):
         ):
             text = (root / relative_path).read_text(encoding="utf-8")
             for fragment in (
-                "read the launcher rig root from the workflow root bead's `gc.work_dir`",
-                "GC_BEAD_ID=<claimed-step-id> ../assets/scripts/checks/build-artifact-valid.sh",
+                "the validation loop runs it automatically and fails the attempt on any error",
                 "fix every reported validation error before setting `gc.outcome=pass`",
             ):
                 with self.subTest(asset=relative_path, fragment=fragment):
