@@ -1,0 +1,61 @@
+description = """
+Base GitHub issue triage work expansion.
+
+This expansion owns the post-snapshot triage graph: body-hash reuse, report
+writing, comment rendering, public-output gating, comment posting, and final
+metadata. It exists so adapter formulas can inline triage work as graph steps
+instead of delegating orchestration to a separate workflow.
+"""
+formula = "github-issue-triage-work"
+type = "expansion"
+version = 1
+contract = "graph.v2"
+
+[vars.post_mode]
+description = "Comment posting policy: auto or human_gate. Security-sensitive and p0 output always gates."
+default = "auto"
+
+[vars.triage_rubric_path]
+description = "Path to a Markdown triage rubric/prompt. Relative paths resolve under the active pack root; importing packs may shadow the default asset filename."
+default = "assets/workflows/github-issue-triage-base/triage-rubric.md"
+
+[[template]]
+id = "{target}.reuse-current-body-hash"
+title = "Reuse current body-hash triage when present"
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/github-issue-triage-base/reuse-current-body-hash.md"
+
+[[template]]
+id = "{target}.write-triage-report"
+title = "Write triage report"
+needs = ["{target}.reuse-current-body-hash"]
+metadata = { "gc.run_target" = "gc.issue-triager" }
+description_file = "../assets/workflows/github-issue-triage-base/write-triage-report.md"
+
+[[template]]
+id = "{target}.render-comment"
+title = "Render triage comment"
+needs = ["{target}.write-triage-report"]
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/github-issue-triage-base/render-comment.md"
+
+[[template]]
+id = "{target}.human-gate-sensitive-output"
+title = "Gate sensitive or forced-human output"
+needs = ["{target}.render-comment"]
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/github-issue-triage-base/human-gate-sensitive-output.md"
+
+[[template]]
+id = "{target}.post-comment"
+title = "Create or update triage comment"
+needs = ["{target}.render-comment", "{target}.human-gate-sensitive-output"]
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/github-issue-triage-base/post-comment.md"
+
+[[template]]
+id = "{target}"
+title = "Finalize triage result"
+needs = ["{target}.post-comment"]
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/github-issue-triage-base/finalize.md"
