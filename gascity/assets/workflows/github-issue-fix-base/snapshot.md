@@ -28,7 +28,7 @@ Then create or refresh the canonical GitHub source bead using this v0 contract:
 - Source beads are non-runnable index/cache beads. Do not route the source bead,
   assign it, depend on it, or use it as a readiness gate.
 - Lookup uses object identity only:
-  `bd list --metadata-field gc.kind=github_source --metadata-field gc.github.kind=issue --metadata-field gc.github.repo=<owner>/<repo> --metadata-field gc.github.number=<number> --status open,in_progress,closed --limit 1 --json`.
+  `gc bd list --metadata-field gc.kind=github_source --metadata-field gc.github.kind=issue --metadata-field gc.github.repo=<owner>/<repo> --metadata-field gc.github.number=<number> --status open,in_progress,closed --limit 1 --json`.
 - Write `source-metadata.json` with flat string metadata:
   `gc.kind=github_source`, `gc.github.kind=issue`,
   `gc.github.repo=<owner>/<repo>`, `gc.github.number=<number>`,
@@ -39,9 +39,9 @@ Then create or refresh the canonical GitHub source bead using this v0 contract:
   `gc.github.snapshot_path=<absolute source.json path>`,
   `gc.github.updated_at=<updated_at>`.
 - If no bead exists, create it with
-  `bd create "GitHub issue source: <owner>/<repo>#<number>" --type task --labels gc.github-source,gc.github-issue --external-ref <canonical_url> --metadata @source-metadata.json`.
+  `gc bd create "GitHub issue source: <owner>/<repo>#<number>" --type task --labels gc.github-source,gc.github-issue --external-ref <canonical_url> --metadata @source-metadata.json`.
 - If a bead exists, refresh it with
-  `bd update <source-bead-id> --external-ref <canonical_url> --metadata @source-metadata.json`.
+  `gc bd update <source-bead-id> --external-ref <canonical_url> --metadata @source-metadata.json`.
 
 Do not use title, label, assignee, or state changes to invalidate downstream
 fix reuse; `gc.github.body_hash` is the issue content key.

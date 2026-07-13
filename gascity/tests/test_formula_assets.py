@@ -385,7 +385,7 @@ class FormulaAssetTests(unittest.TestCase):
             "gc.drain_member_id",
             "worktrees/<source-anchor-id>",
             "git worktree add",
-            "bd update <source-anchor-id> --set-metadata work_dir=",
+            "gc bd update <source-anchor-id> --set-metadata work_dir=",
             "Do not edit source files in the launcher checkout",
         ):
             with self.subTest(step="prepare-worktree", fragment=fragment):
@@ -406,7 +406,7 @@ class FormulaAssetTests(unittest.TestCase):
         for fragment in (
             "Read `work_dir` from the source anchor",
             "close only `<source-anchor-id>`",
-            "bd show <source-anchor-id> --json",
+            "gc bd show <source-anchor-id> --json",
             "status=closed",
             "gc.outcome=pass",
             "if either check fails",
@@ -508,9 +508,9 @@ class FormulaAssetTests(unittest.TestCase):
             "github-pr-review": ("pull", "gc.github.head_sha"),
         }
         required_common = {
-            "bd list --metadata-field gc.kind=github_source",
-            "bd create",
-            "bd update",
+            "gc bd list --metadata-field gc.kind=github_source",
+            "gc bd create",
+            "gc bd update",
             "--external-ref",
             "gc.github.kind",
             "gc.github.repo",
@@ -607,7 +607,7 @@ class FormulaAssetTests(unittest.TestCase):
         implementation_plan_normalized = " ".join(implementation_plan.split())
 
         for fragment in (
-            "bd update <root-bead-id>",
+            "gc bd update <root-bead-id>",
             "gc.github.run_dir",
             "gc.github.requirements_path",
             "gc.github.implementation_plan_path",
@@ -727,8 +727,8 @@ description = "Override sink that writes the base triage report contract."
             "gc.root_bead_id",
             "gc.github.source_bead_id",
             "gc.github.triage_dir",
-            "bd show <root-bead-id> --json",
-            "bd update <root-bead-id>",
+            "gc bd show <root-bead-id> --json",
+            "gc bd update <root-bead-id>",
             "Read `gc.github.snapshot_path`",
             "Do not write a separate triage context file",
         }
