@@ -1272,7 +1272,8 @@ def build_artifact_root(pack_spec: PackSpec) -> Path:
 def launch_review_formula(gc_bin: str, workspace: GateWorkspace, *, env: Mapping[str, str], pack_spec: PackSpec) -> str:
     if not pack_spec.review_formula:
         raise GateError(f"pack {pack_spec.name} does not define a review formula")
-    write_review_subject(workspace.rig_dir)
+    subject_path = write_review_subject(workspace.rig_dir).resolve()
+    report_path = (workspace.rig_dir / REVIEW_REPORT_PATH).resolve()
     command = [
         gc_bin,
         "--city",
@@ -1286,9 +1287,9 @@ def launch_review_formula(gc_bin: str, workspace: GateWorkspace, *, env: Mapping
         "--title",
         review_title(pack_spec),
         "--var",
-        f"subject_path={REVIEW_SUBJECT_PATH}",
+        f"subject_path={subject_path}",
         "--var",
-        f"report_path={REVIEW_REPORT_PATH}",
+        f"report_path={report_path}",
         "--var",
         "interaction_mode=headless",
         "--var",

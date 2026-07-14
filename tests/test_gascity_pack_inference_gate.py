@@ -407,6 +407,38 @@ def test_extract_sling_root_id_searches_nested_json() -> None:
     assert gascity_pack_inference_gate.extract_sling_root_id("not json") is None
 
 
+def test_launch_review_formula_uses_absolute_rig_artifact_paths(tmp_path) -> None:
+    root = tmp_path / "gate with spaces"
+    root.mkdir()
+    workspace = gate_workspace(root)
+    fake_gc = tmp_path / "gc"
+    args_path = tmp_path / "gc-args.txt"
+    fake_gc.write_text(
+        f"""#!/bin/sh
+printf '%s\\n' "$@" > {shlex.quote(str(args_path))}
+printf '{{"root_bead_id":"fi-root"}}\\n'
+""",
+        encoding="utf-8",
+    )
+    fake_gc.chmod(0o755)
+
+    root_id = gascity_pack_inference_gate.launch_review_formula(
+        str(fake_gc),
+        workspace,
+        env={},
+        pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],
+    )
+
+    assert root_id == "fi-root"
+    args = args_path.read_text(encoding="utf-8").splitlines()
+    subject_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_SUBJECT_PATH).resolve()
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    assert f"subject_path={subject_path}" in args
+    assert f"report_path={report_path}" in args
+    assert f"subject_path={gascity_pack_inference_gate.REVIEW_SUBJECT_PATH}" not in args
+    assert f"report_path={gascity_pack_inference_gate.REVIEW_REPORT_PATH}" not in args
+
+
 def test_list_beads_uses_gc_bd_list_when_file_store_absent(tmp_path) -> None:
     workspace = gascity_pack_inference_gate.GateWorkspace(
         root=tmp_path,
