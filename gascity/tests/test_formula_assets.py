@@ -371,7 +371,7 @@ THIRD_PARTY_BUILD_PACKS = {
         },
         "review_expansion": "superpowers-code-review",
         "code_review_entry_expand_vars": {
-            "artifact_path_keys": "gc.build.code_review_report_path,gc.build.review_report_path,gc.var.report_path",
+            "artifact_path_keys": "gc.var.report_path",
         },
         "gap_analysis_target": "superpowers.code-quality-reviewer",
         "review_fix_asset": "assets/workflows/superpowers-code-review/{target}.process-code-review.md",
@@ -4450,6 +4450,14 @@ description = "Override sink that writes the base triage report contract."
                 / "superpowers-review.formula.toml"
             ).read_text(encoding="utf-8")
         )
+        review_entry = (
+            packs_root
+            / "superpowers"
+            / "assets"
+            / "workflows"
+            / "superpowers-review"
+            / "write-report.md"
+        ).read_text(encoding="utf-8")
         setup = (workflow_dir / "{target}.setup-superpowers-code-review.md").read_text(
             encoding="utf-8"
         )
@@ -4508,29 +4516,81 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("gc.build.code_review_status=approved", finalize)
         self.assertIn("gc.build.code_review_approved_at", finalize)
         self.assertIn("gc.build.code_review_status=failed", finalize)
+        self.assertIn("gc.build.review_report_path", finalize)
+        self.assertIn("<artifact_root>/review-report.md", finalize)
+        self.assertIn("gc.build.review.v1", finalize)
+        self.assertIn("gc.var.report_path", finalize)
+        self.assertIn(
+            "Copy the validated `gc.build.review.v1` implementation review report",
+            finalize,
+        )
+        self.assertIn("caller-provided report path", finalize)
+        self.assertIn("exact selected adapter", finalize)
+        self.assertIn("gc.attempt_log", finalize)
 
-        artifact_keys = (
+        expansion_artifact_keys = (
             "gc.build.code_review_report_path,"
             "gc.build.review_report_path,"
             "gc.var.report_path"
         )
         self.assertEqual(
             expansion_formula["vars"]["artifact_path_keys"]["default"],
-            artifact_keys,
+            expansion_artifact_keys,
         )
         write_report_step = next(
             step
             for step in review_formula["steps"]
             if step["id"] == "write-report"
         )
+        adapter_artifact_keys = "gc.var.report_path"
         self.assertEqual(
             write_report_step["metadata"]["gc.build.artifact_path_keys"],
-            artifact_keys,
+            adapter_artifact_keys,
         )
         self.assertEqual(
             write_report_step["expand_vars"]["artifact_path_keys"],
-            artifact_keys,
+            adapter_artifact_keys,
         )
+        self.assertIn("gc.var.report_path", review_entry)
+        self.assertNotIn("fallback `gc.build.review_report_path`", review_entry)
+
+    def test_superpowers_build_finalizer_preserves_final_report_contract(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        finalize = (
+            packs_root
+            / "superpowers"
+            / "assets"
+            / "workflows"
+            / "superpowers-build"
+            / "finalize.md"
+        ).read_text(encoding="utf-8")
+
+        for fragment in (
+            "gc.build.final_report_path",
+            "gc.build.final-report.v1",
+            "status: approved",
+            "trace.coverage",
+            "workflow.id",
+            "workflow.formula",
+            "methodology.pack",
+            "methodology.name",
+            "producer.formula",
+            "producer.stage",
+            "producer.attempt",
+            "## Summary",
+            "## Outcome",
+            "## Artifacts",
+            "## Remaining Risks",
+            "GC_BEAD_ID=<claimed-step-id> .gc/scripts/checks/build-artifact-valid.sh",
+            "launcher rig root",
+            "nearest ancestor containing",
+            "do not run the relative validator",
+            "gc.attempt_log",
+            "claimed attempt's worktree",
+            "repair that canonical artifact in place",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, finalize)
 
 
 if __name__ == "__main__":

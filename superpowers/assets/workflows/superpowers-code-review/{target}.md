@@ -3,6 +3,28 @@ Finalize the Superpowers code-review expansion.
 Verify the latest loop verdict from the code-review wrapper and
 process-code-review lane.
 
+The expansion keeps its implementation review at workflow root metadata
+`gc.build.code_review_report_path`. The terminal bead's
+`gc.build.artifact_path_keys` is the caller's adapter-output contract. For
+either successful path below, satisfy that exact contract before closing:
+
+- When the only selected key is `gc.build.review_report_path`, use the path
+  already recorded on the workflow root or derive
+  `<artifact_root>/review-report.md` when it is blank.
+- When the only selected key is `gc.var.report_path`, use the exact non-empty
+  requested path recorded on the workflow root. Do not replace a
+  caller-provided report path with an implementation-specific path.
+- Copy the validated `gc.build.review.v1` implementation review report from
+  `gc.build.code_review_report_path` to the selected adapter report path when
+  the paths differ. Preserve the report's verdict and contents; do not
+  substitute the gap-analysis report or review-fix summary.
+- Confirm the selected adapter report exists and validates as
+  `gc.build.review.v1`. Persist a derived `gc.build.review_report_path` on the
+  workflow root; preserve an existing `gc.var.report_path` unchanged.
+- On repair attempts (`gc.attempt` greater than 1), read `gc.attempt_log` on
+  the validation loop control bead first and repair the exact selected adapter
+  path named by the validator. Do not invent an attempt-local report path.
+
 Report-only path:
 
 - If workflow root metadata `gc.var.review_mode=report`, do not require the
@@ -17,9 +39,13 @@ Report-only path:
 - Update workflow root metadata:
   - `gc.build.code_review_status=reported`
   - `gc.build.code_review_report_path=<implementation review report path>`
+  - `gc.build.review_report_path=<canonical review report path>` when required
+    by the caller-selected artifact contract
+  - `gc.var.report_path=<requested adapter report path>` when selected by the
+    caller
 - Close this expansion target with `gc.outcome=pass`,
   `code_review.verdict=reported`, and
-  `code_review.report_path=<implementation review report path>`.
+  `code_review.report_path=<selected adapter report path>`.
 
 Approval path for `agent` and `interactive` modes:
 
@@ -33,6 +59,8 @@ Approval path for `agent` and `interactive` modes:
 - Update workflow root metadata:
   - `gc.build.code_review_status=approved`
   - `gc.build.code_review_approved_at=<UTC timestamp>`
+  - `gc.build.review_report_path=<canonical review report path>` when required
+    by the caller-selected artifact contract
 - Close this expansion target with `gc.outcome=pass`,
   `code_review.verdict=done`, and
   `code_review.report_path=<review fix summary path>`.
