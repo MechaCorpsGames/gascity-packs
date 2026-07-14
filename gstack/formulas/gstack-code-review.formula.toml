@@ -92,7 +92,7 @@ id = "{target}"
 title = "Finalize gstack code review"
 needs = ["{target}.gstack-code-review-loop"]
 metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "{artifact_path_keys}" }
-description_file = "../assets/workflows/gstack-code-review/{target}.md"
+description_file = "../assets/workflows/gstack-code-review/finalize-code-review.md"
 
 [template.check]
 max_attempts = 3

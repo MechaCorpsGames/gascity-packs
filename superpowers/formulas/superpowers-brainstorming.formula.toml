@@ -69,7 +69,7 @@ timeout = "10m"
 id = "{target}.write-requirements-spec"
 title = "Write Superpowers requirements spec"
 metadata = { "gc.run_target" = "superpowers.brainstorming" }
-description_file = "../assets/workflows/superpowers-brainstorming/{target}.write-requirements-spec.md"
+description_file = "../assets/workflows/superpowers-brainstorming/write-requirements-spec.md"
 
 [[template.children]]
 id = "{target}.review-written-spec"
@@ -90,7 +90,7 @@ id = "{target}.confirm-spec-approval"
 title = "Confirm Superpowers spec approval"
 needs = ["{target}.apply-spec-feedback"]
 metadata = { "gc.run_target" = "superpowers.brainstorming", "gc.continuation_group" = "superpowers-spec-fixes" }
-description_file = "../assets/workflows/superpowers-brainstorming/{target}.confirm-spec-approval.md"
+description_file = "../assets/workflows/superpowers-brainstorming/confirm-spec-approval.md"
 
 [[template]]
 id = "{target}"

@@ -77,7 +77,7 @@ needs = [
   "{target}.gap-analysis-review",
 ]
 metadata = { "gc.run_target" = "bmad.bmad-review-synthesizer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.code_review_report_path" }
-description_file = "../assets/workflows/bmad-code-review-flow/{target}.synthesize-bmad-review.md"
+description_file = "../assets/workflows/bmad-code-review-flow/synthesize-bmad-review.md"
 
 [[template.children]]
 id = "{target}.apply-bmad-review-findings"

@@ -679,6 +679,31 @@ def assert_pack_or_role_route_target(
 
 
 class FormulaAssetTests(unittest.TestCase):
+    def test_externalized_formula_prompts_use_stable_asset_paths(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        external_prompt_limit = 4096
+        unstable: list[str] = []
+
+        for formula_path in sorted(packs_root.glob("*/formulas/*.formula.toml")):
+            data = tomllib.loads(formula_path.read_text(encoding="utf-8"))
+            for node in formula_nodes(data):
+                description_file = node.get("description_file")
+                if not description_file or "{target}" not in description_file:
+                    continue
+                asset_path = (formula_path.parent / description_file).resolve()
+                if asset_path.stat().st_size > external_prompt_limit:
+                    unstable.append(
+                        f"{formula_path.relative_to(packs_root)}:{node['id']} -> "
+                        f"{asset_path.relative_to(packs_root)} ({asset_path.stat().st_size} bytes)"
+                    )
+
+        self.assertEqual(
+            unstable,
+            [],
+            "oversized descriptions are externalized before expansion, so their physical "
+            "description_file paths must not contain the substituted {target} token",
+        )
+
     def test_expected_formula_set_is_convoy_first(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         paths = sorted((root / "formulas").glob("*.formula.toml"))
@@ -2481,7 +2506,7 @@ class FormulaAssetTests(unittest.TestCase):
         self.assertIn("coverage: []", synthesis)
         self.assertNotIn("$CLAIMED_BEAD_ID", synthesis)
 
-        terminal = (workflow_root / "{target}.md").read_text(encoding="utf-8")
+        terminal = (workflow_root / "finalize-code-review.md").read_text(encoding="utf-8")
         for fragment in (
             "gc.build.artifact_path_keys",
             "gc.build.code_review_report_path",
@@ -2642,7 +2667,7 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(review_handoff=fragment):
                 self.assertIn(fragment, review_terminal)
 
-        setup = (review_root / "{target}.setup-compound-code-review.md").read_text(
+        setup = (review_root / "setup-compound-code-review.md").read_text(
             encoding="utf-8"
         )
         for fragment in (
@@ -2673,7 +2698,7 @@ class FormulaAssetTests(unittest.TestCase):
             "{target}.swift-ios-review.md",
             "{target}.deployment-verification.md",
             "{target}.gap-analysis-review.md",
-            "{target}.synthesize-code-review.md",
+            "synthesize-code-review.md",
             "{target}.apply-review-findings.md",
         )
         for filename in canonical_handoff_files:
@@ -2901,7 +2926,7 @@ class FormulaAssetTests(unittest.TestCase):
             "{target}.blind-hunter-review.md",
             "{target}.edge-case-review.md",
             "{target}.gap-analysis-review.md",
-            "{target}.synthesize-bmad-review.md",
+            "synthesize-bmad-review.md",
             "{target}.apply-bmad-review-findings.md",
         )
         for filename in canonical_handoff_files:
@@ -2921,7 +2946,7 @@ class FormulaAssetTests(unittest.TestCase):
                 with self.subTest(review_subject_guard=filename, fragment=fragment):
                     self.assertIn(fragment, text)
 
-        synthesis = (workflow_root / "{target}.synthesize-bmad-review.md").read_text(encoding="utf-8")
+        synthesis = (workflow_root / "synthesize-bmad-review.md").read_text(encoding="utf-8")
         self.assertIn("status: approved", synthesis)
         self.assertIn("status: changes_required", synthesis)
 
@@ -3327,14 +3352,14 @@ class FormulaAssetTests(unittest.TestCase):
             / "assets"
             / "workflows"
             / "superpowers-brainstorming"
-            / "{target}.write-requirements-spec.md"
+            / "write-requirements-spec.md"
         ).read_text(encoding="utf-8")
         spec_approval = (
             pack_root
             / "assets"
             / "workflows"
             / "superpowers-brainstorming"
-            / "{target}.confirm-spec-approval.md"
+            / "confirm-spec-approval.md"
         ).read_text(encoding="utf-8")
         apply_spec_feedback = (
             pack_root
@@ -4653,7 +4678,7 @@ description = "Override sink that writes the base triage report contract."
                 "build_formula": "bmad-build",
                 "expansion": "bmad-code-review-flow",
                 "fix_child": "{target}.apply-bmad-review-findings",
-                "synthesis": "bmad-code-review-flow/{target}.synthesize-bmad-review.md",
+                "synthesis": "bmad-code-review-flow/synthesize-bmad-review.md",
                 "finalize": "bmad-code-review-flow/{target}.md",
             },
             "compound-engineering": {
@@ -4662,7 +4687,7 @@ description = "Override sink that writes the base triage report contract."
                 "build_formula": "compound-build",
                 "expansion": "compound-code-review",
                 "fix_child": "{target}.apply-review-findings",
-                "synthesis": "compound-code-review/{target}.synthesize-code-review.md",
+                "synthesis": "compound-code-review/synthesize-code-review.md",
                 "finalize": "compound-code-review/{target}.md",
             },
             "gstack": {
@@ -4672,7 +4697,7 @@ description = "Override sink that writes the base triage report contract."
                 "expansion": "gstack-code-review",
                 "fix_child": "{target}.apply-review-findings",
                 "synthesis": "gstack-code-review/{target}.synthesize-code-review.md",
-                "finalize": "gstack-code-review/{target}.md",
+                "finalize": "gstack-code-review/finalize-code-review.md",
             },
             "superpowers": {
                 "pack_dir": repo / "superpowers",
@@ -4681,7 +4706,7 @@ description = "Override sink that writes the base triage report contract."
                 "expansion": "superpowers-code-review",
                 "fix_child": "{target}.process-code-review",
                 "synthesis": None,
-                "finalize": "superpowers-code-review/{target}.md",
+                "finalize": "superpowers-code-review/finalize-code-review.md",
             },
         }
 
@@ -5535,19 +5560,19 @@ description = "Override sink that writes the base triage report contract."
             / "superpowers-review"
             / "write-report.md"
         ).read_text(encoding="utf-8")
-        setup = (workflow_dir / "{target}.setup-superpowers-code-review.md").read_text(
+        setup = (workflow_dir / "setup-superpowers-code-review.md").read_text(
             encoding="utf-8"
         )
-        request = (workflow_dir / "{target}.request-code-review.md").read_text(
+        request = (workflow_dir / "request-code-review.md").read_text(
             encoding="utf-8"
         )
-        gap = (workflow_dir / "{target}.gap-analysis-review.md").read_text(
+        gap = (workflow_dir / "gap-analysis-review.md").read_text(
             encoding="utf-8"
         )
         process = (workflow_dir / "{target}.process-code-review.md").read_text(
             encoding="utf-8"
         )
-        finalize = (workflow_dir / "{target}.md").read_text(encoding="utf-8")
+        finalize = (workflow_dir / "finalize-code-review.md").read_text(encoding="utf-8")
         review_loop = next(
             template
             for template in expansion_formula["template"]

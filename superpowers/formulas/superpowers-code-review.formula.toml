@@ -26,7 +26,7 @@ default = "agent"
 id = "{target}.setup-superpowers-code-review"
 title = "Prepare Superpowers code review"
 metadata = { "gc.run_target" = "gc.run-operator" }
-description_file = "../assets/workflows/superpowers-code-review/{target}.setup-superpowers-code-review.md"
+description_file = "../assets/workflows/superpowers-code-review/setup-superpowers-code-review.md"
 
 [[template]]
 id = "{target}.superpowers-code-review-loop"
@@ -47,13 +47,13 @@ timeout = "10m"
 id = "{target}.request-code-review"
 title = "Superpowers request code review"
 metadata = { "gc.run_target" = "superpowers.code-reviewer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.code_review_report_path" }
-description_file = "../assets/workflows/superpowers-code-review/{target}.request-code-review.md"
+description_file = "../assets/workflows/superpowers-code-review/request-code-review.md"
 
 [[template.children]]
 id = "{target}.gap-analysis-review"
 title = "Superpowers gap-analysis review"
 metadata = { "gc.run_target" = "superpowers.code-quality-reviewer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.gap_analysis_report_path" }
-description_file = "../assets/workflows/superpowers-code-review/{target}.gap-analysis-review.md"
+description_file = "../assets/workflows/superpowers-code-review/gap-analysis-review.md"
 
 [[template.children]]
 id = "{target}.process-code-review"
@@ -68,7 +68,7 @@ id = "{target}"
 title = "Finalize Superpowers code review"
 needs = ["{target}.superpowers-code-review-loop"]
 metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "{artifact_path_keys}" }
-description_file = "../assets/workflows/superpowers-code-review/{target}.md"
+description_file = "../assets/workflows/superpowers-code-review/finalize-code-review.md"
 
 [template.check]
 max_attempts = 3
