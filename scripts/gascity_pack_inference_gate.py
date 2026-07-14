@@ -12,6 +12,7 @@ orchestration agents and runs a bounded review-leg workflow through polecat.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import yaml
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -1843,6 +1845,69 @@ def validate_review_report(
         raise GateError(f"requested review report is missing: {requested_report_path}")
 
     allow_approved = pack_spec.name != GASCITY_PACK
+    validate_review_artifact_file(
+        requested_report_path,
+        label="requested review report",
+        validator=validator,
+        env=env,
+        allow_approved=allow_approved,
+    )
+
+    subject_path = (workspace.rig_dir / REVIEW_SUBJECT_PATH).resolve()
+    require_canonical_review_subject_trace(requested_report_path, subject_path)
+
+    if pack_spec.name in METHODOLOGY_FLOW_CONTRACTS:
+        internal_path_raw = metadata_value(root_bead, "gc.build.code_review_report_path")
+        if not internal_path_raw:
+            raise GateError(
+                "methodology review root is missing internal review report metadata "
+                "gc.build.code_review_report_path"
+            )
+        internal_path = resolve_artifact_path(internal_path_raw, base=workspace.rig_dir)
+        internal_path = internal_path.resolve()
+        if internal_path == requested_report_path:
+            raise GateError(
+                "methodology internal and adapter review report paths must be distinct: "
+                f"internal={internal_path} adapter={requested_report_path}"
+            )
+        try:
+            internal_path.relative_to(workspace.rig_dir.resolve())
+        except ValueError as exc:
+            raise GateError(
+                "methodology internal review report must stay inside the nightly rig: "
+                f"internal={internal_path} rig={workspace.rig_dir.resolve()}"
+            ) from exc
+        if not internal_path.is_file():
+            raise GateError(f"internal review report is missing: {internal_path}")
+        if os.path.samefile(internal_path, requested_report_path):
+            raise GateError(
+                "methodology internal and adapter review report paths must be distinct: "
+                f"internal={internal_path} adapter={requested_report_path}"
+            )
+        validate_review_artifact_file(
+            internal_path,
+            label="internal review report",
+            validator=validator,
+            env=env,
+            allow_approved=allow_approved,
+        )
+        require_canonical_review_subject_trace(internal_path, subject_path)
+        if internal_path.read_bytes() != requested_report_path.read_bytes():
+            raise GateError(
+                "methodology internal and adapter review reports must be byte-identical: "
+                f"internal={internal_path} adapter={requested_report_path}"
+            )
+    print(f"validated review report: {requested_report_path}", flush=True)
+
+
+def validate_review_artifact_file(
+    report_path: Path,
+    *,
+    label: str,
+    validator: Path,
+    env: Mapping[str, str],
+    allow_approved: bool,
+) -> None:
     try:
         run_checked(
             [
@@ -1851,19 +1916,56 @@ def validate_review_report(
                 "--schema",
                 "gc.build.review.v1",
                 "--path",
-                str(requested_report_path),
+                str(report_path),
             ],
             env=env,
             timeout=parse_duration("1m"),
             log_output=True,
         )
-        require_expected_review_signal(requested_report_path, allow_approved=allow_approved)
+        require_expected_review_signal(report_path, allow_approved=allow_approved)
     except (GateError, subprocess.CalledProcessError) as exc:
         raise GateError(
-            "review gate did not produce a valid expected review artifact at requested review report "
-            f"{requested_report_path}: {exc}"
+            f"review gate did not produce a valid expected review artifact at {label} {report_path}: {exc}"
         ) from exc
-    print(f"validated review report: {requested_report_path}", flush=True)
+
+
+def require_canonical_review_subject_trace(report_path: Path, subject_path: Path) -> None:
+    if not subject_path.is_file():
+        raise GateError(f"canonical review subject is missing: {subject_path}")
+
+    text = report_path.read_text(encoding="utf-8", errors="replace")
+    match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
+    if not match:
+        raise GateError(f"review report has no parseable front matter: {report_path}")
+    try:
+        front_matter = yaml.safe_load(match.group("front")) or {}
+    except yaml.YAMLError as exc:
+        raise GateError(f"review report front matter is invalid at {report_path}: {exc}") from exc
+
+    trace = front_matter.get("trace") if isinstance(front_matter, dict) else None
+    upstream = trace.get("upstream") if isinstance(trace, dict) else None
+    if not isinstance(upstream, list):
+        raise GateError(f"review report trace.upstream is missing at {report_path}")
+
+    expected_hash = f"sha256:{hashlib.sha256(subject_path.read_bytes()).hexdigest()}"
+    matching_entries: list[Mapping[str, Any]] = []
+    for entry in upstream:
+        if not isinstance(entry, Mapping):
+            continue
+        raw_path = entry.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        traced_path = Path(raw_path.strip())
+        path_matches = traced_path.is_absolute() and traced_path.resolve() == subject_path
+        if path_matches:
+            matching_entries.append(entry)
+
+    observed_hashes = [str(entry.get("hash") or "") for entry in matching_entries]
+    if expected_hash not in observed_hashes:
+        raise GateError(
+            "review report must trace the canonical review subject digest exactly: "
+            f"report={report_path} subject={subject_path} expected={expected_hash} observed={observed_hashes}"
+        )
 
 
 def require_expected_review_signal(report_path: Path, *, allow_approved: bool = False) -> None:

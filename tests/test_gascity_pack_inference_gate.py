@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import os
 import re
@@ -1189,9 +1190,13 @@ def test_failed_logical_controls_ignore_attempt_beads() -> None:
 
 def test_validate_review_report_requires_blocking_base_gascity_report(tmp_path) -> None:
     workspace = gate_workspace(tmp_path)
+    subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()
     report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
-    report_path.parent.mkdir(parents=True)
-    report_path.write_text(valid_review_artifact(status="changes_required"), encoding="utf-8")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        review_artifact_traced_to_subject(subject_path, status="changes_required"),
+        encoding="utf-8",
+    )
 
     gascity_pack_inference_gate.validate_review_report(
         {"metadata": {"gc.var.report_path": str(report_path)}},
@@ -1203,20 +1208,242 @@ def test_validate_review_report_requires_blocking_base_gascity_report(tmp_path) 
 
 def test_validate_review_report_accepts_exact_methodology_adapter_report(tmp_path) -> None:
     workspace = gate_workspace(tmp_path)
+    subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()
     report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
-    report_path.parent.mkdir(parents=True)
-    report_path.write_text(valid_review_artifact(status="approved"), encoding="utf-8")
+    internal_path = (workspace.rig_dir / ".gc" / "internal" / "review-report.md").resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    internal_path.parent.mkdir(parents=True)
+    report = review_artifact_traced_to_subject(subject_path, status="approved")
+    report_path.write_text(report, encoding="utf-8")
+    internal_path.write_text(report, encoding="utf-8")
     pack_spec = replace(
         gascity_pack_inference_gate.PACK_SPECS["superpowers"],
         validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
     )
 
     gascity_pack_inference_gate.validate_review_report(
-        {"metadata": {"gc.var.report_path": str(report_path)}},
+        {
+            "metadata": {
+                "gc.var.report_path": str(report_path),
+                "gc.build.code_review_report_path": str(internal_path),
+                "gc.build.review_subject_path": str(subject_path),
+            }
+        },
         workspace,
         env={},
         pack_spec=pack_spec,
     )
+
+
+def test_validate_review_report_rejects_internal_alias_to_adapter(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        review_artifact_traced_to_subject(subject_path, status="changes_required"),
+        encoding="utf-8",
+    )
+    pack_spec = replace(
+        gascity_pack_inference_gate.PACK_SPECS["compound-engineering"],
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="must be distinct"):
+        gascity_pack_inference_gate.validate_review_report(
+            {
+                "metadata": {
+                    "gc.var.report_path": str(report_path),
+                    "gc.build.code_review_report_path": str(report_path),
+                    "gc.build.review_subject_path": str(subject_path),
+                }
+            },
+            workspace,
+            env={},
+            pack_spec=pack_spec,
+        )
+
+
+def test_validate_review_report_rejects_internal_hardlink_to_adapter(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    internal_path = (workspace.rig_dir / ".gc" / "internal" / "review-report.md").resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    internal_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        review_artifact_traced_to_subject(subject_path, status="changes_required"),
+        encoding="utf-8",
+    )
+    os.link(report_path, internal_path)
+    pack_spec = replace(
+        gascity_pack_inference_gate.PACK_SPECS["compound-engineering"],
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="must be distinct"):
+        gascity_pack_inference_gate.validate_review_report(
+            {
+                "metadata": {
+                    "gc.var.report_path": str(report_path),
+                    "gc.build.code_review_report_path": str(internal_path),
+                    "gc.build.review_subject_path": str(subject_path),
+                }
+            },
+            workspace,
+            env={},
+            pack_spec=pack_spec,
+        )
+
+
+def test_validate_review_report_rejects_internal_path_outside_rig(tmp_path) -> None:
+    gate_root = tmp_path / "gate"
+    gate_root.mkdir()
+    workspace = gate_workspace(gate_root)
+    subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    internal_path = (tmp_path / "outside" / "review-report.md").resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    internal_path.parent.mkdir(parents=True)
+    report = review_artifact_traced_to_subject(subject_path, status="changes_required")
+    report_path.write_text(report, encoding="utf-8")
+    internal_path.write_text(report, encoding="utf-8")
+    pack_spec = replace(
+        gascity_pack_inference_gate.PACK_SPECS["gstack"],
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="inside the nightly rig"):
+        gascity_pack_inference_gate.validate_review_report(
+            {
+                "metadata": {
+                    "gc.var.report_path": str(report_path),
+                    "gc.build.code_review_report_path": str(internal_path),
+                    "gc.build.review_subject_path": str(subject_path),
+                }
+            },
+            workspace,
+            env={},
+            pack_spec=pack_spec,
+        )
+
+
+def test_require_canonical_review_subject_trace_rejects_relative_path(tmp_path) -> None:
+    subject_path = tmp_path / "review-subject.diff"
+    subject_path.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+    report_path = tmp_path / "review-report.md"
+    report = review_artifact_traced_to_subject(
+        subject_path.resolve(), status="changes_required"
+    ).replace(
+        f"    - path: {subject_path.resolve()}\n",
+        f"    - path: {subject_path.name}\n",
+        1,
+    )
+    report_path.write_text(report, encoding="utf-8")
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="canonical review subject digest",
+    ):
+        gascity_pack_inference_gate.require_canonical_review_subject_trace(
+            report_path, subject_path.resolve()
+        )
+
+
+def test_validate_review_report_rejects_invalid_internal_methodology_report(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    internal_path = (workspace.rig_dir / ".gc" / "internal" / "review-report.md").resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    internal_path.parent.mkdir(parents=True)
+    report_path.write_text(
+        review_artifact_traced_to_subject(subject_path, status="changes_required"),
+        encoding="utf-8",
+    )
+    internal_path.write_text("# Freeform internal review\n", encoding="utf-8")
+    pack_spec = replace(
+        gascity_pack_inference_gate.PACK_SPECS["compound-engineering"],
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="internal review report"):
+        gascity_pack_inference_gate.validate_review_report(
+            {
+                "metadata": {
+                    "gc.var.report_path": str(report_path),
+                    "gc.build.code_review_report_path": str(internal_path),
+                    "gc.build.review_subject_path": str(subject_path),
+                }
+            },
+            workspace,
+            env={},
+            pack_spec=pack_spec,
+        )
+
+
+def test_validate_review_report_rejects_adapter_that_differs_from_internal_report(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    internal_path = (workspace.rig_dir / ".gc" / "internal" / "review-report.md").resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    internal_path.parent.mkdir(parents=True)
+    report = review_artifact_traced_to_subject(subject_path, status="changes_required")
+    internal_path.write_text(report, encoding="utf-8")
+    report_path.write_text(report + "\nAdapter-only rewrite.\n", encoding="utf-8")
+    pack_spec = replace(
+        gascity_pack_inference_gate.PACK_SPECS["gstack"],
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="byte-identical"):
+        gascity_pack_inference_gate.validate_review_report(
+            {
+                "metadata": {
+                    "gc.var.report_path": str(report_path),
+                    "gc.build.code_review_report_path": str(internal_path),
+                    "gc.build.review_subject_path": str(subject_path),
+                }
+            },
+            workspace,
+            env={},
+            pack_spec=pack_spec,
+        )
+
+
+def test_validate_review_report_rejects_fake_canonical_subject_hash(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    internal_path = (workspace.rig_dir / ".gc" / "internal" / "review-report.md").resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    internal_path.parent.mkdir(parents=True)
+    report = review_artifact_traced_to_subject(
+        subject_path,
+        status="changes_required",
+        hash_value="literal:not-the-subject-digest",
+    )
+    report_path.write_text(report, encoding="utf-8")
+    internal_path.write_text(report, encoding="utf-8")
+    pack_spec = replace(
+        gascity_pack_inference_gate.PACK_SPECS["bmad"],
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="canonical review subject digest"):
+        gascity_pack_inference_gate.validate_review_report(
+            {
+                "metadata": {
+                    "gc.var.report_path": str(report_path),
+                    "gc.build.code_review_report_path": str(internal_path),
+                    "gc.build.review_subject_path": str(subject_path),
+                }
+            },
+            workspace,
+            env={},
+            pack_spec=pack_spec,
+        )
 
 
 def test_validate_review_report_rejects_relative_root_report_path(tmp_path) -> None:
@@ -1652,6 +1879,20 @@ paths, which creates a shell injection risk.
 The terminal report verifies the fix: use an argument vector / argument list
 with `shell=False`, and mark SEC-001 covered after tests pass.
 """
+    )
+
+
+def review_artifact_traced_to_subject(
+    subject_path: Path,
+    *,
+    status: str,
+    hash_value: str = "",
+) -> str:
+    digest = hash_value or f"sha256:{hashlib.sha256(subject_path.read_bytes()).hexdigest()}"
+    return valid_review_artifact(status=status).replace(
+        "    - path: fixture\n      hash: literal:test",
+        f"    - path: {subject_path}\n      hash: {digest}",
+        1,
     )
 
 
