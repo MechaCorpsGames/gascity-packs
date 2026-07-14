@@ -2654,6 +2654,15 @@ class FormulaAssetTests(unittest.TestCase):
             "On repeated attempts",
             "revise that candidate in place",
             "unapproved",
+            "reference material, not as an interactive workflow",
+            "gc.var.interaction_mode",
+            "gc.var.brainstorming_approval_mode",
+            "gc.build.design_path",
+            'if type == "array" then .[0] else . end',
+            "tests and acceptance criteria are authoritative",
+            "Never ask a human a question or wait for a reply",
+            "confirm-design-approval",
+            "Do not guess prior bead ids or worktree paths",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, brainstorm_design)

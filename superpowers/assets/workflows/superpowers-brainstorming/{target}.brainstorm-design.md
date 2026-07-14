@@ -1,25 +1,53 @@
-Use the installed Superpowers brainstorming guidance to produce an approved
-design candidate.
+Use the installed Superpowers brainstorming guidance as methodology reference.
+Treat it as reference material, not as an interactive workflow. This lane
+produces a design candidate; the downstream `confirm-design-approval` lane owns
+approval and every human interaction.
+
+First read the exact workflow root id printed by the successful claim. Query
+that root with `gc bd show <claimed-root-id> --json` and normalize the response
+with this jq selector before reading metadata:
+
+```jq
+(if type == "array" then .[0] else . end) | .metadata
+```
+
+Read `gc.var.interaction_mode`, `gc.var.brainstorming_approval_mode`,
+`gc.build.design_path`, `gc.build.design_gate_artifact_path`, and
+`gc.build.brainstorming_path`. On a repeated attempt, treat the existing
+`gc.build.design_path` as the canonical design candidate and revise it in place.
+Use only paths recorded on the workflow root or the claimed bead.
+Do not guess prior bead ids or worktree paths.
 
 This lane maps stock Superpowers checklist items 1-5. Track each item in the
 design candidate so the loop state is durable:
 
 - project context inspected.
-- Decide whether visual questions are ahead; if so, Offer Visual Companion in
-  its own message before continuing; if accepted, use the installed Visual
+- Decide whether visual questions are ahead and record whether an interactive
+  human gate should Offer Visual Companion in its own message. Do not send the
+  offer or wait for its answer from this producer lane; if later accepted, use the
+  installed Visual
   Companion guidance for questions that benefit from visuals.
-- one clarifying question at a time when answers are needed.
+- identify one clarifying question at a time when answers are needed and record
+  it in the candidate.
 - two or three approaches with tradeoffs and a recommendation.
-- recommended design presented in sections scaled to the task.
+- recommended design presented in sections scaled to the task and written to
+  the artifact.
 
-For autonomous runs, do not invent answers. If the target and context fully
-determine the outcome, record the autonomous approval basis. If a human answer
-is required, record the exact question and leave the design unapproved.
+For headless or autonomous runs, the supplied target, repository context,
+tests and acceptance criteria are authoritative. Do not invent answers, invoke
+the stock skill's user-question gates, or create extra requirements.
+Never ask a human a question or wait for a reply from this lane in any
+interaction mode.
+If the inputs fully determine the outcome, record the autonomous approval basis.
+If a human answer is required, record the exact unresolved question, leave the
+design unapproved, and still complete this producer lane so
+`confirm-design-approval` can apply the configured approval mode.
 
-On repeated attempts, read the previous design candidate plus the latest design
-approval or revision summary, then revise that candidate in place. Do not
-discard answered questions, approach tradeoffs, visual-companion decisions, or
-approved sections from earlier attempts.
+On repeated attempts, read the canonical previous design candidate plus the
+latest design approval or revision summary when its path is present in workflow
+root metadata, then revise that candidate in place. Do not discard answered
+questions, approach tradeoffs, visual-companion decisions, or approved sections
+from earlier attempts.
 
 Write or update a design candidate artifact under the brainstorming artifact
 directory. Include requested outcome, constraints, non-goals, design sections,
