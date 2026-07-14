@@ -41,6 +41,28 @@ from the claimed attempt's worktree. From the resolved launcher rig root, run
 `GC_BEAD_ID=<claimed-step-id> .gc/scripts/checks/build-artifact-valid.sh` and
 fix every validation error against the canonical root artifact.
 
+Only after that validator passes and the artifact, test, review, and publish
+readiness evidence all succeed, reconcile the workflow root in one update:
+
+```bash
+gc bd update <workflow-root-id> \
+  --set-metadata 'gc.build.final_report_path=<canonical final report path>' \
+  --set-metadata 'gc.build.status=completed' \
+  --set-metadata 'gc.build.finalize_status=completed' \
+  --set-metadata 'gc.build.finalize_outcome=success' \
+  --unset-metadata gc.blocked_reason \
+  --unset-metadata gc.failure_class
+```
+
+The root lifecycle value `gc.build.status=completed` is distinct from the final report's `status: approved`;
+`approved` is the artifact schema value, not the workflow-root status
+vocabulary.
+
+Then set the claimed step to `gc.outcome=pass` and close it. Do not clear either
+failure marker when validation or required evidence fails; a successful update
+must explicitly unset them because metadata updates otherwise merge with stale
+prepare-stage values.
+
 Do not invoke provider-native subagents or upstream plugin runtime commands.
 
 Artifact validation: this stage is gated by `.gc/scripts/checks/build-artifact-valid.sh`, which validates the artifact recorded at `gc.build.final_report_path` against schema `gc.build.final-report.v1`. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair that canonical artifact in place instead of rewriting it or changing the root path. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.

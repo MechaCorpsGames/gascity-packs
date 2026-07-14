@@ -1048,8 +1048,18 @@ class FormulaAssetTests(unittest.TestCase):
         prepare = (root / "assets/workflows/build-base/prepare.md").read_text(encoding="utf-8")
         for fragment in (
             "[metadata.gc.methodology]",
+            ".metadata.gc.methodology",
+            "interaction_modes",
+            "review_modes",
+            "allowed_drain_policies",
+            "methodology-metadata-unreadable:",
+            "methodology-metadata-missing:",
+            "must not be reported as `unsupported-*`",
             "gc.blocked_reason",
             "gc.failure_class=methodology_incompatible",
+            "gc.build.status=ready",
+            "--unset-metadata gc.blocked_reason",
+            "--unset-metadata gc.failure_class",
             "never ask questions",
             "derive the running formula from the claimed step bead's `gc.step_ref`",
             "gc formula show <running-formula> --json",
@@ -4597,6 +4607,12 @@ description = "Override sink that writes the base triage report contract."
             "gc.attempt_log",
             "claimed attempt's worktree",
             "repair that canonical artifact in place",
+            "gc.build.status=completed",
+            "gc.build.finalize_status=completed",
+            "gc.build.finalize_outcome=success",
+            "distinct from the final report's `status: approved`",
+            "--unset-metadata gc.blocked_reason",
+            "--unset-metadata gc.failure_class",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, finalize)
