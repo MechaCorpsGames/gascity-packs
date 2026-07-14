@@ -633,6 +633,26 @@ def test_validate_review_report_requires_blocking_base_gascity_report(tmp_path) 
     )
 
 
+def test_validate_review_report_resolves_relative_path_from_root_work_dir(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    work_dir = workspace.rig_dir / "fi-3ph-write-review-report"
+    report_path = work_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(valid_review_artifact(status="changes_required"), encoding="utf-8")
+
+    gascity_pack_inference_gate.validate_review_report(
+        {
+            "metadata": {
+                "gc.work_dir": str(work_dir),
+                "gc.var.report_path": str(gascity_pack_inference_gate.REVIEW_REPORT_PATH),
+            }
+        },
+        workspace,
+        env={},
+        pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],
+    )
+
+
 def test_validate_review_report_accepts_methodology_fix_summary_from_metadata(tmp_path) -> None:
     workspace = gate_workspace(tmp_path)
     report_path = workspace.rig_dir / ".gc" / "inference-gate" / "artifacts" / "review-fix-summary.md"

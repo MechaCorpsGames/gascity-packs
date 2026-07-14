@@ -1767,17 +1767,27 @@ def validate_review_report(
 
 def review_report_candidates(root_bead: Mapping[str, Any], rig_dir: Path, pack_spec: PackSpec) -> list[Path]:
     candidates: list[Path] = []
+    bases: list[Path] = []
+    for key in ("gc.work_dir", "work_dir"):
+        raw_work_dir = metadata_value(root_bead, key)
+        if raw_work_dir:
+            work_dir = resolve_artifact_path(raw_work_dir, base=rig_dir)
+            if work_dir not in bases:
+                bases.append(work_dir)
+    bases.append(rig_dir)
+
     for key in REVIEW_REPORT_METADATA_KEYS:
         raw_path = metadata_value(root_bead, key)
         if raw_path:
-            candidates.append(resolve_artifact_path(raw_path, base=rig_dir))
+            candidates.extend(resolve_artifact_path(raw_path, base=base) for base in bases)
 
-    candidates.append(resolve_artifact_path(REVIEW_REPORT_PATH, base=rig_dir))
+    candidates.extend(resolve_artifact_path(REVIEW_REPORT_PATH, base=base) for base in bases)
     if pack_spec.name != GASCITY_PACK:
-        candidates.extend(resolve_artifact_path(path, base=rig_dir) for path in METHODOLOGY_REVIEW_REPORT_FALLBACKS)
-        artifacts_dir = rig_dir / ".gc" / "inference-gate" / "artifacts"
-        if artifacts_dir.is_dir():
-            candidates.extend(sorted(artifacts_dir.glob("*.md")))
+        for base in bases:
+            candidates.extend(resolve_artifact_path(path, base=base) for path in METHODOLOGY_REVIEW_REPORT_FALLBACKS)
+            artifacts_dir = base / ".gc" / "inference-gate" / "artifacts"
+            if artifacts_dir.is_dir():
+                candidates.extend(sorted(artifacts_dir.glob("*.md")))
 
     unique: list[Path] = []
     seen: set[Path] = set()
