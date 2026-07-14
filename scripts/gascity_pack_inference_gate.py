@@ -48,6 +48,18 @@ REVIEW_REPORT_METADATA_KEYS = (
     "gc.var.report_path",
     "report_path",
 )
+LOGICAL_CONTROL_KINDS = frozenset(
+    {
+        "check",
+        "drain",
+        "fanout",
+        "ralph",
+        "retry",
+        "scope",
+        "scope-check",
+        "workflow-finalize",
+    }
+)
 METHODOLOGY_REVIEW_REPORT_FALLBACKS = (
     Path(".gc/inference-gate/artifacts/review-fix-summary.md"),
     Path(".gc/inference-gate/artifacts/implementation-review-report.md"),
@@ -1661,6 +1673,26 @@ def metadata_value(bead: Mapping[str, Any], key: str) -> str:
     return str(value)
 
 
+def failed_logical_controls(
+    beads: Sequence[Mapping[str, Any]],
+    root_id: str,
+) -> list[Mapping[str, Any]]:
+    failures: list[Mapping[str, Any]] = []
+    for bead in beads:
+        if str(bead.get("status") or "") != "closed":
+            continue
+        if metadata_value(bead, "gc.root_bead_id") != root_id:
+            continue
+        if metadata_value(bead, "gc.outcome") != "fail":
+            continue
+        if metadata_value(bead, "gc.attempt"):
+            continue
+        if metadata_value(bead, "gc.kind") not in LOGICAL_CONTROL_KINDS:
+            continue
+        failures.append(bead)
+    return sorted(failures, key=lambda bead: str(bead.get("id") or ""))
+
+
 def wait_for_workflow_pass(
     gc_bin: str,
     workspace: GateWorkspace,
@@ -1679,6 +1711,20 @@ def wait_for_workflow_pass(
         print(f"workflow {root_id}: status={status or '<unset>'} outcome={outcome or '<unset>'}", flush=True)
         if status == "closed":
             if outcome == "pass":
+                failed_controls = failed_logical_controls(
+                    list_beads(gc_bin, workspace, env=env),
+                    root_id,
+                )
+                if failed_controls:
+                    details = ", ".join(
+                        f"{bead.get('id', '<unknown>')}"
+                        f" ({metadata_value(bead, 'gc.step_ref') or bead.get('title', '<untitled>')})"
+                        for bead in failed_controls
+                    )
+                    raise GateError(
+                        f"logical workflow control failed beneath closed/pass root {root_id}: {details}\n"
+                        + collect_diagnostics(gc_bin, workspace, env=env)
+                    )
                 return last_bead
             raise GateError(
                 f"workflow {root_id} closed with gc.outcome={outcome!r}, want 'pass'\n"

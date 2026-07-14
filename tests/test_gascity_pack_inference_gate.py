@@ -651,6 +651,60 @@ esac
     assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")  # gc-bd-argv-tail
 
 
+def test_wait_for_workflow_pass_rejects_failed_logical_control(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    fake_gc = tmp_path / "gc"
+    fake_gc.write_text(
+        """#!/bin/sh
+case "$*" in
+  *"bd show fi-root --json"*) # gc-bd-argv-tail: fake gc receives the wrapper's argv tail
+    printf '[{"id":"fi-root","title":"root","status":"closed","metadata":{"gc.outcome":"pass"}}]\n'
+    ;;
+  *"bd list --all --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper's argv tail
+    printf '[{"id":"fi-review","title":"Review implementation","status":"closed","metadata":{"gc.root_bead_id":"fi-root","gc.kind":"ralph","gc.outcome":"fail","gc.step_ref":"build.review"}}]\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_gc.chmod(0o755)
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="logical workflow control failed.*fi-review.*build.review",
+    ):
+        gascity_pack_inference_gate.wait_for_workflow_pass(
+            str(fake_gc),
+            workspace,
+            "fi-root",
+            env={},
+            timeout=5,
+            poll_interval=0,
+        )
+
+
+def test_failed_logical_controls_ignore_attempt_beads() -> None:
+    beads = [
+        {
+            "id": "fi-attempt",
+            "title": "Review implementation",
+            "status": "closed",
+            "metadata": {
+                "gc.root_bead_id": "fi-root",
+                "gc.kind": "ralph",
+                "gc.attempt": "1",
+                "gc.logical_bead_id": "fi-review",
+                "gc.outcome": "fail",
+            },
+        }
+    ]
+
+    assert gascity_pack_inference_gate.failed_logical_controls(beads, "fi-root") == []
+
+
 def test_validate_review_report_requires_blocking_base_gascity_report(tmp_path) -> None:
     workspace = gate_workspace(tmp_path)
     report_path = workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH
