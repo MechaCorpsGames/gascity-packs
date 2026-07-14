@@ -146,7 +146,7 @@ GC_BD_ARGV_TAIL_MARKER = "gc-bd-argv-tail"
 GC_BD_ARGV_TAIL_FIXTURE = Path("tests/test_gascity_pack_inference_gate.py")
 GC_BD_ARGV_TAIL_LINES = {
     '*"bd show fi-root --json"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
-    '*"bd list --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
+    '*"bd list --all --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper\'s argv tail',
     'assert "bd show fi-root --json" in args_path.read_text(encoding="utf-8")  # gc-bd-argv-tail',
 }
 

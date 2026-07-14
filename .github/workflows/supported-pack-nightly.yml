@@ -52,7 +52,7 @@ permissions:
 
 env:
   DOLT_VERSION: "2.1.0"
-  BD_VERSION: "v1.0.4"
+  BD_VERSION: "v1.1.0"
   CLAUDE_VERSION: "2.1.123"
 
 jobs:

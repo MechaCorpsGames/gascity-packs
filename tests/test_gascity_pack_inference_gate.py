@@ -256,6 +256,7 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert "GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}" in workflow
     assert '--timeout "$GATE_TIMEOUT"' in workflow
     assert 'DOLT_VERSION: "2.1.0"' in workflow
+    assert 'BD_VERSION: "v1.1.0"' in workflow
     assert "ANTHROPIC_BASE_URL: https://ollama.com" in workflow
     assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
     assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}" in workflow
@@ -295,6 +296,7 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
     assert "\n  push:" not in workflow
     assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
     assert 'DOLT_VERSION: "2.1.0"' in workflow
+    assert 'BD_VERSION: "v1.1.0"' in workflow
     assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
     assert "include-hidden-files: true" in workflow
 
@@ -426,7 +428,7 @@ printf '[{{"id":"fi-1","title":"root","status":"open"}}]\\n'
     beads = gascity_pack_inference_gate.list_beads(str(fake_gc), workspace, env={})
 
     assert beads == [{"id": "fi-1", "title": "root", "status": "open"}]
-    assert args_path.read_text(encoding="utf-8").splitlines()[-3:] == ["--json", "--limit", "1000"]
+    assert args_path.read_text(encoding="utf-8").splitlines()[-4:] == ["--all", "--json", "--limit", "1000"]
 
 
 def test_list_beads_falls_back_to_city_event_log_when_live_list_is_empty(tmp_path) -> None:
@@ -585,7 +587,7 @@ case "$*" in
   *"bd show fi-root --json"*) # gc-bd-argv-tail: fake gc receives the wrapper's argv tail
     printf '[{{"id":"fi-root","title":"root","status":"closed","metadata":{{"gc.outcome":"pass"}}}}]\\n'
     ;;
-  *"bd list --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper's argv tail
+  *"bd list --all --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper's argv tail
     printf '[{{"id":"fi-other","title":"other","status":"open"}}]\\n'
     ;;
   *)
