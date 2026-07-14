@@ -37,6 +37,36 @@ if [ -z "$SCOPE_REF" ]; then
   SCOPE_REF="$(metadata_value "$ROOT_JSON" "gc.step_ref")"
 fi
 
+validate_declared_artifact() {
+  local schema path_keys script_dir artifact_check
+  schema="$(metadata_value "$ROOT_JSON" "gc.build.artifact_schema")"
+  path_keys="$(metadata_value "$ROOT_JSON" "gc.build.artifact_path_keys")"
+
+  if [ -z "$schema" ] && [ -z "$path_keys" ]; then
+    return 0
+  fi
+  if [ -z "$schema" ] || [ -z "$path_keys" ]; then
+    echo "review check: gc.build.artifact_schema and gc.build.artifact_path_keys must be declared together" >&2
+    return 1
+  fi
+
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  artifact_check="$script_dir/build-artifact-valid.sh"
+  if [ ! -x "$artifact_check" ]; then
+    echo "review check: artifact validator is missing or not executable: $artifact_check" >&2
+    return 1
+  fi
+
+  GC_BEAD_ID="$ROOT_ID" "$artifact_check"
+}
+
+approve() {
+  local message="$1"
+  validate_declared_artifact
+  echo "$message"
+  exit 0
+}
+
 MATCHES="$(gc bd list --all --metadata-field "gc.root_bead_id=$PARENT_ROOT" --json --limit=0 2>/dev/null || printf '[]')"
 
 VERDICT="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
@@ -85,8 +115,7 @@ if [ "$REVIEW_MODE" = "report" ]; then
     ' 2>/dev/null)"
   fi
   if [ -n "$REPORT_MODE_PATH" ]; then
-    echo "Implementation review report mode satisfied: $REPORT_MODE_PATH"
-    exit 0
+    approve "Implementation review report mode satisfied: $REPORT_MODE_PATH"
   fi
   echo "Implementation review report mode needs a review report path"
   exit 1
@@ -152,8 +181,7 @@ if [ "$VERDICT" != "done" ]; then
       ;;
     "")
       if [ "$LANE_STATUS" = "approved" ]; then
-        echo "Implementation review approved from lane verdicts"
-        exit 0
+        approve "Implementation review approved from lane verdicts"
       fi
       echo "Implementation review needs another iteration: ${LANE_STATUS:-missing verdict}"
       exit 1
@@ -165,5 +193,4 @@ if [ "$VERDICT" != "done" ]; then
   esac
 fi
 
-echo "Implementation review approved"
-exit 0
+approve "Implementation review approved"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
@@ -417,6 +418,9 @@ THIRD_PARTY_BUILD_PACKS = {
             "review": "bmad-code-review-flow",
         },
         "review_expansion": "bmad-code-review-flow",
+        "code_review_entry_expand_vars": {
+            "artifact_path_keys": "gc.var.report_path",
+        },
         "gap_analysis_target": "bmad.story-self-checker",
         "review_fix_asset": "assets/workflows/bmad-code-review-flow/{target}.apply-bmad-review-findings.md",
     },
@@ -1953,6 +1957,15 @@ class FormulaAssetTests(unittest.TestCase):
                             "close-source-anchor": ["record-item-result"],
                         },
                     )
+                elif pack_name == "bmad":
+                    self.assertEqual(
+                        [step["id"] for step in resolved_shared["steps"]],
+                        ["implement-item", "close-source-anchor"],
+                    )
+                    self.assertEqual(
+                        resolved_shared["steps"][1]["needs"],
+                        ["implement-item"],
+                    )
                 else:
                     self.assertEqual([step["id"] for step in resolved_shared["steps"]], ["implement-item"])
                 self.assertTrue(any(step["id"] == "implement-item" for step in shared_item_formula["steps"]))
@@ -2736,6 +2749,202 @@ class FormulaAssetTests(unittest.TestCase):
         ):
             with self.subTest(final_terminal=fragment):
                 self.assertIn(fragment, terminal)
+
+    def test_bmad_build_producers_define_schema_complete_artifacts(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        pack_root = packs_root / "bmad"
+        workflow_root = pack_root / "assets" / "workflows" / "bmad-build"
+        build = load_formula(pack_root, "bmad-build")
+        finalize_step = next(step for step in build["steps"] if step["id"] == "finalize")
+        self.assertEqual(
+            finalize_step["metadata"]["gc.build.artifact_schema"],
+            "gc.build.final-report.v1",
+        )
+        self.assertIn("bmad-build/finalize.md", finalize_step["description_file"])
+
+        cases = {
+            "requirements": (
+                workflow_root / "requirements.md",
+                "gc.build.requirements.v1",
+                "gc.build.requirements_path",
+                (
+                    "Problem Statement",
+                    "W6H",
+                    "User Stories",
+                    "Technical Stories",
+                    "Behavior Requirements",
+                    "Example Mapping",
+                    "Acceptance Criteria",
+                    "Out Of Scope",
+                    "Open Questions",
+                ),
+            ),
+            "plan": (
+                workflow_root / "plan.md",
+                "gc.build.plan.v1",
+                "gc.build.plan_path",
+                ("Summary", "Current System", "Proposed Implementation", "Non-Goals", "Verification"),
+            ),
+            "decompose": (
+                workflow_root / "decompose.md",
+                "gc.build.decomposition.v1",
+                "gc.build.decomposition_path",
+                ("Summary", "Selected Downstream Formulas", "Implementation Convoy", "Work Items"),
+            ),
+            "finalize": (
+                workflow_root / "finalize.md",
+                "gc.build.final-report.v1",
+                "gc.build.final_report_path",
+                ("Summary", "Outcome", "Artifacts", "Remaining Risks"),
+            ),
+        }
+        for stage, (path, schema, metadata_key, sections) in cases.items():
+            text = path.read_text(encoding="utf-8")
+            for fragment in (
+                f"schema: {schema}",
+                "workflow:",
+                "methodology:",
+                "producer:",
+                "status: approved",
+                "trace:",
+                "upstream:",
+                "coverage:",
+                "`ID` and `Status`",
+                "first line must be `---`",
+                metadata_key,
+                "launcher rig root",
+                'GC_BEAD_ID="$CLAIMED_BEAD_ID"',
+                "gc.attempt_log",
+            ):
+                with self.subTest(stage=stage, fragment=fragment):
+                    self.assertIn(fragment, text)
+            markers = [f"`## {section}`" for section in sections]
+            for marker in markers:
+                self.assertIn(marker, text)
+            self.assertEqual(
+                [text.index(marker) for marker in markers],
+                sorted(text.index(marker) for marker in markers),
+            )
+
+        decompose = cases["decompose"][0].read_text(encoding="utf-8")
+        self.assertIn("gc.input_convoy_id", decompose)
+        self.assertIn("gc.build.implementation_convoy_id", decompose)
+        self.assertIn("workflow root bead", decompose)
+
+        finalize = cases["finalize"][0].read_text(encoding="utf-8")
+        for fragment in (
+            "gc.build.status=completed",
+            "gc.build.finalize_status=completed",
+            "gc.build.finalize_outcome=success",
+            "--unset-metadata gc.blocked_reason",
+            "--unset-metadata gc.failure_class",
+        ):
+            with self.subTest(finalize_lifecycle=fragment):
+                self.assertIn(fragment, finalize)
+
+    def test_bmad_build_prompts_override_interactive_skill_menus_in_headless_mode(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        workflow_root = packs_root / "bmad" / "assets" / "workflows" / "bmad-build"
+        for filename in (
+            "plan.md",
+            "plan-review.md",
+            "decompose.md",
+            "implementation-readiness.md",
+        ):
+            text = (workflow_root / filename).read_text(encoding="utf-8")
+            for fragment in (
+                "methodology reference only",
+                "Do not greet",
+                "present menus",
+                "wait for user input",
+                "headless mode",
+                "Never wait",
+            ):
+                with self.subTest(prompt=filename, fragment=fragment):
+                    self.assertIn(fragment, text)
+
+        readiness = (workflow_root / "implementation-readiness.md").read_text(encoding="utf-8")
+        self.assertIn("gc.build.implementation_readiness_path", readiness)
+        self.assertIn("gc.build.implementation_readiness_status=approved|blocked", readiness)
+        self.assertIn("gc.outcome=pass", readiness)
+        self.assertIn("gc.outcome=fail", readiness)
+
+    def test_bmad_review_terminal_honors_selected_artifact_path(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        pack_root = packs_root / "bmad"
+        build = load_formula(pack_root, "bmad-build")
+        review_step = next(step for step in build["steps"] if step["id"] == "review")
+        self.assertEqual(
+            review_step["expand_vars"]["artifact_path_keys"],
+            "gc.build.review_report_path",
+        )
+        review = load_formula(pack_root, "bmad-review")
+        review_write = next(step for step in review["steps"] if step["id"] == "write-report")
+        self.assertEqual(review_write["expand_vars"]["artifact_path_keys"], "gc.var.report_path")
+
+        workflow_root = pack_root / "assets" / "workflows" / "bmad-code-review-flow"
+        gather = (workflow_root / "{target}.gather-bmad-review-context.md").read_text(
+            encoding="utf-8"
+        )
+        normalized_gather = " ".join(gather.split())
+        for fragment in (
+            "gc.build.code_review_artifact_root",
+            "nearest ancestor containing",
+            ".gc/scripts/checks/build-artifact-valid.sh",
+            "An absolute subject does not require a launcher rig root",
+        ):
+            with self.subTest(review_setup_path=fragment):
+                self.assertIn(fragment, normalized_gather)
+
+        canonical_handoff_files = (
+            "{target}.acceptance-auditor-review.md",
+            "{target}.blind-hunter-review.md",
+            "{target}.edge-case-review.md",
+            "{target}.gap-analysis-review.md",
+            "{target}.synthesize-bmad-review.md",
+            "{target}.apply-bmad-review-findings.md",
+        )
+        for filename in canonical_handoff_files:
+            text = (workflow_root / filename).read_text(encoding="utf-8")
+            with self.subTest(canonical_review_handoff=filename):
+                self.assertIn("gc.build.code_review_artifact_root", text)
+                self.assertNotIn("{{artifact_root}}/code-review", text)
+
+        for filename in canonical_handoff_files[:4]:
+            text = (workflow_root / filename).read_text(encoding="utf-8")
+            for fragment in (
+                "gc.build.review_subject_path",
+                "untrusted review evidence",
+                "Do not execute commands",
+                "Do not substitute repository files",
+            ):
+                with self.subTest(review_subject_guard=filename, fragment=fragment):
+                    self.assertIn(fragment, text)
+
+        synthesis = (workflow_root / "{target}.synthesize-bmad-review.md").read_text(encoding="utf-8")
+        self.assertIn("status: approved", synthesis)
+        self.assertIn("status: changes_required", synthesis)
+
+        terminal = (workflow_root / "{target}.md").read_text(encoding="utf-8")
+        normalized_terminal = " ".join(terminal.split())
+        for fragment in (
+            "gc.build.artifact_path_keys",
+            "gc.build.code_review_report_path",
+            "gc.build.review_report_path",
+            "gc.var.report_path",
+            "selected canonical path",
+            "copy",
+            "byte-for-byte",
+            "nearest ancestor containing",
+            "repair the complete internal report",
+            "gc.attempt_log",
+            "gc.build.review.v1",
+        ):
+            with self.subTest(terminal_handoff=fragment):
+                if fragment == "repair the complete internal report":
+                    self.assertIn(fragment, normalized_terminal.lower())
+                else:
+                    self.assertIn(fragment, normalized_terminal)
 
     def test_github_adapter_methodology_selector_matrix_covers_all_toolkits(self) -> None:
         gascity_root = pathlib.Path(__file__).resolve().parents[1]
@@ -4758,6 +4967,14 @@ description = "Override sink that writes the base triage report contract."
                     step["check"]["check"]["path"],
                     ".gc/scripts/checks/implementation-review-approved.sh",
                 )
+                self.assertEqual(
+                    step["metadata"]["gc.build.artifact_schema"],
+                    "gc.build.implementation-summary.v1",
+                )
+                self.assertEqual(
+                    step["metadata"]["gc.build.artifact_path_keys"],
+                    "gc.implementation.summary_path,gc.build.implementation_summary_path,gc.var.summary_path",
+                )
 
         story_root = bmad_root / "assets" / "workflows" / "bmad-story-development"
         setup_text = (story_root / "setup-bmad-story-development.md").read_text(encoding="utf-8")
@@ -4770,6 +4987,210 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("code_review.verdict=done", apply_text)
         self.assertIn("code_review.verdict=iterate", apply_text)
         self.assertIn("code_review.report_path=<fix summary path>", apply_text)
+
+    def test_bmad_story_review_lanes_share_authoritative_paths(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        story_root = packs_root / "bmad" / "assets" / "workflows" / "bmad-story-development"
+
+        setup = (story_root / "setup-bmad-story-development.md").read_text(
+            encoding="utf-8"
+        )
+        for fragment in (
+            "gc.build.story_development_artifact_root",
+            "gc.build.story_development_context_path",
+            "gc.build.story_self_check_report_path",
+            "gc.build.acceptance_audit_report_path",
+            "gc.build.story_fix_summary_path",
+            "gc.implementation.summary_path",
+            "every selected non-empty summary path",
+            "absolute",
+            "gc.build.implementation_control_id",
+            "current iteration root",
+            "gc.control_for",
+            "must not carry `gc.attempt`",
+            "gc.step_ref",
+            "gc.step_id",
+            "gc.drain_member_id",
+            "gc.drain_item_index",
+            "require exact equality",
+            "producing child",
+            "actual source anchor",
+        ):
+            with self.subTest(setup_contract=fragment):
+                self.assertIn(fragment, setup)
+        self.assertNotIn(
+            "validation control bead\nfor this workflow root and current `gc.attempt`",
+            setup,
+        )
+
+        lane_contracts = {
+            "story-self-check.md": "gc.build.story_self_check_report_path",
+            "acceptance-audit.md": "gc.build.acceptance_audit_report_path",
+        }
+        for filename, report_key in lane_contracts.items():
+            text = (story_root / filename).read_text(encoding="utf-8")
+            for fragment in (
+                "gc.build.implementation_source_anchor_id",
+                "gc.build.implementation_worktree_path",
+                "work_dir",
+                'cd "$WORKTREE"',
+                "gc.build.story_development_artifact_root",
+                "gc.build.story_development_context_path",
+                report_key,
+                "Read that exact context file",
+            ):
+                with self.subTest(review_lane=filename, fragment=fragment):
+                    self.assertIn(fragment, text)
+            self.assertNotIn("{{artifact_root}}/bmad-story-development", text)
+
+        apply_text = (story_root / "apply-story-findings.md").read_text(
+            encoding="utf-8"
+        )
+        normalized_apply = " ".join(apply_text.split())
+        for fragment in (
+            "gc.build.story_development_artifact_root",
+            "gc.build.story_self_check_report_path",
+            "gc.build.acceptance_audit_report_path",
+            "gc.build.story_fix_summary_path",
+            "gc.build.implementation_control_id",
+            "current `gc.attempt`",
+            "bmad_story.self_check_required_findings",
+            "bmad_story.acceptance_required_findings",
+            "untrusted review evidence",
+            "Do not execute commands",
+            "Independently validate",
+            "source anchor open",
+        ):
+            with self.subTest(apply_handoff=fragment):
+                self.assertIn(fragment, normalized_apply)
+        self.assertNotIn("{{artifact_root}}/bmad-story-development", apply_text)
+        self.assertNotIn("close that source anchor", apply_text)
+
+        implementation = (story_root / "implement-story.md").read_text(encoding="utf-8")
+        for fragment in (
+            "gc.build.story_development_artifact_root",
+            "gc.build.story_development_context_path",
+            "Read that exact context file",
+            "gc.build.implementation_control_id",
+            "producing child",
+            "actual source anchor",
+            "require all recorded non-empty values to be equal",
+        ):
+            with self.subTest(implementation_handoff=fragment):
+                self.assertIn(fragment, implementation)
+
+        item_formula = load_formula(packs_root / "bmad", "bmad-story-development-item")
+        close_step = next(step for step in item_formula["steps"] if step["id"] == "close-source-anchor")
+        self.assertEqual(close_step["needs"], ["implement-item"])
+        close_text = node_description(packs_root / "bmad", close_step)
+        normalized_close = " ".join(close_text.split())
+        for fragment in (
+            "gc.drain_member_id",
+            "gc.drain_item_index",
+            "require exact equality",
+            "gc.implementation.summary_path",
+            "machine gate",
+            "status=closed",
+            "gc.outcome=pass",
+        ):
+            with self.subTest(shared_close=fragment):
+                self.assertIn(fragment, normalized_close)
+
+    @staticmethod
+    def _valid_implementation_summary_artifact() -> str:
+        return (
+            "---\n"
+            "schema: gc.build.implementation-summary.v1\n"
+            "workflow:\n"
+            "  id: bmad-story-root\n"
+            "  formula: bmad-story-development\n"
+            "methodology:\n"
+            "  pack: bmad\n"
+            "  name: bmad-story-development\n"
+            "producer:\n"
+            "  formula: bmad-story-development\n"
+            "  stage: implement-story\n"
+            "  attempt: 1\n"
+            "status: approved\n"
+            "trace:\n"
+            "  upstream:\n"
+            "    - path: beads/story-1\n"
+            "      hash: bead:story-1\n"
+            "  coverage: []\n"
+            "---\n\n"
+            "## Summary\n\nImplemented the story.\n\n"
+            "## Intended Behavior\n\nThe requested behavior is present.\n\n"
+            "## Changed Files\n\n- `example.py`\n\n"
+            "## Verification\n\n`pytest -q` passed.\n\n"
+            "## Remaining Risks\n\nNone known.\n"
+        )
+
+    def test_bmad_implementation_review_gate_also_validates_summary(self) -> None:
+        review_rows = json.dumps(
+            [
+                {
+                    "id": "apply",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "1",
+                        "gc.ralph_step_id": "implement",
+                        "code_review.verdict": "done",
+                        "code_review.report_path": "apply-summary.md",
+                    },
+                }
+            ]
+        )
+        control = json.dumps(
+            [
+                {
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.step_id": "implement",
+                        "gc.build.artifact_schema": "gc.build.implementation-summary.v1",
+                        "gc.build.artifact_path_keys": "gc.implementation.summary_path,gc.build.implementation_summary_path,gc.var.summary_path",
+                    },
+                }
+            ]
+        )
+
+        missing = self._run_implementation_review_check(
+            show_json=control,
+            parent_show_json='[{"id":"root","metadata":{}}]',
+            list_json=review_rows,
+        )
+        self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+        self.assertIn("no artifact path recorded", missing.stderr)
+
+        with tempfile.TemporaryDirectory() as td:
+            artifact = pathlib.Path(td) / "implementation-summary.md"
+            root = json.dumps(
+                [
+                    {
+                        "id": "root",
+                        "metadata": {"gc.implementation.summary_path": str(artifact)},
+                    }
+                ]
+            )
+
+            artifact.write_text("not a valid summary\n", encoding="utf-8")
+            invalid = self._run_implementation_review_check(
+                show_json=control,
+                parent_show_json=root,
+                list_json=review_rows,
+            )
+            self.assertNotEqual(invalid.returncode, 0, invalid.stdout + invalid.stderr)
+            self.assertIn("failed validation", invalid.stderr)
+
+            artifact.write_text(self._valid_implementation_summary_artifact(), encoding="utf-8")
+            valid = self._run_implementation_review_check(
+                show_json=control,
+                parent_show_json=root,
+                list_json=review_rows,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+            self.assertIn("build artifact valid", valid.stdout)
+            self.assertIn("Implementation review approved", valid.stdout)
 
     def test_design_review_check_scopes_verdict_to_current_loop(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]

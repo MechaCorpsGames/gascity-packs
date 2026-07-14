@@ -426,16 +426,10 @@ class DerivedPackCompatibilityTests(unittest.TestCase):
         }
         for pack_name, expected in DERIVED_PACKS.items():
             review_report_gate = base_contract.REVIEW_REPORT_GATE
-            if pack_name in {"compound-engineering", "superpowers", "gstack"}:
+            if pack_name in {"compound-engineering", "superpowers", "gstack", "bmad"}:
                 review_report_gate = (
                     base_contract.REVIEW_REPORT_GATE[0],
                     "gc.var.report_path",
-                )
-            elif pack_name == "bmad":
-                review_report_gate = (
-                    base_contract.REVIEW_REPORT_GATE[0],
-                    "gc.build.code_review_report_path,"
-                    + base_contract.REVIEW_REPORT_GATE[1],
                 )
             formula_gates = {
                 expected["formula"]: build_gates,
