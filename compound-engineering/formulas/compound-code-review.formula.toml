@@ -247,7 +247,7 @@ needs = [
   "{target}.deployment-verification",
   "{target}.gap-analysis-review",
 ]
-metadata = { "gc.run_target" = "compound-engineering.ce-code-review-synthesizer" }
+metadata = { "gc.run_target" = "compound-engineering.ce-code-review-synthesizer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.code_review_report_path" }
 description_file = "../assets/workflows/compound-code-review/{target}.synthesize-code-review.md"
 
 [[template.children]]
