@@ -1,12 +1,94 @@
 Implement the assigned gstack work bead.
 
-Gas City owns the worktree, bead, and convoy plumbing. Read the assigned
-implementation bead, the approved plan, and any context bundle before editing.
-Use the gstack discipline: ship the narrowest complete slice, test it, review
-your own diff, and record proof.
+Gas City owns the worktree, bead, and convoy plumbing. Resolve the source anchor
+before reading or editing source. Read the claimed step bead's
+`gc.root_bead_id`, then read that gstack-work workflow root bead and its
+`gc.input_convoy_id`. If the input convoy has
+`gc.synthetic_kind=drain-unit-convoy`, use its `gc.drain_member_id` as the
+source anchor; otherwise use the input convoy ID. Never use a dependency or the
+synthetic convoy itself as the source anchor.
 
-Your summary must include intended behavior, first verification command,
-changed files, proof command, remaining risks, and any release consideration.
+Read `work_dir` from the source anchor and require it to be an absolute,
+existing git worktree distinct from the launcher checkout. Set `WORKTREE` to
+that path, run `cd "$WORKTREE"`, and verify `pwd -P` equals `$WORKTREE` before
+any source read, source edit, test, hash, commit, or proof command. `gc.work_dir`
+on the workflow root bead is the launcher rig root used for validation; it is
+not the implementation worktree.
+
+Read the assigned implementation bead, approved plan, and any context bundle
+only after entering the authoritative worktree. Use the gstack discipline: ship
+the narrowest complete slice, test it, review your own diff, and record proof.
+
+Write the implementation summary as Markdown with YAML front matter valid for
+`gc.build.implementation-summary.v1`, not as a freeform note or JSON. Read its
+path from workflow root metadata `gc.implementation.summary_path` (fallbacks
+`gc.build.implementation_summary_path`, then `gc.var.summary_path`). If all are
+blank, derive an absolute per-item path for this source anchor and record it on
+the workflow root bead as `gc.implementation.summary_path` before closing.
+
+Use nested mappings with this top-level shape:
+
+```yaml
+---
+schema: gc.build.implementation-summary.v1
+workflow:
+  id: <gstack-work-workflow-root-id>
+  formula: gstack-work
+methodology:
+  pack: gstack
+  name: gstack-work
+producer:
+  formula: gstack-work
+  stage: implement
+  attempt: <positive integer>
+status: approved
+trace: {upstream: [...], coverage: [...]}
+---
+```
+
+The artifact's first line must be `---`. Every `trace.upstream` entry must have
+`path` and a scheme-qualified `hash`. Represent the source anchor as
+`path: beads/<source-anchor-id>` and `hash: bead:<source-anchor-id>`. Preserve
+actual source IDs verbatim; never invent, substitute, or renumber them. Every
+upstream ID must appear exactly once in `trace.coverage`; when the source
+declares no IDs, omit `ids` and use `coverage: []`. Every non-`covered` entry
+must have a rationale. Include one Markdown table whose `ID` and `Status` pairs
+exactly match the YAML coverage:
+
+| ID | Status |
+| --- | --- |
+| <actual-source-id> | covered |
+
+Only include the example data row when coverage is non-empty, and replace the
+placeholder with an actual ID. When coverage is empty, do not add a data row;
+omit the table or use only its header and separator.
+
+Use these schema-required second-level headings in this exact order:
+
+- `## Summary`
+- `## Intended Behavior`
+- `## Changed Files`
+- `## Verification`
+- `## Remaining Risks`
+
+Include intended behavior, the first verification command and observed result,
+changed files, the final proof command and observed result, remaining risks,
+and any release consideration.
+
+Before closing, return only as needed to the launcher rig root resolved from
+the workflow root bead's `gc.work_dir` and run the canonical check without
+using the launcher checkout for source operations. If that root does not contain
+the validator, use the nearest ancestor containing
+`.gc/scripts/checks/build-artifact-valid.sh`. Read the exact current bead ID
+from the startup claim output and substitute it literally below; shell variables
+from earlier tool calls do not persist:
+
+```bash
+GC_BEAD_ID=<exact-claimed-bead-id> <launcher-rig>/.gc/scripts/checks/build-artifact-valid.sh
+```
+
+Fix every validation error in the recorded summary before setting
+`gc.outcome=pass`.
 
 Close with `gc.outcome=pass` only after the work is implemented and verified.
 

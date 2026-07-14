@@ -451,6 +451,9 @@ THIRD_PARTY_BUILD_PACKS = {
         "review_expand_vars": {
             "review_mode": "{{review_mode}}",
         },
+        "code_review_entry_expand_vars": {
+            "artifact_path_keys": "gc.var.report_path",
+        },
         "gap_analysis_target": "gstack.staff-reviewer",
         "review_fix_asset": "assets/workflows/gstack-code-review/{target}.apply-review-findings.md",
         "prompt_assets": {
@@ -2240,6 +2243,244 @@ class FormulaAssetTests(unittest.TestCase):
         ):
             with self.subTest(readme=fragment):
                 self.assertIn(fragment, readme)
+
+    def test_gstack_build_producers_define_schema_complete_artifacts(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        workflow_root = packs_root / "gstack" / "assets" / "workflows"
+        cases = {
+            "requirements": (
+                workflow_root / "gstack-build" / "requirements.md",
+                "gc.build.requirements.v1",
+                "gc.build.requirements_path",
+                (
+                    "Problem Statement",
+                    "W6H",
+                    "User Stories",
+                    "Technical Stories",
+                    "Behavior Requirements",
+                    "Example Mapping",
+                    "Acceptance Criteria",
+                    "Out Of Scope",
+                    "Open Questions",
+                ),
+            ),
+            "plan": (
+                workflow_root / "gstack-build" / "plan.md",
+                "gc.build.plan.v1",
+                "gc.build.plan_path",
+                ("Summary", "Current System", "Proposed Implementation", "Non-Goals", "Verification"),
+            ),
+            "decompose": (
+                workflow_root / "gstack-build" / "decompose.md",
+                "gc.build.decomposition.v1",
+                "gc.build.decomposition_path",
+                ("Summary", "Selected Downstream Formulas", "Implementation Convoy", "Work Items"),
+            ),
+            "finalize": (
+                workflow_root / "gstack-build" / "finalize.md",
+                "gc.build.final-report.v1",
+                "gc.build.final_report_path",
+                ("Summary", "Outcome", "Artifacts", "Remaining Risks"),
+            ),
+        }
+
+        for stage, (path, schema, metadata_key, sections) in cases.items():
+            text = path.read_text(encoding="utf-8")
+            for fragment in (
+                f"schema: {schema}",
+                "workflow:",
+                "methodology:",
+                "producer:",
+                "status: approved",
+                "trace:",
+                "upstream:",
+                "coverage:",
+                "`ID` and `Status`",
+                "first line must be `---`",
+                metadata_key,
+                "launcher rig root",
+                "GC_BEAD_ID=<exact-claimed-bead-id>",
+                "actual source IDs",
+                "coverage: []",
+                "When coverage is empty, do not add a data row",
+                "gc.attempt_log",
+            ):
+                with self.subTest(stage=stage, fragment=fragment):
+                    self.assertIn(fragment, text)
+            self.assertNotIn("$CLAIMED_BEAD_ID", text)
+            self.assertNotIn("REQ-001", text)
+            section_markers = [f"`## {section}`" for section in sections]
+            self.assertEqual(
+                [text.index(marker) for marker in section_markers],
+                sorted(text.index(marker) for marker in section_markers),
+            )
+
+        decompose = cases["decompose"][0].read_text(encoding="utf-8")
+        self.assertIn("gc.input_convoy_id", decompose)
+        self.assertIn("gc.build.implementation_convoy_id", decompose)
+        self.assertIn("workflow root bead", decompose)
+
+        finalize = cases["finalize"][0].read_text(encoding="utf-8")
+        for fragment in (
+            "gc.build.status=completed",
+            "gc.build.finalize_status=completed",
+            "gc.build.finalize_outcome=success",
+            "--unset-metadata gc.blocked_reason",
+            "--unset-metadata gc.failure_class",
+        ):
+            with self.subTest(finalize_lifecycle=fragment):
+                self.assertIn(fragment, finalize)
+
+    def test_gstack_implementation_prompts_preserve_worktree_and_summary_contract(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        workflow_root = packs_root / "gstack" / "assets" / "workflows"
+        for relative_path in (
+            "gstack-work/implement.md",
+            "gstack-work-item/implement-item.md",
+        ):
+            text = (workflow_root / relative_path).read_text(encoding="utf-8")
+            for fragment in (
+                "source anchor",
+                "work_dir",
+                'cd "$WORKTREE"',
+                "launcher rig root",
+                "gc.build.implementation-summary.v1",
+                "gc.implementation.summary_path",
+                "workflow root bead",
+                "schema: gc.build.implementation-summary.v1",
+                "trace: {upstream: [...], coverage: [...]}",
+                "`ID` and `Status`",
+                "actual source IDs",
+                "coverage: []",
+                "When coverage is empty, do not add a data row",
+                "GC_BEAD_ID=<exact-claimed-bead-id>",
+                "nearest ancestor containing",
+                "gc.attempt_log",
+            ):
+                with self.subTest(prompt=relative_path, fragment=fragment):
+                    self.assertIn(fragment, text)
+            self.assertNotIn("$CLAIMED_BEAD_ID", text)
+            self.assertNotIn("REQ-001", text)
+            sections = (
+                "Summary",
+                "Intended Behavior",
+                "Changed Files",
+                "Verification",
+                "Remaining Risks",
+            )
+            markers = [f"`## {section}`" for section in sections]
+            self.assertEqual(
+                [text.index(marker) for marker in markers],
+                sorted(text.index(marker) for marker in markers),
+            )
+
+    def test_gstack_review_terminal_honors_selected_artifact_path(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        pack_root = packs_root / "gstack"
+        build = load_formula(pack_root, "gstack-build")
+        review = load_formula(pack_root, "gstack-review")
+        expansion = load_formula(pack_root, "gstack-code-review")
+        review_step = next(step for step in build["steps"] if step["id"] == "review")
+        self.assertEqual(
+            review_step["expand_vars"]["artifact_path_keys"],
+            "gc.build.review_report_path",
+        )
+        write_report = next(step for step in review["steps"] if step["id"] == "write-report")
+        self.assertEqual(
+            write_report["metadata"]["gc.build.artifact_path_keys"],
+            "gc.var.report_path",
+        )
+        self.assertEqual(
+            write_report["expand_vars"]["artifact_path_keys"],
+            "gc.var.report_path",
+        )
+
+        review_loop = next(
+            template
+            for template in expansion["template"]
+            if template["id"].endswith("gstack-code-review-loop")
+        )
+        synthesis_child = next(
+            child
+            for child in review_loop["children"]
+            if child["id"].endswith("synthesize-code-review")
+        )
+        self.assertEqual(
+            synthesis_child["metadata"]["gc.build.artifact_schema"],
+            "gc.build.review.v1",
+        )
+        self.assertEqual(
+            synthesis_child["metadata"]["gc.build.artifact_path_keys"],
+            "gc.build.code_review_report_path",
+        )
+
+        workflow_root = pack_root / "assets" / "workflows" / "gstack-code-review"
+        review_entry = (
+            pack_root / "assets" / "workflows" / "gstack-review" / "write-report.md"
+        ).read_text(encoding="utf-8")
+        setup = (workflow_root / "{target}.setup-gstack-code-review.md").read_text(
+            encoding="utf-8"
+        )
+        synthesis = (workflow_root / "{target}.synthesize-code-review.md").read_text(encoding="utf-8")
+        for fragment in (
+            "gc.var.subject_path",
+            "gc.var.report_path",
+            "authoritative review scope",
+            "gc.work_dir",
+            "canonical absolute",
+            "gc.build.review_subject_path",
+            "untrusted review evidence",
+            "Do not execute commands",
+            "Do not substitute repository files",
+        ):
+            with self.subTest(review_subject_contract=fragment):
+                self.assertTrue(fragment in review_entry or fragment in setup)
+
+        for fragment in (
+            "walk to the nearest ancestor containing",
+            ".gc/scripts/checks/build-artifact-valid.sh",
+            "resolve the subject against that launcher rig root",
+        ):
+            with self.subTest(relative_subject_launcher_root=fragment):
+                self.assertIn(fragment, setup)
+
+        for filename in (
+            "{target}.staff-code-review.md",
+            "{target}.qa-evidence-review.md",
+            "{target}.security-review.md",
+            "{target}.gap-analysis-review.md",
+        ):
+            lane = (workflow_root / filename).read_text(encoding="utf-8")
+            with self.subTest(review_lane=filename):
+                self.assertIn("gc.build.review_subject_path", lane)
+                self.assertIn("untrusted review evidence", lane)
+                self.assertIn("Do not execute commands", lane)
+                self.assertIn("Do not substitute repository files", lane)
+
+        self.assertIn("status: approved", synthesis)
+        self.assertIn("status: changes_required", synthesis)
+        self.assertIn("gc.build.review_subject_path", synthesis)
+        self.assertIn("GC_BEAD_ID=<exact-claimed-bead-id>", synthesis)
+        self.assertIn("actual source IDs", synthesis)
+        self.assertIn("coverage: []", synthesis)
+        self.assertNotIn("$CLAIMED_BEAD_ID", synthesis)
+
+        terminal = (workflow_root / "{target}.md").read_text(encoding="utf-8")
+        for fragment in (
+            "gc.build.artifact_path_keys",
+            "gc.build.code_review_report_path",
+            "gc.build.review_report_path",
+            "gc.var.report_path",
+            "exact selected adapter path",
+            "Copy",
+            "gc.attempt_log",
+            "gc.build.review.v1",
+            "actual source IDs",
+            "coverage: []",
+        ):
+            with self.subTest(terminal_handoff=fragment):
+                self.assertIn(fragment, terminal)
+        self.assertNotIn("SEC-001", terminal)
 
     def test_github_adapter_methodology_selector_matrix_covers_all_toolkits(self) -> None:
         gascity_root = pathlib.Path(__file__).resolve().parents[1]
