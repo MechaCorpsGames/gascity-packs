@@ -716,6 +716,19 @@ class FormulaAssetTests(unittest.TestCase):
             "sha256sum",
             "64 hexadecimal digits",
             "Never use a placeholder digest",
+            "schema: gc.build.review.v1",
+            "id: <workflow-root-id>",
+            "formula: review",
+            "pack: gascity",
+            "name: review",
+            "stage: write-report",
+            "attempt: <positive integer>",
+            "status: changes_required",
+            "coverage: []",
+            "## Verdict",
+            "## Findings",
+            "## Verification",
+            "correct the whole contract",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, prompt)
