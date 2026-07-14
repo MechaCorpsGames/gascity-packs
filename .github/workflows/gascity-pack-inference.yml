@@ -54,8 +54,8 @@ permissions:
   contents: read
 
 env:
-  DOLT_VERSION: "2.1.7"
-  BD_VERSION: "v1.1.0"
+  DOLT_VERSION: "2.1.0"
+  BD_VERSION: "v1.0.4"
   CLAUDE_VERSION: "2.1.123"
   ANTHROPIC_BASE_URL: https://ollama.com
   ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
@@ -96,7 +96,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.26.5"
+          go-version: "1.25.10"
 
       - name: Set up Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020

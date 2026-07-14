@@ -254,6 +254,19 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           "$(go env GOPATH)/bin/gc" version
 
+      - name: Verify Beads compatibility
+        if: steps.subset.outputs.run_gate == 'true'
+        run: |
+          gc_beads_version="$(go version -m "$(go env GOPATH)/bin/gc" | awk '$1 == "dep" && $2 == "github.com/steveyegge/beads" { print $3 }')"
+          bd_cli_version="$(bd version | awk '{ print $3 }')"
+          test -n "$gc_beads_version" || { echo "Gas City binary does not report its Beads dependency" >&2; exit 1; }
+          test -n "$bd_cli_version" || { echo "Could not determine the bd CLI version" >&2; exit 1; }
+          if [ "v${bd_cli_version#v}" != "$gc_beads_version" ]; then
+            echo "bd CLI v${bd_cli_version#v} does not match Gas City Beads dependency $gc_beads_version" >&2
+            exit 1
+          fi
+          echo "Verified Beads compatibility: bd v${bd_cli_version#v} = Gas City $gc_beads_version"
+
       - name: Validate Ollama Claude configuration
         if: steps.subset.outputs.run_gate == 'true'
         run: |
