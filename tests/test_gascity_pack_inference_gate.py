@@ -161,6 +161,7 @@ def test_write_gate_workspace_uses_city_and_rig_scope_imports(tmp_path) -> None:
     assert "provider = \"tmux\"" not in city_toml
     assert "socket =" not in city_toml
     assert 'startup_timeout = "3m"' in city_toml
+    assert 'progress_stall_timeout = "10m"' in city_toml
     assert "[[rigs]]" in city_toml
     assert 'name = "fixture"' in city_toml
     assert "[rigs.imports.gc]" in city_toml

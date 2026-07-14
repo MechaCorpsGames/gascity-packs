@@ -782,6 +782,7 @@ def write_gate_workspace(
             "",
             "[session]",
             'startup_timeout = "3m"',
+            'progress_stall_timeout = "10m"',
             "",
             "[daemon]",
             "formula_v2 = true",
