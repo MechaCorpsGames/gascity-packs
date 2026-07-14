@@ -4411,6 +4411,41 @@ description = "Override sink that writes the base triage report contract."
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("build artifact valid", result.stdout)
 
+    def test_build_artifact_check_resolves_relative_path_from_launcher_root(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            launcher_root = pathlib.Path(artifact_dir) / "rig"
+            attempt_worktree = launcher_root / ".gc" / "worktrees" / "review-attempt"
+            attempt_worktree.mkdir(parents=True)
+            check_marker = (
+                launcher_root / ".gc" / "scripts" / "checks" / "build-artifact-valid.sh"
+            )
+            check_marker.parent.mkdir(parents=True)
+            check_marker.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+            artifact = launcher_root / "artifacts" / "requirements.md"
+            artifact.parent.mkdir()
+            artifact.write_text(self._valid_requirements_artifact(), encoding="utf-8")
+
+            control = (
+                '[{"id": "loop", "metadata": {'
+                '"gc.root_bead_id": "root", '
+                '"gc.build.artifact_schema": "gc.build.requirements.v1", '
+                '"gc.build.artifact_path_keys": "gc.build.requirements_path"}}]'
+            )
+            root_bead = (
+                '[{"id": "root", "metadata": {'
+                '"gc.build.requirements_path": "artifacts/requirements.md"'
+                "}}]"
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+                extra_env={"GC_WORK_DIR": str(attempt_worktree)},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"path={artifact}", result.stdout)
+
     def test_build_artifact_check_blocks_invalid_artifact_with_repair_context(self) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:
             artifact = pathlib.Path(artifact_dir) / "requirements.md"

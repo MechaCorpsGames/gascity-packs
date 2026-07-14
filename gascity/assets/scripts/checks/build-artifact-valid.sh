@@ -48,6 +48,23 @@ print(value if isinstance(value, str) else "")
 ' "$2"
 }
 
+launcher_root_from_work_dir() {
+  candidate="${GC_WORK_DIR:-}"
+  [ -n "$candidate" ] || return 1
+  candidate="$(cd "$candidate" 2>/dev/null && pwd -P)" || return 1
+
+  while :; do
+    if [ -f "$candidate/.gc/scripts/checks/build-artifact-valid.sh" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    [ "$candidate" != "/" ] || return 1
+    parent="$(dirname "$candidate")"
+    [ "$parent" != "$candidate" ] || return 1
+    candidate="$parent"
+  done
+}
+
 SHOW_JSON="$(gc bd show "$BEAD_ID" --json 2>/dev/null)" || fail "gc bd show $BEAD_ID failed"
 
 SCHEMA="$(metadata_value "$SHOW_JSON" "gc.build.artifact_schema")"
@@ -80,7 +97,8 @@ case "$ARTIFACT_PATH" in
   /*) ;;
   *)
     [ -n "${GC_WORK_DIR:-}" ] || fail "artifact path $ARTIFACT_PATH from $RESOLVED_KEY is relative and GC_WORK_DIR is unset"
-    ARTIFACT_PATH="$GC_WORK_DIR/$ARTIFACT_PATH"
+    LAUNCHER_ROOT="$(launcher_root_from_work_dir)" || fail "artifact path $ARTIFACT_PATH from $RESOLVED_KEY is relative but no launcher root containing .gc/scripts/checks/build-artifact-valid.sh exists at or above GC_WORK_DIR=$GC_WORK_DIR"
+    ARTIFACT_PATH="$LAUNCHER_ROOT/$ARTIFACT_PATH"
     ;;
 esac
 [ -f "$ARTIFACT_PATH" ] || fail "artifact $ARTIFACT_PATH from $RESOLVED_KEY does not exist"
