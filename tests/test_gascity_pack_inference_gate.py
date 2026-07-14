@@ -987,7 +987,7 @@ case "$*" in
     printf '[{{"id":"fi-root","title":"root","status":"closed","metadata":{{"gc.outcome":"pass"}}}}]\\n'
     ;;
   *"bd list --all --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper's argv tail
-    printf '[{{"id":"fi-other","title":"other","status":"open"}}]\\n'
+    printf '[{{"id":"fi-finalize","title":"Finalize workflow","status":"closed","metadata":{{"gc.root_bead_id":"fi-root","gc.kind":"workflow-finalize","gc.outcome":"pass"}}}}]\\n'
     ;;
   *)
     printf '{{}}\\n'
@@ -1046,6 +1046,128 @@ esac
         )
 
 
+def test_wait_for_workflow_pass_waits_for_non_attempt_finalizer(tmp_path, monkeypatch) -> None:
+    workspace = gate_workspace(tmp_path)
+    root = {"id": "fi-root", "status": "closed", "metadata": {"gc.outcome": "pass"}}
+    snapshots = [
+        [
+            {
+                "id": "fi-finalize-attempt",
+                "status": "closed",
+                "metadata": {
+                    "gc.root_bead_id": "fi-root",
+                    "gc.kind": "workflow-finalize",
+                    "gc.attempt": "1",
+                    "gc.outcome": "pass",
+                },
+            }
+        ],
+        [
+            {
+                "id": "fi-finalize",
+                "status": "open",
+                "metadata": {
+                    "gc.root_bead_id": "fi-root",
+                    "gc.kind": "workflow-finalize",
+                },
+            }
+        ],
+        [
+            {
+                "id": "fi-finalize",
+                "status": "closed",
+                "metadata": {
+                    "gc.root_bead_id": "fi-root",
+                    "gc.kind": "workflow-finalize",
+                    "gc.outcome": "pass",
+                },
+            }
+        ],
+    ]
+    observed: list[list[dict]] = []
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "show_bead", lambda *args, **kwargs: root)
+
+    def list_beads(*args, **kwargs):
+        snapshot = snapshots[min(len(observed), len(snapshots) - 1)]
+        observed.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "list_beads", list_beads)
+
+    bead = gascity_pack_inference_gate.wait_for_workflow_pass(
+        "gc",
+        workspace,
+        "fi-root",
+        env={},
+        timeout=5,
+        poll_interval=0,
+    )
+
+    assert bead == root
+    assert len(observed) == 3
+
+
+def test_wait_for_workflow_pass_rejects_failed_finalizer(tmp_path, monkeypatch) -> None:
+    workspace = gate_workspace(tmp_path)
+    root = {"id": "fi-root", "status": "closed", "metadata": {"gc.outcome": "pass"}}
+    finalizer = {
+        "id": "fi-finalize",
+        "title": "Finalize workflow",
+        "status": "closed",
+        "metadata": {
+            "gc.root_bead_id": "fi-root",
+            "gc.kind": "workflow-finalize",
+            "gc.outcome": "fail",
+        },
+    }
+    monkeypatch.setattr(gascity_pack_inference_gate, "show_bead", lambda *args, **kwargs: root)
+    monkeypatch.setattr(gascity_pack_inference_gate, "list_beads", lambda *args, **kwargs: [finalizer])
+    monkeypatch.setattr(gascity_pack_inference_gate, "collect_diagnostics", lambda *args, **kwargs: "diagnostics")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="logical workflow control failed.*fi-finalize"):
+        gascity_pack_inference_gate.wait_for_workflow_pass(
+            "gc",
+            workspace,
+            "fi-root",
+            env={},
+            timeout=5,
+            poll_interval=0,
+        )
+
+
+@pytest.mark.parametrize("marker", ("gc.blocked_reason", "gc.failure_class"))
+def test_wait_for_workflow_pass_rejects_stale_root_failure_marker(tmp_path, monkeypatch, marker: str) -> None:
+    workspace = gate_workspace(tmp_path)
+    root = {
+        "id": "fi-root",
+        "status": "closed",
+        "metadata": {"gc.outcome": "pass", marker: "stale failure state"},
+    }
+    finalizer = {
+        "id": "fi-finalize",
+        "status": "closed",
+        "metadata": {
+            "gc.root_bead_id": "fi-root",
+            "gc.kind": "workflow-finalize",
+            "gc.outcome": "pass",
+        },
+    }
+    monkeypatch.setattr(gascity_pack_inference_gate, "show_bead", lambda *args, **kwargs: root)
+    monkeypatch.setattr(gascity_pack_inference_gate, "list_beads", lambda *args, **kwargs: [finalizer])
+    monkeypatch.setattr(gascity_pack_inference_gate, "collect_diagnostics", lambda *args, **kwargs: "diagnostics")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=marker):
+        gascity_pack_inference_gate.wait_for_workflow_pass(
+            "gc",
+            workspace,
+            "fi-root",
+            env={},
+            timeout=5,
+            poll_interval=0,
+        )
+
+
 def test_failed_logical_controls_ignore_attempt_beads() -> None:
     beads = [
         {
@@ -1067,41 +1189,21 @@ def test_failed_logical_controls_ignore_attempt_beads() -> None:
 
 def test_validate_review_report_requires_blocking_base_gascity_report(tmp_path) -> None:
     workspace = gate_workspace(tmp_path)
-    report_path = workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
     report_path.parent.mkdir(parents=True)
     report_path.write_text(valid_review_artifact(status="changes_required"), encoding="utf-8")
 
     gascity_pack_inference_gate.validate_review_report(
-        {"metadata": {}},
+        {"metadata": {"gc.var.report_path": str(report_path)}},
         workspace,
         env={},
         pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],
     )
 
 
-def test_validate_review_report_resolves_relative_path_from_root_work_dir(tmp_path) -> None:
+def test_validate_review_report_accepts_exact_methodology_adapter_report(tmp_path) -> None:
     workspace = gate_workspace(tmp_path)
-    work_dir = workspace.rig_dir / "fi-3ph-write-review-report"
-    report_path = work_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH
-    report_path.parent.mkdir(parents=True)
-    report_path.write_text(valid_review_artifact(status="changes_required"), encoding="utf-8")
-
-    gascity_pack_inference_gate.validate_review_report(
-        {
-            "metadata": {
-                "gc.work_dir": str(work_dir),
-                "gc.var.report_path": str(gascity_pack_inference_gate.REVIEW_REPORT_PATH),
-            }
-        },
-        workspace,
-        env={},
-        pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],
-    )
-
-
-def test_validate_review_report_accepts_methodology_fix_summary_from_metadata(tmp_path) -> None:
-    workspace = gate_workspace(tmp_path)
-    report_path = workspace.rig_dir / ".gc" / "inference-gate" / "artifacts" / "review-fix-summary.md"
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
     report_path.parent.mkdir(parents=True)
     report_path.write_text(valid_review_artifact(status="approved"), encoding="utf-8")
     pack_spec = replace(
@@ -1110,22 +1212,103 @@ def test_validate_review_report_accepts_methodology_fix_summary_from_metadata(tm
     )
 
     gascity_pack_inference_gate.validate_review_report(
-        {"metadata": {"gc.build.code_review_report_path": str(report_path.relative_to(workspace.rig_dir))}},
+        {"metadata": {"gc.var.report_path": str(report_path)}},
         workspace,
         env={},
         pack_spec=pack_spec,
     )
 
 
+def test_validate_review_report_rejects_relative_root_report_path(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    work_dir = workspace.rig_dir / "fi-3ph-write-review-report"
+    report_path = work_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH
+    report_path.parent.mkdir(parents=True)
+    report_path.write_text(valid_review_artifact(status="changes_required"), encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="gc.var.report_path.*absolute"):
+        gascity_pack_inference_gate.validate_review_report(
+            {
+                "metadata": {
+                    "gc.work_dir": str(work_dir),
+                    "gc.var.report_path": str(gascity_pack_inference_gate.REVIEW_REPORT_PATH),
+                }
+            },
+            workspace,
+            env={},
+            pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],
+        )
+
+
+def test_validate_review_report_rejects_root_path_different_from_adapter_request(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    internal_path = (workspace.rig_dir / ".gc" / "internal" / "review-report.md").resolve()
+    internal_path.parent.mkdir(parents=True)
+    internal_path.write_text(valid_review_artifact(status="changes_required"), encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="does not match requested adapter report"):
+        gascity_pack_inference_gate.validate_review_report(
+            {"metadata": {"gc.var.report_path": str(internal_path)}},
+            workspace,
+            env={},
+            pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],
+        )
+
+
+def test_validate_review_report_rejects_internal_metadata_report(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    requested_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    internal_path = workspace.rig_dir / ".gc" / "inference-gate" / "artifacts" / "implementation-review.md"
+    internal_path.parent.mkdir(parents=True)
+    internal_path.write_text(valid_review_artifact(status="approved"), encoding="utf-8")
+    pack_spec = replace(
+        gascity_pack_inference_gate.PACK_SPECS["superpowers"],
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="requested review report.*missing"):
+        gascity_pack_inference_gate.validate_review_report(
+            {
+                "metadata": {
+                    "gc.var.report_path": str(requested_path),
+                    "gc.build.code_review_report_path": str(internal_path),
+                }
+            },
+            workspace,
+            env={},
+            pack_spec=pack_spec,
+        )
+
+
+def test_validate_review_report_rejects_methodology_fallback(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    requested_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    fallback_path = workspace.rig_dir / ".gc" / "inference-gate" / "artifacts" / "review-fix-summary.md"
+    fallback_path.parent.mkdir(parents=True)
+    fallback_path.write_text(valid_review_artifact(status="approved"), encoding="utf-8")
+    pack_spec = replace(
+        gascity_pack_inference_gate.PACK_SPECS["superpowers"],
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="requested review report.*missing"):
+        gascity_pack_inference_gate.validate_review_report(
+            {"metadata": {"gc.var.report_path": str(requested_path)}},
+            workspace,
+            env={},
+            pack_spec=pack_spec,
+        )
+
+
 def test_validate_review_report_rejects_approved_base_gascity_report(tmp_path) -> None:
     workspace = gate_workspace(tmp_path)
-    report_path = workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
     report_path.parent.mkdir(parents=True)
     report_path.write_text(valid_review_artifact(status="approved"), encoding="utf-8")
 
     with pytest.raises(gascity_pack_inference_gate.GateError, match="valid expected review artifact"):
         gascity_pack_inference_gate.validate_review_report(
-            {"metadata": {}},
+            {"metadata": {"gc.var.report_path": str(report_path)}},
             workspace,
             env={},
             pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],

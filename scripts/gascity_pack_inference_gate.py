@@ -40,14 +40,6 @@ GASTOWN_PACK = "gastown"
 GASCITY_REMOTE_SOURCE = "https://github.com/gastownhall/gascity.git"
 REVIEW_SUBJECT_PATH = Path(".gc/inference-gate/review-subject.diff")
 REVIEW_REPORT_PATH = Path(".gc/inference-gate/review-report.md")
-REVIEW_REPORT_METADATA_KEYS = (
-    "gc.build.code_review_report_path",
-    "gc.build.review_report_path",
-    "code_review.report_path",
-    "code_review.review_report_path",
-    "gc.var.report_path",
-    "report_path",
-)
 LOGICAL_CONTROL_KINDS = frozenset(
     {
         "check",
@@ -59,11 +51,6 @@ LOGICAL_CONTROL_KINDS = frozenset(
         "scope-check",
         "workflow-finalize",
     }
-)
-METHODOLOGY_REVIEW_REPORT_FALLBACKS = (
-    Path(".gc/inference-gate/artifacts/review-fix-summary.md"),
-    Path(".gc/inference-gate/artifacts/implementation-review-report.md"),
-    Path(".gc/inference-gate/artifacts/gap-analysis-report.md"),
 )
 REVIEW_FORMULA = "review"
 REVIEW_TITLE = "gascity pack inference gate: review"
@@ -1693,6 +1680,22 @@ def failed_logical_controls(
     return sorted(failures, key=lambda bead: str(bead.get("id") or ""))
 
 
+def workflow_finalizers(
+    beads: Sequence[Mapping[str, Any]],
+    root_id: str,
+) -> list[Mapping[str, Any]]:
+    return sorted(
+        (
+            bead
+            for bead in beads
+            if metadata_value(bead, "gc.root_bead_id") == root_id
+            and metadata_value(bead, "gc.kind") == "workflow-finalize"
+            and not metadata_value(bead, "gc.attempt")
+        ),
+        key=lambda bead: str(bead.get("id") or ""),
+    )
+
+
 def wait_for_workflow_pass(
     gc_bin: str,
     workspace: GateWorkspace,
@@ -1711,10 +1714,8 @@ def wait_for_workflow_pass(
         print(f"workflow {root_id}: status={status or '<unset>'} outcome={outcome or '<unset>'}", flush=True)
         if status == "closed":
             if outcome == "pass":
-                failed_controls = failed_logical_controls(
-                    list_beads(gc_bin, workspace, env=env),
-                    root_id,
-                )
+                beads = list_beads(gc_bin, workspace, env=env)
+                failed_controls = failed_logical_controls(beads, root_id)
                 if failed_controls:
                     details = ", ".join(
                         f"{bead.get('id', '<unknown>')}"
@@ -1725,14 +1726,51 @@ def wait_for_workflow_pass(
                         f"logical workflow control failed beneath closed/pass root {root_id}: {details}\n"
                         + collect_diagnostics(gc_bin, workspace, env=env)
                     )
-                return last_bead
+
+                finalizers = workflow_finalizers(beads, root_id)
+                if not finalizers:
+                    print(f"workflow {root_id}: waiting for workflow-finalize control", flush=True)
+                elif any(str(bead.get("status") or "") != "closed" for bead in finalizers):
+                    states = ", ".join(
+                        f"{bead.get('id', '<unknown>')}={bead.get('status', '<unset>')}" for bead in finalizers
+                    )
+                    print(f"workflow {root_id}: waiting for workflow-finalize controls ({states})", flush=True)
+                else:
+                    incomplete_finalizers = [
+                        bead for bead in finalizers if metadata_value(bead, "gc.outcome") != "pass"
+                    ]
+                    if incomplete_finalizers:
+                        details = ", ".join(
+                            f"{bead.get('id', '<unknown>')}={metadata_value(bead, 'gc.outcome') or '<unset>'}"
+                            for bead in incomplete_finalizers
+                        )
+                        raise GateError(
+                            f"workflow-finalize controls beneath closed/pass root {root_id} did not pass: {details}\n"
+                            + collect_diagnostics(gc_bin, workspace, env=env)
+                        )
+
+                    stale_markers = [
+                        (key, metadata_value(last_bead, key))
+                        for key in ("gc.blocked_reason", "gc.failure_class")
+                        if metadata_value(last_bead, key).strip()
+                    ]
+                    if stale_markers:
+                        details = ", ".join(f"{key}={value!r}" for key, value in stale_markers)
+                        raise GateError(
+                            f"workflow {root_id} closed/pass with stale failure metadata: {details}\n"
+                            + collect_diagnostics(gc_bin, workspace, env=env)
+                        )
+                    return last_bead
+                time.sleep(poll_interval)
+                continue
             raise GateError(
                 f"workflow {root_id} closed with gc.outcome={outcome!r}, want 'pass'\n"
                 + collect_diagnostics(gc_bin, workspace, env=env)
             )
         time.sleep(poll_interval)
     raise GateError(
-        f"timed out after {timeout:.0f}s waiting for workflow {root_id} to close; last bead={last_bead!r}\n"
+        f"timed out after {timeout:.0f}s waiting for workflow {root_id} and its finalizer to pass; "
+        f"last bead={last_bead!r}\n"
         + collect_diagnostics(gc_bin, workspace, env=env)
     )
 
@@ -1788,66 +1826,44 @@ def validate_review_report(
     if not validator.is_file():
         raise GateError(f"review artifact validator was not found: {validator}")
 
+    requested_report_path = (workspace.rig_dir / REVIEW_REPORT_PATH).resolve()
+    root_report_path_raw = metadata_value(root_bead, "gc.var.report_path")
+    root_report_path = Path(root_report_path_raw)
+    if not root_report_path.is_absolute():
+        raise GateError(
+            "review workflow root gc.var.report_path must be the absolute adapter report path; "
+            f"got {root_report_path_raw!r}"
+        )
+    if root_report_path != requested_report_path:
+        raise GateError(
+            f"review workflow root gc.var.report_path {root_report_path} does not match requested adapter report "
+            f"{requested_report_path}"
+        )
+    if not requested_report_path.is_file():
+        raise GateError(f"requested review report is missing: {requested_report_path}")
+
     allow_approved = pack_spec.name != GASCITY_PACK
-    failures: list[str] = []
-    for report_path in review_report_candidates(root_bead, workspace.rig_dir, pack_spec):
-        if not report_path.is_file():
-            failures.append(f"{report_path}: missing")
-            continue
-        try:
-            run_checked(
-                [sys.executable, str(validator), "--schema", "gc.build.review.v1", "--path", str(report_path)],
-                env=env,
-                timeout=parse_duration("1m"),
-                log_output=True,
-            )
-            require_expected_review_signal(report_path, allow_approved=allow_approved)
-        except (GateError, subprocess.CalledProcessError) as exc:
-            failures.append(f"{report_path}: {exc}")
-            continue
-        print(f"validated review report: {report_path}", flush=True)
-        return
-
-    detail = "\n".join(f"- {failure}" for failure in failures) if failures else "no candidate report paths"
-    raise GateError(f"review gate did not produce a valid expected review artifact:\n{detail}")
-
-
-def review_report_candidates(root_bead: Mapping[str, Any], rig_dir: Path, pack_spec: PackSpec) -> list[Path]:
-    candidates: list[Path] = []
-    bases: list[Path] = []
-    for key in ("gc.work_dir", "work_dir"):
-        raw_work_dir = metadata_value(root_bead, key)
-        if raw_work_dir:
-            work_dir = resolve_artifact_path(raw_work_dir, base=rig_dir)
-            if work_dir not in bases:
-                bases.append(work_dir)
-    bases.append(rig_dir)
-
-    for key in REVIEW_REPORT_METADATA_KEYS:
-        raw_path = metadata_value(root_bead, key)
-        if raw_path:
-            candidates.extend(resolve_artifact_path(raw_path, base=base) for base in bases)
-
-    candidates.extend(resolve_artifact_path(REVIEW_REPORT_PATH, base=base) for base in bases)
-    if pack_spec.name != GASCITY_PACK:
-        for base in bases:
-            candidates.extend(resolve_artifact_path(path, base=base) for path in METHODOLOGY_REVIEW_REPORT_FALLBACKS)
-            artifacts_dir = base / ".gc" / "inference-gate" / "artifacts"
-            if artifacts_dir.is_dir():
-                candidates.extend(sorted(artifacts_dir.glob("*.md")))
-
-    unique: list[Path] = []
-    seen: set[Path] = set()
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            resolved = candidate
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        unique.append(resolved)
-    return unique
+    try:
+        run_checked(
+            [
+                sys.executable,
+                str(validator),
+                "--schema",
+                "gc.build.review.v1",
+                "--path",
+                str(requested_report_path),
+            ],
+            env=env,
+            timeout=parse_duration("1m"),
+            log_output=True,
+        )
+        require_expected_review_signal(requested_report_path, allow_approved=allow_approved)
+    except (GateError, subprocess.CalledProcessError) as exc:
+        raise GateError(
+            "review gate did not produce a valid expected review artifact at requested review report "
+            f"{requested_report_path}: {exc}"
+        ) from exc
+    print(f"validated review report: {requested_report_path}", flush=True)
 
 
 def require_expected_review_signal(report_path: Path, *, allow_approved: bool = False) -> None:
