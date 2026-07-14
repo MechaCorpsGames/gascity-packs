@@ -30,9 +30,11 @@ ALIAS_PATTERN = re.compile(r"(?<![A-Za-z0-9_<])@([a-z0-9][a-z0-9_-]*)", re.IGNOR
 DISCORD_RESERVED_MENTIONS = {"everyone", "here"}
 MAX_STATUS_PREVIEW = 160
 GATEWAY_WORKER_THREADS = 8
+GATEWAY_NAMED_WORKER_THREADS = 1
 GATEWAY_MAX_PENDING_MESSAGES = 128
 RECONNECT_BASE_DELAY_SECONDS = 5
 RECONNECT_MAX_DELAY_SECONDS = 60
+GATEWAY_IDENTIFY_STAGGER_SECONDS = 5.5
 PRUNE_INTERVAL_SECONDS = 60
 HEALTH_RECONNECT_GRACE_SECONDS = 90
 GC_API_HEALTH_TTL_SECONDS = 30
@@ -146,6 +148,27 @@ def bot_was_mentioned(message: dict[str, Any], bot_user_id: str) -> bool:
     return any(str(item.get("id", "")).strip() == bot_user_id for item in mentions if isinstance(item, dict))
 
 
+def configured_bot_mentions(message: dict[str, Any], config: dict[str, Any]) -> set[str]:
+    configured_bot_ids: set[str] = set()
+    for app_name in common.list_app_names(config):
+        try:
+            application_id = str(common.resolve_app_config(config, app_name).get("application_id", "")).strip()
+        except ValueError:
+            continue
+        if application_id:
+            configured_bot_ids.add(application_id)
+    mentions = message.get("mentions") or []
+    if not isinstance(mentions, list):
+        return set()
+    return {
+        mention_id
+        for item in mentions
+        if isinstance(item, dict)
+        for mention_id in [str(item.get("id", "")).strip()]
+        if mention_id in configured_bot_ids
+    }
+
+
 def websocket_accept_value(key: str) -> str:
     digest = hashlib.sha1((str(key) + WEBSOCKET_GUID).encode("utf-8")).digest()
     return base64.b64encode(digest).decode("ascii")
@@ -214,11 +237,16 @@ def casefold_lookup(values: list[str]) -> tuple[dict[str, str], set[str]]:
     return lookup, collisions
 
 
-def message_ingress_id(message: dict[str, Any]) -> str:
+def message_ingress_id(message: dict[str, Any], app_name: str = "") -> str:
     message_id = str(message.get("id", "")).strip()
     if message_id:
-        return f"in-{message_id}"
-    return f"in-{int(time.time() * 1000)}"
+        ingress_id = f"in-{message_id}"
+    else:
+        ingress_id = f"in-{int(time.time() * 1000)}"
+    normalized_app_name = common.validate_app_name(app_name)
+    if normalized_app_name:
+        return f"{ingress_id}-app-{normalized_app_name}"
+    return ingress_id
 
 
 def conversation_fields(message: dict[str, Any], channel_info: dict[str, Any]) -> tuple[str, str]:
@@ -242,7 +270,12 @@ def ingress_preview(message: dict[str, Any], bot_user_id: str) -> str:
     return summarize_body(strip_bot_mentions(str(message.get("content", "")), bot_user_id))
 
 
-def fetch_message_via_rest(channel_id: str, message_id: str) -> dict[str, Any]:
+def fetch_message_via_rest(
+    channel_id: str,
+    message_id: str,
+    *,
+    bot_token: str | None = None,
+) -> dict[str, Any]:
     normalized_channel_id = str(channel_id).strip()
     normalized_message_id = str(message_id).strip()
     if not normalized_channel_id or not normalized_message_id:
@@ -250,17 +283,22 @@ def fetch_message_via_rest(channel_id: str, message_id: str) -> dict[str, Any]:
     quoted_channel = urllib.parse.quote(normalized_channel_id)
     quoted_message = urllib.parse.quote(normalized_message_id)
     try:
-        payload = common.discord_api_request("GET", f"/channels/{quoted_channel}/messages/{quoted_message}")
+        path = f"/channels/{quoted_channel}/messages/{quoted_message}"
+        if bot_token is None:
+            payload = common.discord_api_request("GET", path)
+        else:
+            payload = common.discord_api_request("GET", path, bot_token=bot_token)
         if isinstance(payload, dict) and str(payload.get("id", "")).strip() == normalized_message_id:
             return payload
     except common.DiscordAPIError as exc:
         if int(getattr(exc, "status_code", 0) or 0) != 404:
             return {}
     try:
-        payload = common.discord_api_request(
-            "GET",
-            f"/channels/{quoted_channel}/messages?around={quoted_message}&limit=3",
-        )
+        path = f"/channels/{quoted_channel}/messages?around={quoted_message}&limit=3"
+        if bot_token is None:
+            payload = common.discord_api_request("GET", path)
+        else:
+            payload = common.discord_api_request("GET", path, bot_token=bot_token)
     except common.DiscordAPIError:
         return {}
     if isinstance(payload, list):
@@ -270,7 +308,11 @@ def fetch_message_via_rest(channel_id: str, message_id: str) -> dict[str, Any]:
     return {}
 
 
-def recover_message_for_routing(message: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def recover_message_for_routing(
+    message: dict[str, Any],
+    *,
+    bot_token: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     recovered = dict(message)
     gateway_content = raw_message_content(message)
     debug = {
@@ -287,7 +329,7 @@ def recover_message_for_routing(message: dict[str, Any]) -> tuple[dict[str, Any]
     if not needs_rest:
         return recovered, debug
     debug["rest_fetch_attempted"] = True
-    fetched = fetch_message_via_rest(channel_id, message_id)
+    fetched = fetch_message_via_rest(channel_id, message_id, bot_token=bot_token)
     if not isinstance(fetched, dict) or not fetched:
         debug["content_source"] = "gateway_empty_rest_unavailable"
         return recovered, debug
@@ -500,18 +542,23 @@ def probe_gc_api_health(runtime_state: "GatewayRuntimeState") -> bool:
     return True
 
 
-def resolve_binding(config: dict[str, Any], message: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+def resolve_binding(
+    config: dict[str, Any],
+    message: dict[str, Any],
+    app_name: str = "",
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    normalized_app_name = common.validate_app_name(app_name)
     guild_id = str(message.get("guild_id", "")).strip()
     channel_id = str(message.get("channel_id", "")).strip()
     channel_info: dict[str, Any] = {}
-    binding_id = common.chat_binding_id("dm" if not guild_id else "room", channel_id)
+    binding_id = common.chat_binding_id("dm" if not guild_id else "room", channel_id, normalized_app_name)
     binding = common.resolve_chat_binding(config, binding_id)
     if not guild_id:
         return binding, channel_info
     if binding:
         binding = dict(binding)
         if binding_allows_ambient_read(binding):
-            cached_binding = cached_ambient_room_binding(channel_id)
+            cached_binding = cached_ambient_room_binding(channel_id, normalized_app_name)
             if cached_binding:
                 binding = cached_binding
         channel_info = binding_channel_info(binding)
@@ -525,7 +572,7 @@ def resolve_binding(config: dict[str, Any], message: dict[str, Any]) -> tuple[di
                 return binding, channel_info
         channel_type_raw = binding.get("channel_type", None)
         if channel_type_raw is None:
-            bot_token = common.load_bot_token()
+            bot_token = common.load_bot_token(normalized_app_name)
             if not bot_token:
                 return binding, {}
             try:
@@ -541,7 +588,7 @@ def resolve_binding(config: dict[str, Any], message: dict[str, Any]) -> tuple[di
             channel_type = 0
         if channel_type not in common.THREAD_CHANNEL_TYPES:
             return binding, {}
-        bot_token = common.load_bot_token()
+        bot_token = common.load_bot_token(normalized_app_name)
         if not bot_token:
             return binding, channel_info
         try:
@@ -551,7 +598,7 @@ def resolve_binding(config: dict[str, Any], message: dict[str, Any]) -> tuple[di
         binding.update(common.normalize_binding_channel_metadata(looked_up_channel_info))
         persist_binding_channel_metadata(binding)
         return binding, binding_channel_info(binding)
-    bot_token = common.load_bot_token()
+    bot_token = common.load_bot_token(normalized_app_name)
     if not bot_token:
         return None, channel_info
     try:
@@ -561,13 +608,13 @@ def resolve_binding(config: dict[str, Any], message: dict[str, Any]) -> tuple[di
             return None, {}
         raise
     if not isinstance(channel_info, dict):
-        return common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id)), {}
+        return common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id, normalized_app_name)), {}
     parent_id = str(channel_info.get("parent_id", "")).strip()
     if parent_id and parent_id != channel_id:
-        binding = common.resolve_chat_binding(config, common.chat_binding_id("room", parent_id))
+        binding = common.resolve_chat_binding(config, common.chat_binding_id("room", parent_id, normalized_app_name))
         if binding:
             return binding, channel_info
-    return common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id)), channel_info
+    return common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id, normalized_app_name)), channel_info
 
 
 def resolve_targets(
@@ -621,15 +668,24 @@ def binding_allows_untargeted_ambient_delivery(binding: dict[str, Any] | None) -
     return bool(common.binding_peer_policy(binding).get("allow_untargeted_ambient_delivery"))
 
 
-def explicit_room_binding(config: dict[str, Any], channel_id: str) -> dict[str, Any] | None:
-    return common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id))
+def explicit_room_binding(
+    config: dict[str, Any],
+    channel_id: str,
+    app_name: str = "",
+) -> dict[str, Any] | None:
+    return common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id, app_name))
 
 
-def bound_room_claims_message(config: dict[str, Any], channel_id: str, parent_id: str = "") -> bool:
-    if explicit_room_binding(config, channel_id):
+def bound_room_claims_message(
+    config: dict[str, Any],
+    channel_id: str,
+    parent_id: str = "",
+    app_name: str = "",
+) -> bool:
+    if explicit_room_binding(config, channel_id, app_name):
         return True
     parent = str(parent_id).strip()
-    if parent and explicit_room_binding(config, parent):
+    if parent and explicit_room_binding(config, parent, app_name):
         return True
     return False
 
@@ -646,13 +702,18 @@ def ambient_bindings_config_signature() -> tuple[int, int, int] | None:
     )
 
 
-def cached_ambient_room_binding(channel_id: str) -> dict[str, Any] | None:
+def ambient_binding_cache_key(channel_id: str, app_name: str = "") -> str:
+    return f"{common.validate_app_name(app_name)}\x00{str(channel_id).strip()}"
+
+
+def cached_ambient_room_binding(channel_id: str, app_name: str = "") -> dict[str, Any] | None:
+    cache_key = ambient_binding_cache_key(channel_id, app_name)
     config_signature = ambient_bindings_config_signature()
     with AMBIENT_ROOM_BINDINGS_CACHE_LOCK:
         if AMBIENT_ROOM_BINDINGS_CACHE.get("config_signature") == config_signature:
             bindings = AMBIENT_ROOM_BINDINGS_CACHE.get("bindings", {})
             if isinstance(bindings, dict):
-                binding = bindings.get(channel_id)
+                binding = bindings.get(cache_key)
                 return dict(binding) if isinstance(binding, dict) else None
 
     with AMBIENT_ROOM_BINDINGS_FETCH_LOCK:
@@ -661,7 +722,7 @@ def cached_ambient_room_binding(channel_id: str) -> dict[str, Any] | None:
             if AMBIENT_ROOM_BINDINGS_CACHE.get("config_signature") == config_signature:
                 bindings = AMBIENT_ROOM_BINDINGS_CACHE.get("bindings", {})
                 if isinstance(bindings, dict):
-                    binding = bindings.get(channel_id)
+                    binding = bindings.get(cache_key)
                     return dict(binding) if isinstance(binding, dict) else None
 
         bindings: dict[str, dict[str, Any]] = {}
@@ -676,12 +737,12 @@ def cached_ambient_room_binding(channel_id: str) -> dict[str, Any] | None:
                 continue
             conversation_id = str(binding.get("conversation_id", "")).strip()
             if conversation_id:
-                bindings[conversation_id] = dict(binding)
+                bindings[ambient_binding_cache_key(conversation_id, str(binding.get("app", "")))] = dict(binding)
 
         with AMBIENT_ROOM_BINDINGS_CACHE_LOCK:
             AMBIENT_ROOM_BINDINGS_CACHE["config_signature"] = config_signature
             AMBIENT_ROOM_BINDINGS_CACHE["bindings"] = bindings
-    binding = bindings.get(channel_id)
+    binding = bindings.get(cache_key)
     return dict(binding) if isinstance(binding, dict) else None
 
 
@@ -842,8 +903,10 @@ def save_rejected_ingress_receipt(
     status: str,
     reason: str,
     message_debug: dict[str, Any] | None = None,
+    app_name: str = "",
 ) -> tuple[bool, dict[str, Any]]:
-    ingress_id = message_ingress_id(message)
+    normalized_app_name = common.validate_app_name(app_name)
+    ingress_id = message_ingress_id(message, normalized_app_name)
     return common.save_chat_ingress_if_absent(
         {
             "ingress_id": ingress_id,
@@ -858,6 +921,7 @@ def save_rejected_ingress_receipt(
             "reason": reason,
             "message_debug": dict(message_debug or {}),
             "targets": [],
+            "app": normalized_app_name,
         }
     )
 
@@ -869,14 +933,17 @@ def reject_ingress_before_processing(
     status: str,
     reason: str,
     message_debug: dict[str, Any] | None = None,
+    app_name: str = "",
 ) -> dict[str, Any]:
-    ingress_id = message_ingress_id(message)
+    normalized_app_name = common.validate_app_name(app_name)
+    ingress_id = message_ingress_id(message, normalized_app_name)
     claimed, receipt = save_rejected_ingress_receipt(
         message,
         bot_user_id,
         status=status,
         reason=reason,
         message_debug=message_debug,
+        app_name=normalized_app_name,
     )
     if claimed:
         return {"status": status, "reason": reason, "ingress_id": ingress_id, "receipt": receipt}
@@ -896,6 +963,7 @@ def reject_ingress_before_processing(
                 "reason": str(receipt.get("reason", "")).strip() or "ingress_claim_unreadable",
                 "message_debug": dict(message_debug or {}),
                 "targets": [],
+                "app": normalized_app_name,
             }
         )
         return {"status": "failed_claim_conflict", "ingress_id": ingress_id, "receipt": receipt}
@@ -1240,8 +1308,13 @@ def process_room_launch_thread_message(
     return {"status": "delivered", "ingress_id": ingress_id, "receipt": receipt}
 
 
-def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[str, Any]:
-    ingress_id = message_ingress_id(message)
+def process_inbound_message(
+    message: dict[str, Any],
+    bot_user_id: str,
+    app_name: str = "",
+) -> dict[str, Any]:
+    normalized_app_name = common.validate_app_name(app_name)
+    ingress_id = message_ingress_id(message, normalized_app_name)
     author = message.get("author") or {}
     if bool(author.get("bot")) or str(author.get("id", "")).strip() == bot_user_id:
         return {"status": "ignored", "reason": "bot_message", "ingress_id": ingress_id}
@@ -1251,11 +1324,19 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
     if not channel_id:
         return {"status": "ignored", "reason": "missing_channel", "ingress_id": ingress_id}
 
-    message, message_debug = recover_message_for_routing(message)
+    recovery_token = common.load_bot_token(normalized_app_name) if normalized_app_name else None
+    message, message_debug = recover_message_for_routing(message, bot_token=recovery_token)
     author = message.get("author") or {}
 
     config = common.load_config()
-    room_launchers_configured = bool(common.list_room_launchers(config)) if guild_id else False
+    mentioned_configured_bots = configured_bot_mentions(message, config) if guild_id else set()
+    if mentioned_configured_bots and str(bot_user_id).strip() not in mentioned_configured_bots:
+        return {
+            "status": "ignored",
+            "reason": "different_configured_bot_mentioned",
+            "ingress_id": ingress_id,
+        }
+    room_launchers_configured = bool(common.list_room_launchers(config)) if guild_id and not normalized_app_name else False
     mentioned_bot = bot_was_mentioned(message, bot_user_id) if guild_id else False
     preloaded_launcher: dict[str, Any] | None = None
     preloaded_launch: dict[str, Any] | None = None
@@ -1278,7 +1359,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
             if preloaded_launch is None:
                 preloaded_launcher = common.resolve_room_launcher(config, channel_id)
         if preloaded_launcher is None and not mentioned_bot:
-            preloaded_binding = cached_ambient_room_binding(channel_id)
+            preloaded_binding = cached_ambient_room_binding(channel_id, normalized_app_name)
             if not preloaded_binding or not binding_allows_ambient_read(preloaded_binding):
                 return {"status": "ignored", "reason": "not_mentioned", "ingress_id": ingress_id}
             preloaded_channel_info = binding_channel_info(preloaded_binding)
@@ -1292,6 +1373,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                     status="ignored_untargeted",
                     reason="ambient_target_required",
                     message_debug=message_debug,
+                    app_name=normalized_app_name,
                 )
             participant_names = [str(item).strip() for item in preloaded_binding.get("session_names", []) if str(item).strip()]
             participant_lookup, participant_collisions = casefold_lookup(participant_names)
@@ -1310,6 +1392,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                     status="ignored_untargeted",
                     reason="ambient_target_required",
                     message_debug=message_debug,
+                    app_name=normalized_app_name,
                 )
             preloaded_channel_type_raw = preloaded_binding.get("channel_type", 0)
             try:
@@ -1335,6 +1418,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
             "message_debug": dict(message_debug or {}),
             "status": "processing",
             "targets": [],
+            "app": normalized_app_name,
         }
     )
     if not claimed:
@@ -1356,6 +1440,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                     "status": "failed_claim_conflict",
                     "reason": str(base_receipt.get("reason", "")).strip() or "ingress_claim_unreadable",
                     "targets": [],
+                    "app": normalized_app_name,
                 }
             )
             return {"status": "failed_claim_conflict", "ingress_id": ingress_id, "receipt": receipt}
@@ -1407,6 +1492,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                         "status": "processing",
                         "reason": retry_reason,
                         "targets": [],
+                        "app": normalized_app_name,
                     }
                 )
                 claimed = True
@@ -1426,7 +1512,7 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
         if launcher is None and binding is None:
             config = common.load_config()
             try:
-                binding, channel_info = resolve_binding(config, message)
+                binding, channel_info = resolve_binding(config, message, normalized_app_name)
             except common.DiscordAPIError as exc:
                 receipt = persist_ingress_receipt(
                     {
@@ -1437,6 +1523,39 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
                     }
                 )
                 return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
+        if guild_id:
+            roles = (message.get("member") or {}).get("roles") or []
+            role_ids = [str(role_id).strip() for role_id in roles if str(role_id).strip()]
+            policy_route = launcher or binding or {}
+            policy_channel_id = (
+                str(policy_route.get("thread_parent_id", "")).strip()
+                or str(channel_info.get("parent_id", "")).strip()
+                or str(policy_route.get("conversation_id", "")).strip()
+                or channel_id
+            )
+            policy_rejection = common.policy_reason(
+                config,
+                guild_id,
+                policy_channel_id,
+                role_ids,
+                app_name=normalized_app_name,
+            )
+            if policy_rejection:
+                receipt = persist_ingress_receipt(
+                    {
+                        **base_receipt,
+                        "binding_id": str((binding or {}).get("id", "")).strip(),
+                        "status": "rejected_policy",
+                        "reason": policy_rejection,
+                        "targets": [],
+                    }
+                )
+                return {
+                    "status": "rejected_policy",
+                    "reason": policy_rejection,
+                    "ingress_id": ingress_id,
+                    "receipt": receipt,
+                }
         base_receipt.update(
             {
                 "ingress_id": ingress_id,
@@ -1598,7 +1717,8 @@ def process_inbound_message(message: dict[str, Any], bot_user_id: str) -> dict[s
 
 
 class GatewayRuntimeState:
-    def __init__(self) -> None:
+    def __init__(self, app_name: str = "") -> None:
+        self.app_name = common.validate_app_name(app_name)
         self._lock = threading.Lock()
         self._last_persist_monotonic = 0.0
         self._status: dict[str, Any] = {
@@ -1612,12 +1732,14 @@ class GatewayRuntimeState:
             "dropped_messages": 0,
             "message_queue_size": 0,
         }
+        if self.app_name:
+            self._status["app"] = self.app_name
         self._persist_locked(force=True)
 
     def _persist_locked(self, force: bool = False) -> None:
         now = time.monotonic()
         if force or (now - self._last_persist_monotonic) >= 1.0:
-            common.save_gateway_status(self._status)
+            common.save_gateway_status(self._status, app_name=self.app_name)
             self._last_persist_monotonic = now
 
     def snapshot(self) -> dict[str, Any]:
@@ -1800,8 +1922,16 @@ def _resolve_thread_parent(channel_id: str) -> str:
 
 
 class GatewayWorker:
-    def __init__(self, runtime_state: GatewayRuntimeState) -> None:
+    def __init__(
+        self,
+        runtime_state: GatewayRuntimeState,
+        app_name: str = "",
+        *,
+        initial_connect_delay_seconds: float = 0,
+    ) -> None:
         self.runtime_state = runtime_state
+        self.app_name = common.validate_app_name(app_name)
+        self.initial_connect_delay_seconds = max(float(initial_connect_delay_seconds), 0.0)
         self.stop_event = threading.Event()
         self._stopped = False
         self._stop_lock = threading.Lock()
@@ -1809,8 +1939,12 @@ class GatewayWorker:
         self.worker_threads: list[threading.Thread] = []
         self._current_ws_lock = threading.Lock()
         self._current_ws: GatewayWebSocket | None = None
-        for index in range(GATEWAY_WORKER_THREADS):
-            thread = threading.Thread(target=self.message_worker_loop, name=f"discord-gateway-worker-{index + 1}")
+        consumer_count = GATEWAY_NAMED_WORKER_THREADS if self.app_name else GATEWAY_WORKER_THREADS
+        for index in range(consumer_count):
+            worker_name = f"discord-gateway-worker-{index + 1}"
+            if self.app_name:
+                worker_name = f"{worker_name}-{self.app_name}"
+            thread = threading.Thread(target=self.message_worker_loop, name=worker_name)
             thread.start()
             self.worker_threads.append(thread)
 
@@ -1848,13 +1982,24 @@ class GatewayWorker:
         ready_payload: dict[str, Any] | None = None,
         last_known_bot_user_id: str = "",
     ) -> str:
+        try:
+            app_config = common.resolve_app_config(config, self.app_name)
+        except ValueError:
+            app_config = {}
+        configured_application_id = str(app_config.get("application_id", "")).strip()
         ready_user = (ready_payload or {}).get("user") or {}
-        bot_user_id = str(ready_user.get("id", "")).strip()
-        if bot_user_id:
-            return bot_user_id
-        if last_known_bot_user_id:
-            return str(last_known_bot_user_id).strip()
-        return str((config.get("app") or {}).get("application_id", "")).strip()
+        authenticated_user_id = str(ready_user.get("id", "")).strip()
+        if not authenticated_user_id:
+            authenticated_user_id = str(last_known_bot_user_id).strip()
+        if authenticated_user_id:
+            if configured_application_id and authenticated_user_id != configured_application_id:
+                display_name = self.app_name or "default"
+                raise RuntimeError(
+                    f"Discord app {display_name!r} authenticated as user {authenticated_user_id!r}, "
+                    f"not configured application_id {configured_application_id!r}"
+                )
+            return authenticated_user_id
+        return configured_application_id
 
     def gateway_connect_url(self, url: str) -> str:
         if not url:
@@ -1866,8 +2011,11 @@ class GatewayWorker:
         query["encoding"] = "json"
         return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query)))
 
-    def gateway_url(self) -> str:
-        payload = common.discord_api_request("GET", "/gateway/bot")
+    def gateway_url(self, bot_token: str = "") -> str:
+        if self.app_name:
+            payload = common.discord_api_request("GET", "/gateway/bot", bot_token=bot_token)
+        else:
+            payload = common.discord_api_request("GET", "/gateway/bot")
         url = str((payload or {}).get("url", "")).strip()
         if not url:
             raise RuntimeError("Discord gateway URL is missing from /gateway/bot")
@@ -1916,7 +2064,7 @@ class GatewayWorker:
                 self.message_queue.task_done()
                 self.runtime_state.patch(message_queue_size=self.message_queue.qsize())
 
-    def _record_extmsg_inbound(self, message: dict[str, Any], bot_user_id: str) -> bool:
+    def _record_extmsg_inbound(self, message: dict[str, Any], bot_user_id: str) -> bool | dict[str, Any]:
         """Normalize and post inbound Discord message to extmsg fabric.
 
         If the message contains @mentions in a room (not a thread), this also
@@ -1925,6 +2073,8 @@ class GatewayWorker:
         Returns True if the message was fully handled by extmsg (caller should
         skip legacy routing). Returns False to fall through to legacy path.
         """
+        if self.app_name:
+            return False
         try:
             author = message.get("author") or {}
             if bool(author.get("bot")) or str(author.get("id", "")).strip() == bot_user_id:
@@ -1934,12 +2084,18 @@ class GatewayWorker:
             app_id = str(config.get("app", {}).get("application_id", "")).strip()
             if not app_id:
                 return False
+            mentioned_configured_bots = configured_bot_mentions(message, config) if guild_id else set()
+            if mentioned_configured_bots and str(bot_user_id).strip() not in mentioned_configured_bots:
+                return False
 
             content = str(message.get("content", ""))
             channel_id = str(message.get("channel_id", "")).strip()
             # Discord MESSAGE_CREATE in threads doesn't include parent_id.
-            # Check channel type to detect threads (cached).
-            parent_id = _resolve_thread_parent(channel_id)
+            # Prefer verified metadata on an exact binding before a REST lookup.
+            direct_binding = common.resolve_chat_binding(config, common.chat_binding_id("room", channel_id))
+            parent_id = str((direct_binding or {}).get("thread_parent_id", "")).strip()
+            if not parent_id:
+                parent_id = _resolve_thread_parent(channel_id)
             is_thread = bool(parent_id)
 
             # Explicit room bindings take precedence over generic extmsg
@@ -1957,6 +2113,14 @@ class GatewayWorker:
                 targets = common.resolve_mention_targets(at_mentions)
                 if not targets:
                     return False
+                policy_rejection = self._reject_extmsg_policy(
+                    config,
+                    message,
+                    bot_user_id,
+                    parent_channel_id=channel_id,
+                )
+                if policy_rejection:
+                    return policy_rejection
                 group = common.launch_thread_for_mentions(
                     message, targets, guild_id, app_id,
                 )
@@ -1976,6 +2140,14 @@ class GatewayWorker:
 
             # THREAD: all messages go to transcript. Handle @mentions and NL names.
             if is_thread:
+                policy_rejection = self._reject_extmsg_policy(
+                    config,
+                    message,
+                    bot_user_id,
+                    parent_channel_id=parent_id,
+                )
+                if policy_rejection:
+                    return policy_rejection
                 # @mentions in thread = add new participants (strong signal).
                 at_mentions = common.resolve_at_mentions(content)
                 if at_mentions:
@@ -2007,17 +2179,44 @@ class GatewayWorker:
         except Exception:
             return False  # On error, fall through to legacy path.
 
+    def _reject_extmsg_policy(
+        self,
+        config: dict[str, Any],
+        message: dict[str, Any],
+        bot_user_id: str,
+        *,
+        parent_channel_id: str,
+    ) -> dict[str, Any] | None:
+        guild_id = str(message.get("guild_id", "")).strip()
+        if not guild_id:
+            return None
+        roles = (message.get("member") or {}).get("roles") or []
+        role_ids = [str(role_id).strip() for role_id in roles if str(role_id).strip()]
+        policy_rejection = common.policy_reason(config, guild_id, parent_channel_id, role_ids)
+        if not policy_rejection:
+            return None
+        return reject_ingress_before_processing(
+            message,
+            bot_user_id,
+            status="rejected_policy",
+            reason=policy_rejection,
+        )
+
     def handle_gateway_message(self, message: dict[str, Any], bot_user_id: str) -> None:
         try:
             # Try the new extmsg path first. If it handles the message
             # (e.g., creates a thread from @mentions), skip legacy routing.
-            if self._record_extmsg_inbound(message, bot_user_id):
+            extmsg_result = self._record_extmsg_inbound(message, bot_user_id)
+            if extmsg_result is True:
                 self.runtime_state.bump("routed_messages",
                     last_message_status="extmsg_routed",
                     last_message_preview=common.utcnow(),
                     last_event_at=common.utcnow())
                 return
-            outcome = process_inbound_message(message, bot_user_id)
+            if isinstance(extmsg_result, dict):
+                outcome = extmsg_result
+            else:
+                outcome = process_inbound_message(message, bot_user_id, self.app_name)
             status = str(outcome.get("status", "")).strip()
             preview = summarize_body(str((outcome.get("receipt") or {}).get("body_preview", "")))
             if status == "duplicate":
@@ -2048,6 +2247,7 @@ class GatewayWorker:
                 bot_user_id,
                 status="rejected_shutting_down",
                 reason="service_shutting_down",
+                app_name=self.app_name,
             )
             self.runtime_state.bump(
                 "dropped_messages",
@@ -2061,12 +2261,13 @@ class GatewayWorker:
             self.message_queue.put_nowait((message, bot_user_id))
             self.runtime_state.patch(message_queue_size=self.message_queue.qsize())
         except queue.Full:
-            ingress_id = message_ingress_id(message)
+            ingress_id = message_ingress_id(message, self.app_name)
             save_rejected_ingress_receipt(
                 message,
                 bot_user_id,
                 status="rejected_overloaded",
                 reason="message_queue_full",
+                app_name=self.app_name,
             )
             print(
                 f"[{common.current_service_name() or 'discord-gateway'}] dropping ingress {ingress_id}: message queue full",
@@ -2094,6 +2295,8 @@ class GatewayWorker:
         self.runtime_state.patch(last_prune_at=common.utcnow())
 
     def run_forever(self) -> None:
+        if self.initial_connect_delay_seconds and self.stop_event.wait(self.initial_connect_delay_seconds):
+            return
         backoff_seconds = RECONNECT_BASE_DELAY_SECONDS
         next_prune_at = 0.0
         seq: int | None = None
@@ -2103,12 +2306,16 @@ class GatewayWorker:
         while not self.stop_event.is_set():
             try:
                 now = time.monotonic()
-                if now >= next_prune_at:
+                if not self.app_name and now >= next_prune_at:
                     self.prune_runtime_data()
                     next_prune_at = now + PRUNE_INTERVAL_SECONDS
                 config = common.load_config()
-                bot_token = common.load_bot_token()
-                application_id = str((config.get("app") or {}).get("application_id", "")).strip()
+                bot_token = common.load_bot_token(self.app_name)
+                try:
+                    app_config = common.resolve_app_config(config, self.app_name)
+                except ValueError:
+                    app_config = {}
+                application_id = str(app_config.get("application_id", "")).strip()
                 if not bot_token or not application_id:
                     self.runtime_state.patch(
                         connected=False,
@@ -2120,7 +2327,11 @@ class GatewayWorker:
                     continue
 
                 can_resume = bool(resume_session_id and seq is not None)
-                connection_url = self.gateway_connect_url(resume_gateway_url) if can_resume and resume_gateway_url else self.gateway_url()
+                connection_url = (
+                    self.gateway_connect_url(resume_gateway_url)
+                    if can_resume and resume_gateway_url
+                    else self.gateway_url(bot_token)
+                )
                 ws = GatewayWebSocket(connection_url)
                 self.set_current_ws(ws)
                 ready_payload: dict[str, Any] | None = None
@@ -2155,7 +2366,7 @@ class GatewayWorker:
                             awaiting_heartbeat_ack = True
                             next_heartbeat_at = now + heartbeat_interval
                             self.runtime_state.patch(last_heartbeat_at=common.utcnow())
-                        if now >= next_prune_at:
+                        if not self.app_name and now >= next_prune_at:
                             self.prune_runtime_data()
                             next_prune_at = now + PRUNE_INTERVAL_SECONDS
                         if not event:
@@ -2185,11 +2396,14 @@ class GatewayWorker:
                                 )
                                 continue
                             if event_type == "RESUMED":
+                                bot_user_id = self.current_bot_user_id(config, None, last_known_bot_user_id)
+                                last_known_bot_user_id = bot_user_id
                                 awaiting_heartbeat_ack = False
                                 backoff_seconds = RECONNECT_BASE_DELAY_SECONDS
                                 self.runtime_state.patch(
                                     connected=True,
                                     state="ready",
+                                    bot_user_id=bot_user_id,
                                     last_resumed_at=common.utcnow(),
                                     last_resumed_epoch=int(time.time()),
                                     last_error="",
@@ -2233,6 +2447,33 @@ class GatewayWorker:
                 backoff_seconds = min(RECONNECT_MAX_DELAY_SECONDS, max(RECONNECT_BASE_DELAY_SECONDS, backoff_seconds * 2))
 
 
+def build_gateway_workers(config: dict[str, Any]) -> list[GatewayWorker]:
+    application_id_owners: dict[str, str] = {}
+    for app_name in common.list_app_names(config):
+        application_id = str(common.resolve_app_config(config, app_name).get("application_id", "")).strip()
+        if not application_id:
+            continue
+        display_name = app_name or "default"
+        previous_owner = application_id_owners.get(application_id)
+        if previous_owner:
+            raise ValueError(
+                f"Discord application_id {application_id!r} is configured more than once "
+                f"({previous_owner!r} and {display_name!r})"
+            )
+        application_id_owners[application_id] = display_name
+    workers: list[GatewayWorker] = []
+    for index, app_name in enumerate(common.list_app_names(config)):
+        runtime_state = GatewayRuntimeState(app_name)
+        workers.append(
+            GatewayWorker(
+                runtime_state,
+                app_name,
+                initial_connect_delay_seconds=index * GATEWAY_IDENTIFY_STAGGER_SECONDS,
+            )
+        )
+    return workers
+
+
 class GatewayHandler(BaseHTTPRequestHandler):
     server_version = "DiscordGateway/0.1"
 
@@ -2242,11 +2483,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/healthz":
-            state = get_runtime_state().snapshot()
+            states = gateway_runtime_snapshots()
+            configured_app_names = configured_gateway_app_names(common.load_config())
             gc_api_reachable = True
-            if str(state.get("state", "")).strip() in {"ready", "reconnecting"}:
+            if any(
+                app_name in configured_app_names
+                and str(state.get("state", "")).strip() in {"ready", "reconnecting"}
+                for app_name, state in states.items()
+            ):
                 gc_api_reachable = probe_gc_api_health(get_runtime_state())
-            code = gateway_health_status_code(state, gc_api_reachable=gc_api_reachable)
+            code = aggregate_gateway_health_status_code(
+                states,
+                configured_app_names=configured_app_names,
+                gc_api_reachable=gc_api_reachable,
+            )
             self.send_response(code)
             self.end_headers()
             return
@@ -2254,12 +2504,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
             text_response(self, HTTPStatus.OK, "discord gateway ready\n", "text/plain; charset=utf-8")
             return
         if parsed.path == "/v0/discord/gateway/status":
-            json_response(self, HTTPStatus.OK, get_runtime_state().snapshot())
+            states = gateway_runtime_snapshots()
+            json_response(
+                self,
+                HTTPStatus.OK,
+                gateway_status_payload(
+                    states,
+                    configured_app_names=configured_gateway_app_names(common.load_config()),
+                    gc_api_reachable=cached_gc_api_reachable(),
+                ),
+            )
             return
         json_response(self, HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
 
 RUNTIME_STATE: GatewayRuntimeState | None = None
+RUNTIME_STATES_LOCK = threading.Lock()
+RUNTIME_STATES: dict[str, GatewayRuntimeState] = {}
 
 
 def get_runtime_state() -> GatewayRuntimeState:
@@ -2267,6 +2528,31 @@ def get_runtime_state() -> GatewayRuntimeState:
     if RUNTIME_STATE is None:
         RUNTIME_STATE = GatewayRuntimeState()
     return RUNTIME_STATE
+
+
+def gateway_runtime_snapshots() -> dict[str, dict[str, Any]]:
+    with RUNTIME_STATES_LOCK:
+        runtime_states = dict(RUNTIME_STATES)
+    if not runtime_states:
+        runtime_states = {"default": get_runtime_state()}
+    return {app_name: runtime_state.snapshot() for app_name, runtime_state in runtime_states.items()}
+
+
+def configured_gateway_app_names(config: dict[str, Any]) -> set[str]:
+    configured: set[str] = set()
+    for app_name in common.list_app_names(config):
+        try:
+            application_id = str(common.resolve_app_config(config, app_name).get("application_id", "")).strip()
+        except ValueError:
+            continue
+        if application_id:
+            configured.add(app_name or "default")
+    return configured
+
+
+def cached_gc_api_reachable() -> bool:
+    with GC_API_HEALTH_LOCK:
+        return bool(GC_API_HEALTH_CACHE.get("reachable", True))
 
 
 def gateway_health_status_code(state: dict[str, Any], gc_api_reachable: bool = True) -> HTTPStatus:
@@ -2284,6 +2570,95 @@ def gateway_health_status_code(state: dict[str, Any], gc_api_reachable: bool = T
     return HTTPStatus.SERVICE_UNAVAILABLE
 
 
+def aggregate_gateway_status(
+    states: dict[str, dict[str, Any]],
+    *,
+    configured_app_names: set[str],
+    gc_api_reachable: bool = True,
+) -> dict[str, Any]:
+    selected = {
+        app_name: states.get(app_name, {"state": "missing"})
+        for app_name in sorted(configured_app_names)
+    }
+    ready_apps = sum(str(state.get("state", "")).strip() == "ready" for state in selected.values())
+    reconnecting_apps = sum(str(state.get("state", "")).strip() == "reconnecting" for state in selected.values())
+    provisioning_states = {"connecting", "waiting_for_config", "starting"}
+    provisioning_apps = sum(
+        str(state.get("state", "")).strip() in provisioning_states
+        for state in selected.values()
+    )
+    operational_apps = sum(
+        gateway_health_status_code(state, gc_api_reachable=True) == HTTPStatus.NO_CONTENT
+        and str(state.get("state", "")).strip() not in provisioning_states
+        for state in selected.values()
+    )
+    configured_apps = len(selected)
+    failed_apps = configured_apps - operational_apps - provisioning_apps
+    if not gc_api_reachable and configured_apps:
+        state = "failed"
+    elif configured_apps == 0:
+        state = "waiting_for_config"
+    elif ready_apps == configured_apps:
+        state = "ready"
+    elif provisioning_apps == configured_apps:
+        state = "provisioning"
+    elif operational_apps:
+        state = "degraded"
+    else:
+        state = "failed"
+    return {
+        "state": state,
+        "configured_apps": configured_apps,
+        "ready_apps": ready_apps,
+        "reconnecting_apps": reconnecting_apps,
+        "provisioning_apps": provisioning_apps,
+        "operational_apps": operational_apps,
+        "failed_apps": failed_apps,
+        "gc_api_reachable": bool(gc_api_reachable),
+    }
+
+
+def aggregate_gateway_health_status_code(
+    states: dict[str, dict[str, Any]],
+    *,
+    configured_app_names: set[str],
+    gc_api_reachable: bool = True,
+) -> HTTPStatus:
+    aggregate = aggregate_gateway_status(
+        states,
+        configured_app_names=configured_app_names,
+        gc_api_reachable=gc_api_reachable,
+    )
+    if not gc_api_reachable and aggregate["configured_apps"]:
+        return HTTPStatus.SERVICE_UNAVAILABLE
+    if aggregate["configured_apps"] == 0:
+        return HTTPStatus.NO_CONTENT
+    if aggregate["operational_apps"]:
+        return HTTPStatus.NO_CONTENT
+    if aggregate["provisioning_apps"] == aggregate["configured_apps"]:
+        return HTTPStatus.NO_CONTENT
+    return HTTPStatus.SERVICE_UNAVAILABLE
+
+
+def gateway_status_payload(
+    states: dict[str, dict[str, Any]],
+    *,
+    configured_app_names: set[str],
+    gc_api_reachable: bool = True,
+) -> dict[str, Any]:
+    payload = dict(states.get("default", {}))
+    payload["gateway_statuses"] = {
+        app_name: dict(state)
+        for app_name, state in sorted(states.items())
+    }
+    payload["aggregate"] = aggregate_gateway_status(
+        states,
+        configured_app_names=configured_app_names,
+        gc_api_reachable=gc_api_reachable,
+    )
+    return payload
+
+
 def main() -> int:
     common.ensure_layout()
     common.prune_chat_ingress()
@@ -2295,15 +2670,29 @@ def main() -> int:
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
 
-    runtime_state = get_runtime_state()
-    worker = GatewayWorker(runtime_state)
-    thread = threading.Thread(target=worker.run_forever, name="discord-gateway")
-    thread.start()
+    workers = build_gateway_workers(common.load_config())
+    if not workers:
+        raise SystemExit("no Discord gateway workers were configured")
+    global RUNTIME_STATE, RUNTIME_STATES
+    RUNTIME_STATE = workers[0].runtime_state
+    with RUNTIME_STATES_LOCK:
+        RUNTIME_STATES = {
+            worker.app_name or "default": worker.runtime_state
+            for worker in workers
+        }
+    worker_threads: list[threading.Thread] = []
+    for worker in workers:
+        thread_name = "discord-gateway" if not worker.app_name else f"discord-gateway-{worker.app_name}"
+        thread = threading.Thread(target=worker.run_forever, name=thread_name)
+        thread.start()
+        worker_threads.append(thread)
+    runtime_state = workers[0].runtime_state
 
     with ThreadingUnixHTTPServer(socket_path, GatewayHandler) as server:
         def handle_shutdown(signum: int, _frame: Any) -> None:
             runtime_state.patch(last_shutdown_signal=signum, last_shutdown_at=common.utcnow())
-            worker.request_stop()
+            for worker in workers:
+                worker.request_stop()
             threading.Thread(target=server.shutdown, daemon=True).start()
 
         previous_sigint = signal.signal(signal.SIGINT, handle_shutdown)
@@ -2314,8 +2703,10 @@ def main() -> int:
         finally:
             signal.signal(signal.SIGINT, previous_sigint)
             signal.signal(signal.SIGTERM, previous_sigterm)
-            worker.stop()
-            thread.join()
+            for worker in workers:
+                worker.stop()
+            for thread in worker_threads:
+                thread.join()
     return 0
 
 

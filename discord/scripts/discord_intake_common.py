@@ -56,6 +56,7 @@ ROOM_LAUNCH_READY_RESOLVE_TIMEOUT_SECONDS = 90.0
 ROOM_LAUNCH_READY_RESOLVE_DELAY_SECONDS = 0.5
 ROOM_LAUNCH_PRIMER_VERSION = 1
 AGENT_HANDLE_SEGMENT = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+DISCORD_APP_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 class DiscordAPIError(RuntimeError):
@@ -152,6 +153,10 @@ def config_path() -> str:
     return os.path.join(data_dir(), "config.json")
 
 
+def config_mutation_lock_path() -> str:
+    return os.path.join(locks_dir(), "config.lock")
+
+
 def secret_path(name: str) -> str:
     return os.path.join(secrets_dir(), name)
 
@@ -166,7 +171,10 @@ def published_services_dir() -> str:
     return os.path.join(root, ".gc", "services", ".published")
 
 
-def gateway_status_path() -> str:
+def gateway_status_path(app_name: str = "") -> str:
+    normalized_app_name = validate_app_name(app_name)
+    if normalized_app_name:
+        return os.path.join(data_dir(), f"gateway-status-{normalized_app_name}.json")
     return os.path.join(data_dir(), "gateway-status.json")
 
 
@@ -239,6 +247,7 @@ def default_config() -> dict[str, Any]:
         "app": {
             "command_name": COMMAND_NAME_DEFAULT,
         },
+        "apps": {},
         "policy": {
             "guild_allowlist": [],
             "channel_allowlist": [],
@@ -322,6 +331,29 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
             "channel_allowlist": _normalize_allowlist(policy.get("channel_allowlist")),
             "role_allowlist": _normalize_allowlist(policy.get("role_allowlist")),
         }
+    apps = raw.get("apps")
+    if isinstance(apps, dict):
+        normalized_apps: dict[str, Any] = {}
+        for raw_name, raw_app in apps.items():
+            if not isinstance(raw_app, dict):
+                continue
+            try:
+                app_name = validate_app_name(raw_name, allow_default=False)
+            except ValueError:
+                continue
+            app_policy = raw_app.get("policy") if isinstance(raw_app.get("policy"), dict) else {}
+            normalized_apps[app_name] = {
+                "application_id": str(raw_app.get("application_id", "")).strip(),
+                "public_key": str(raw_app.get("public_key", "")).strip(),
+                "command_name": str(raw_app.get("command_name", COMMAND_NAME_DEFAULT)).strip()
+                or COMMAND_NAME_DEFAULT,
+                "policy": {
+                    "guild_allowlist": _normalize_allowlist(app_policy.get("guild_allowlist")),
+                    "channel_allowlist": _normalize_allowlist(app_policy.get("channel_allowlist")),
+                    "role_allowlist": _normalize_allowlist(app_policy.get("role_allowlist")),
+                },
+            }
+        config["apps"] = normalized_apps
     chat = raw.get("chat")
     if isinstance(chat, dict):
         normalized_bindings: dict[str, Any] = {}
@@ -341,7 +373,11 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
                 normalized_session_names = dedupe_session_names(session_names)
                 if kind == "dm" and len(normalized_session_names) != 1:
                     continue
-                binding_id = chat_binding_id(kind, conversation_id)
+                try:
+                    app_name = validate_app_name(value.get("app", ""))
+                except ValueError:
+                    continue
+                binding_id = chat_binding_id(kind, conversation_id, app_name)
                 normalized_bindings[binding_id] = {
                     "id": binding_id,
                     "kind": kind,
@@ -349,6 +385,8 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
                     "guild_id": str(value.get("guild_id", "")).strip(),
                     "session_names": normalized_session_names,
                 }
+                if app_name:
+                    normalized_bindings[binding_id]["app"] = app_name
                 channel_metadata = normalize_binding_channel_metadata(value)
                 if channel_metadata:
                     normalized_bindings[binding_id].update(channel_metadata)
@@ -551,7 +589,20 @@ def binding_peer_policy(binding: dict[str, Any]) -> dict[str, Any]:
 def redact_config(config: dict[str, Any]) -> dict[str, Any]:
     redacted = normalize_config(config)
     redacted["app"]["bot_token_present"] = bool(load_bot_token())
+    for app_name, app in redacted.get("apps", {}).items():
+        app["bot_token_present"] = bool(load_bot_token(app_name))
     return redacted
+
+
+def validate_app_name(value: Any, *, allow_default: bool = True) -> str:
+    normalized = str(value or "").strip()
+    if not normalized and allow_default:
+        return ""
+    if normalized == "default":
+        raise ValueError("app name 'default' is reserved for the legacy default app")
+    if not DISCORD_APP_NAME.fullmatch(normalized):
+        raise ValueError("app name must match [a-z][a-z0-9_-]{0,31}")
+    return normalized
 
 
 def validate_application_id(value: str) -> str:
@@ -576,40 +627,155 @@ def validate_public_key(value: str) -> str:
     return normalized
 
 
-def import_app_config(config: dict[str, Any], app_fields: dict[str, Any]) -> dict[str, Any]:
+def import_app_config(
+    config: dict[str, Any],
+    app_fields: dict[str, Any],
+    *,
+    app_name: str = "",
+    bot_token: str | None = None,
+) -> dict[str, Any]:
+    normalized_app_name = validate_app_name(app_name)
+    normalized_bot_token: str | None = None
+    if bot_token is not None:
+        normalized_bot_token = str(bot_token).strip()
+        if not normalized_bot_token:
+            raise ValueError("bot token is empty")
+    with advisory_lock(config_mutation_lock_path()):
+        current = load_config() if os.path.exists(config_path()) else normalize_config(config)
+        previous_bot_token = load_bot_token(normalized_app_name) if normalized_bot_token is not None else ""
+        existing_app = current.get("apps", {}).get(normalized_app_name) if normalized_app_name else None
+        requested_application_id = validate_application_id(
+            app_fields.get("application_id", app_fields.get("app_id", ""))
+        )
+        existing_application_id = (
+            str(existing_app.get("application_id", "")).strip()
+            if isinstance(existing_app, dict)
+            else ""
+        )
+        existing_named_bot_token = load_bot_token(normalized_app_name) if normalized_app_name else ""
+        if existing_named_bot_token and (not isinstance(existing_app, dict) or not existing_application_id):
+            raise ValueError(
+                f"orphan bot token for Discord app {normalized_app_name!r} has no pinned application_id; "
+                "remove it explicitly or import the replacement under a new app name"
+            )
+        if (
+            normalized_app_name
+            and existing_application_id
+            and requested_application_id
+            and requested_application_id != existing_application_id
+        ):
+            raise ValueError(
+                f"Discord app {normalized_app_name!r} cannot change application_id; "
+                "import the replacement under a new app name"
+            )
+        updated = _import_app_config_locked(current, app_fields, app_name=normalized_app_name)
+        if normalized_bot_token is None:
+            return updated
+        try:
+            save_bot_token(normalized_bot_token, app_name=normalized_app_name)
+        except OSError:
+            save_config(current)
+            if previous_bot_token:
+                save_bot_token(previous_bot_token, app_name=normalized_app_name)
+            else:
+                try:
+                    os.remove(secret_path(bot_token_secret_name(normalized_app_name)))
+                except FileNotFoundError:
+                    pass
+            raise
+        return updated
+
+
+def _import_app_config_locked(
+    config: dict[str, Any],
+    app_fields: dict[str, Any],
+    *,
+    app_name: str = "",
+) -> dict[str, Any]:
     cfg = normalize_config(config)
-    app = cfg.setdefault("app", {})
+    normalized_app_name = validate_app_name(app_name)
+    if normalized_app_name:
+        app = cfg.setdefault("apps", {}).setdefault(normalized_app_name, {})
+        policy = app.setdefault("policy", {})
+    else:
+        app = cfg.setdefault("app", {})
+        policy = cfg.setdefault("policy", {})
     application_id = validate_application_id(app_fields.get("application_id", app_fields.get("app_id", "")))
     public_key = validate_public_key(app_fields.get("public_key", ""))
     if application_id:
+        for existing_app_name in list_app_names(cfg):
+            if existing_app_name == normalized_app_name:
+                continue
+            existing_application_id = str(resolve_app_config(cfg, existing_app_name).get("application_id", "")).strip()
+            if existing_application_id == application_id:
+                display_name = existing_app_name or "default"
+                raise ValueError(f"application_id is already configured for app {display_name!r}")
         app["application_id"] = application_id
     if public_key:
         app["public_key"] = public_key
     command_name = str(app_fields.get("command_name", app.get("command_name", COMMAND_NAME_DEFAULT))).strip()
     app["command_name"] = command_name or COMMAND_NAME_DEFAULT
 
-    policy = cfg.setdefault("policy", {})
     for key in ("guild_allowlist", "channel_allowlist", "role_allowlist"):
         if key in app_fields:
             policy[key] = _normalize_allowlist(app_fields.get(key))
     return save_config(cfg)
 
 
-def save_bot_token(token: str) -> None:
+def resolve_app_config(config: dict[str, Any], app_name: str = "") -> dict[str, Any]:
+    cfg = normalize_config(config)
+    normalized_app_name = validate_app_name(app_name)
+    if not normalized_app_name:
+        return cfg["app"]
+    app = cfg.get("apps", {}).get(normalized_app_name)
+    if not isinstance(app, dict):
+        raise ValueError(f"unknown Discord app {normalized_app_name!r}")
+    return app
+
+
+def resolve_app_policy(config: dict[str, Any], app_name: str = "") -> dict[str, Any]:
+    cfg = normalize_config(config)
+    normalized_app_name = validate_app_name(app_name)
+    if not normalized_app_name:
+        return cfg["policy"]
+    app = cfg.get("apps", {}).get(normalized_app_name)
+    if not isinstance(app, dict):
+        raise ValueError(f"unknown Discord app {normalized_app_name!r}")
+    return app["policy"]
+
+
+def list_app_names(config: dict[str, Any]) -> list[str]:
+    cfg = normalize_config(config)
+    names = sorted(cfg.get("apps", {}))
+    return [""] + names
+
+
+def bot_token_secret_name(app_name: str = "") -> str:
+    normalized_app_name = validate_app_name(app_name)
+    if not normalized_app_name:
+        return "bot-token.txt"
+    return f"bot-token-{normalized_app_name}.txt"
+
+
+def save_bot_token(token: str, app_name: str = "") -> None:
     ensure_layout()
-    atomic_write_text(secret_path("bot-token.txt"), token.strip() + "\n", mode=0o600)
+    atomic_write_text(secret_path(bot_token_secret_name(app_name)), token.strip() + "\n", mode=0o600)
 
 
-def load_bot_token() -> str:
-    return read_text(secret_path("bot-token.txt")).strip()
+def load_bot_token(app_name: str = "") -> str:
+    return read_text(secret_path(bot_token_secret_name(app_name))).strip()
 
 
 def normalize_channel_key(guild_id: str, channel_id: str) -> str:
     return f"{str(guild_id).strip()}/{str(channel_id).strip()}"
 
 
-def chat_binding_id(kind: str, conversation_id: str) -> str:
-    return f"{str(kind).strip().lower()}:{str(conversation_id).strip()}"
+def chat_binding_id(kind: str, conversation_id: str, app_name: str = "") -> str:
+    binding_id = f"{str(kind).strip().lower()}:{str(conversation_id).strip()}"
+    normalized_app_name = validate_app_name(app_name)
+    if normalized_app_name:
+        return f"{binding_id}@app:{normalized_app_name}"
+    return binding_id
 
 
 def set_chat_binding(
@@ -619,6 +785,32 @@ def set_chat_binding(
     session_names: list[str],
     guild_id: str = "",
     *,
+    app_name: str = "",
+    policy: dict[str, Any] | None = None,
+    channel_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    with advisory_lock(config_mutation_lock_path()):
+        current = load_config() if os.path.exists(config_path()) else normalize_config(config)
+        return _set_chat_binding_locked(
+            current,
+            kind,
+            conversation_id,
+            session_names,
+            guild_id,
+            app_name=app_name,
+            policy=policy,
+            channel_metadata=channel_metadata,
+        )
+
+
+def _set_chat_binding_locked(
+    config: dict[str, Any],
+    kind: str,
+    conversation_id: str,
+    session_names: list[str],
+    guild_id: str = "",
+    *,
+    app_name: str = "",
     policy: dict[str, Any] | None = None,
     channel_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -634,9 +826,10 @@ def set_chat_binding(
     if normalized_kind == "dm" and len(normalized_session_names) != 1:
         raise ValueError("DM bindings require exactly one session name")
 
+    normalized_app_name = validate_app_name(app_name)
     cfg = normalize_config(config)
-    binding_id = chat_binding_id(normalized_kind, normalized_conversation)
-    if normalized_kind == "room" and resolve_room_launcher(cfg, normalized_conversation):
+    binding_id = chat_binding_id(normalized_kind, normalized_conversation, normalized_app_name)
+    if not normalized_app_name and normalized_kind == "room" and resolve_room_launcher(cfg, normalized_conversation):
         raise ValueError("room launch is already enabled for that conversation")
     existing = resolve_chat_binding(cfg, binding_id) or {}
     raw_room_policy = copy.deepcopy(existing.get("policy")) if isinstance(existing.get("policy"), dict) else {}
@@ -664,6 +857,8 @@ def set_chat_binding(
         "guild_id": str(guild_id).strip(),
         "session_names": normalized_session_names,
     }
+    if normalized_app_name:
+        binding["app"] = normalized_app_name
     if normalized_kind == "room":
         if raw_channel_metadata:
             binding.update(raw_channel_metadata)
@@ -673,6 +868,27 @@ def set_chat_binding(
 
 
 def set_room_launcher(
+    config: dict[str, Any],
+    guild_id: str,
+    conversation_id: str,
+    *,
+    response_mode: str = "mention_only",
+    default_qualified_handle: str = "",
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    with advisory_lock(config_mutation_lock_path()):
+        current = load_config() if os.path.exists(config_path()) else normalize_config(config)
+        return _set_room_launcher_locked(
+            current,
+            guild_id,
+            conversation_id,
+            response_mode=response_mode,
+            default_qualified_handle=default_qualified_handle,
+            policy=policy,
+        )
+
+
+def _set_room_launcher_locked(
     config: dict[str, Any],
     guild_id: str,
     conversation_id: str,
@@ -735,14 +951,24 @@ def list_room_launchers(config: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(launchers.values(), key=lambda item: (str(item.get("kind", "")), str(item.get("conversation_id", ""))))
 
 
-def describe_room_channel_metadata(conversation_id: str, *, bot_token: str = "") -> dict[str, Any]:
-    token = str(bot_token).strip() or load_bot_token()
+def describe_room_channel_scope(conversation_id: str, *, bot_token: str | None = None) -> dict[str, Any]:
+    token = load_bot_token() if bot_token is None else str(bot_token).strip()
     if not token:
         return {}
     info = discord_api_request("GET", f"/channels/{urllib.parse.quote(str(conversation_id).strip())}", bot_token=token)
     if not isinstance(info, dict):
         return {}
-    return normalize_binding_channel_metadata(info)
+    scope = normalize_binding_channel_metadata(info)
+    guild_id = str(info.get("guild_id", "")).strip()
+    if guild_id:
+        scope["guild_id"] = guild_id
+    return scope
+
+
+def describe_room_channel_metadata(conversation_id: str, *, bot_token: str | None = None) -> dict[str, Any]:
+    return normalize_binding_channel_metadata(
+        describe_room_channel_scope(conversation_id, bot_token=bot_token)
+    )
 
 
 def channel_metadata_cache_path(conversation_id: str) -> str:
@@ -773,14 +999,53 @@ def resolve_chat_binding(config: dict[str, Any], binding_id: str) -> dict[str, A
 
 def list_chat_bindings(config: dict[str, Any]) -> list[dict[str, Any]]:
     bindings = normalize_config(config).get("chat", {}).get("bindings", {})
-    return sorted(bindings.values(), key=lambda item: (str(item.get("kind", "")), str(item.get("conversation_id", ""))))
+    return sorted(
+        bindings.values(),
+        key=lambda item: (
+            str(item.get("kind", "")),
+            str(item.get("conversation_id", "")),
+            str(item.get("app", "")),
+        ),
+    )
 
 
-def resolve_publish_route(config: dict[str, Any], route_id: str) -> dict[str, Any] | None:
-    binding = resolve_chat_binding(config, route_id)
-    if binding:
-        return binding
+def resolve_publish_route(
+    config: dict[str, Any],
+    route_id: str,
+    *,
+    app_name: str = "",
+) -> dict[str, Any] | None:
     route = str(route_id).strip()
+    normalized_app_name = validate_app_name(app_name)
+    if normalized_app_name:
+        resolve_app_config(config, normalized_app_name)
+        if "@app:" in route:
+            expected_suffix = f"@app:{normalized_app_name}"
+            if not route.endswith(expected_suffix):
+                raise ValueError("--app does not match the binding app")
+        elif route.startswith(("dm:", "room:")):
+            route = f"{route}@app:{normalized_app_name}"
+        else:
+            raise ValueError("named apps support only room and DM bindings")
+    binding = resolve_chat_binding(config, route)
+    if binding:
+        binding_app_name = validate_app_name(binding.get("app", ""))
+        if binding_app_name:
+            resolve_app_config(config, binding_app_name)
+        return binding
+    if not normalized_app_name and route.startswith(("dm:", "room:")) and "@app:" not in route:
+        candidates = [
+            item
+            for item in list_chat_bindings(config)
+            if str(item.get("id", "")).partition("@app:")[0] == route
+        ]
+        if len(candidates) == 1:
+            candidate_app_name = validate_app_name(candidates[0].get("app", ""))
+            if candidate_app_name:
+                resolve_app_config(config, candidate_app_name)
+            return candidates[0]
+        if len(candidates) > 1:
+            raise ValueError(f"binding {route!r} is ambiguous; select one with --app")
     if route.startswith("launch-room:"):
         launcher = resolve_room_launcher(config, route.removeprefix("launch-room:"))
         if launcher:
@@ -793,6 +1058,18 @@ def resolve_publish_route(config: dict[str, Any], route_id: str) -> dict[str, An
 
 
 def set_channel_mapping(
+    config: dict[str, Any],
+    guild_id: str,
+    channel_id: str,
+    target: str,
+    fix_formula: str | None,
+) -> dict[str, Any]:
+    with advisory_lock(config_mutation_lock_path()):
+        current = load_config() if os.path.exists(config_path()) else normalize_config(config)
+        return _set_channel_mapping_locked(current, guild_id, channel_id, target, fix_formula)
+
+
+def _set_channel_mapping_locked(
     config: dict[str, Any],
     guild_id: str,
     channel_id: str,
@@ -826,6 +1103,18 @@ def normalize_rig_key(guild_id: str, rig_name: str) -> str:
 
 
 def set_rig_mapping(
+    config: dict[str, Any],
+    guild_id: str,
+    rig_name: str,
+    target: str,
+    fix_formula: str | None,
+) -> dict[str, Any]:
+    with advisory_lock(config_mutation_lock_path()):
+        current = load_config() if os.path.exists(config_path()) else normalize_config(config)
+        return _set_rig_mapping_locked(current, guild_id, rig_name, target, fix_formula)
+
+
+def _set_rig_mapping_locked(
     config: dict[str, Any],
     guild_id: str,
     rig_name: str,
@@ -1176,17 +1465,17 @@ def list_recent_requests(limit: int = 20) -> list[dict[str, Any]]:
     return entries[:limit]
 
 
-def save_gateway_status(payload: dict[str, Any]) -> dict[str, Any]:
+def save_gateway_status(payload: dict[str, Any], app_name: str = "") -> dict[str, Any]:
     ensure_layout()
     body = copy.deepcopy(payload)
     body["updated_at"] = utcnow()
-    atomic_write_json(gateway_status_path(), body)
+    atomic_write_json(gateway_status_path(app_name), body)
     return body
 
 
-def load_gateway_status() -> dict[str, Any]:
+def load_gateway_status(app_name: str = "") -> dict[str, Any]:
     ensure_layout()
-    payload = read_json(gateway_status_path(), {}, allow_invalid=True)
+    payload = read_json(gateway_status_path(app_name), {}, allow_invalid=True)
     if isinstance(payload, dict):
         return payload
     return {}
@@ -1804,12 +2093,17 @@ def interactions_url() -> str:
 
 def build_status_snapshot(limit: int = 20) -> dict[str, Any]:
     config = load_config()
+    gateway_statuses = {
+        app_name or "default": redact_gateway_status(load_gateway_status(app_name))
+        for app_name in list_app_names(config)
+    }
     return {
         "service_name": current_service_name(),
         "admin_url": admin_url(),
         "interactions_url": interactions_url(),
         "config": redact_config(config),
         "gateway_status": redact_gateway_status(load_gateway_status()),
+        "gateway_statuses": gateway_statuses,
         "recent_requests": [redact_request_record(item) for item in list_recent_requests(limit=limit)],
         "chat_bindings": list_chat_bindings(config),
         "chat_launchers": list_room_launchers(config),
@@ -1900,7 +2194,7 @@ def discord_api_request(
         "Accept": "application/json",
         "User-Agent": "gas-city-discord/0.1",
     }
-    token = bot_token or load_bot_token()
+    token = load_bot_token() if bot_token is None else bot_token
     if token:
         headers["Authorization"] = f"Bot {token}"
     if payload is not None:
@@ -4166,7 +4460,12 @@ def record_room_launch_message_target(
         return save_room_launch(body)
 
 
-def resolve_publish_conversation_id(binding: dict[str, Any], requested_conversation_id: str) -> str:
+def resolve_publish_conversation_id(
+    binding: dict[str, Any],
+    requested_conversation_id: str,
+    *,
+    bot_token: str | None = None,
+) -> str:
     binding_conversation_id = str(binding.get("conversation_id", "")).strip()
     requested = str(requested_conversation_id).strip()
     if not requested or requested == binding_conversation_id:
@@ -4174,7 +4473,11 @@ def resolve_publish_conversation_id(binding: dict[str, Any], requested_conversat
     if str(binding.get("kind", "")).strip() == "dm":
         raise ValueError("--conversation-id cannot override a DM binding")
     try:
-        channel_info = discord_api_request("GET", f"/channels/{urllib.parse.quote(requested)}")
+        channel_info = discord_api_request(
+            "GET",
+            f"/channels/{urllib.parse.quote(requested)}",
+            bot_token=bot_token,
+        )
     except DiscordAPIError as exc:
         raise ValueError(f"failed to validate --conversation-id: {exc}") from exc
     parent_id = str((channel_info or {}).get("parent_id", "")).strip()
@@ -4190,12 +4493,17 @@ def resolve_publish_destination(
     trigger_id: str = "",
     reply_to_message_id: str = "",
     source_context: dict[str, str] | None = None,
+    bot_token: str | None = None,
 ) -> tuple[str, str, dict[str, Any] | None]:
     reply_target = str(reply_to_message_id).strip() or str(trigger_id).strip()
     source_meta = derive_publish_source_metadata(source_context)
     launch_id = str(source_meta.get("launch_id", "")).strip()
     if str(binding.get("publish_route_kind", "")).strip() != "room_launch" or not launch_id:
-        conversation_id = resolve_publish_conversation_id(binding, requested_conversation_id)
+        conversation_id = resolve_publish_conversation_id(
+            binding,
+            requested_conversation_id,
+            bot_token=bot_token,
+        )
         return conversation_id, reply_target, None
     current = load_room_launch(launch_id)
     if not current:
@@ -4727,20 +5035,63 @@ def publish_binding_message(
     source_session_name: str = "",
     source_session_id: str = "",
 ) -> dict[str, Any]:
+    app_name = validate_app_name(binding.get("app", ""))
+    bot_token: str | None = None
+    if app_name:
+        bot_token = load_bot_token(app_name)
+        if not bot_token:
+            raise DiscordAPIError(f"Discord bot token is not configured for app {app_name!r}")
+    if str(binding.get("kind", "")).strip() == "room":
+        config = load_config()
+        policy = resolve_app_policy(config, app_name)
+        has_outbound_policy = bool(
+            _normalize_allowlist(policy.get("guild_allowlist"))
+            or _normalize_allowlist(policy.get("channel_allowlist"))
+        )
+        if has_outbound_policy:
+            policy_token = bot_token or load_bot_token()
+            if not policy_token:
+                display_name = app_name or "default"
+                raise DiscordAPIError(f"Discord bot token is not configured for app {display_name!r}")
+            binding_conversation_id = str(binding.get("conversation_id", "")).strip()
+            channel_scope = describe_room_channel_scope(binding_conversation_id, bot_token=policy_token)
+            actual_guild_id = str(channel_scope.get("guild_id", "")).strip()
+            parent_channel_id = (
+                str(channel_scope.get("thread_parent_id", "")).strip()
+                or binding_conversation_id
+            )
+            policy_rejection = outbound_policy_reason(
+                config,
+                actual_guild_id,
+                parent_channel_id,
+                app_name=app_name,
+            )
+            if policy_rejection:
+                display_name = app_name or "default"
+                raise ValueError(f"Discord app {display_name!r} policy rejects publish: {policy_rejection}")
     conversation_id, reply_target, launch = resolve_publish_destination(
         binding,
         requested_conversation_id=requested_conversation_id,
         trigger_id=trigger_id,
         reply_to_message_id=reply_to_message_id,
         source_context=source_context,
+        bot_token=bot_token,
     )
     if not conversation_id:
         raise ValueError("binding is missing a destination conversation_id")
-    response = post_channel_message(
-        conversation_id,
-        body,
-        reply_to_message_id=reply_target,
-    )
+    if app_name:
+        response = post_channel_message(
+            conversation_id,
+            body,
+            reply_to_message_id=reply_target,
+            bot_token=bot_token,
+        )
+    else:
+        response = post_channel_message(
+            conversation_id,
+            body,
+            reply_to_message_id=reply_target,
+        )
     remote_message_id = str((response or {}).get("id", "")).strip()
     if not remote_message_id:
         raise DiscordAPIError("discord publish returned no message id")
@@ -4772,6 +5123,7 @@ def publish_binding_message(
             "binding_id": str(binding.get("id", "")).strip(),
             "binding_kind": str(binding.get("kind", "")).strip(),
             "binding_conversation_id": str(binding.get("conversation_id", "")).strip(),
+            "app": app_name,
             "conversation_id": conversation_id,
             "guild_id": str(binding.get("guild_id", "")).strip(),
             "trigger_id": str(trigger_id).strip(),
@@ -4884,7 +5236,13 @@ def sync_guild_commands(config: dict[str, Any], guild_id: str) -> Any:
     )
 
 
-def post_channel_message(channel_id: str, body: str, reply_to_message_id: str = "") -> Any:
+def post_channel_message(
+    channel_id: str,
+    body: str,
+    reply_to_message_id: str = "",
+    *,
+    bot_token: str | None = None,
+) -> Any:
     payload: dict[str, Any] = {
         "content": body,
         "allowed_mentions": {"parse": ["users"]},
@@ -4896,11 +5254,10 @@ def post_channel_message(channel_id: str, body: str, reply_to_message_id: str = 
             "message_id": reply_to_message_id,
             "fail_if_not_exists": False,
         }
-    return discord_api_request(
-        "POST",
-        f"/channels/{urllib.parse.quote(str(channel_id))}/messages",
-        payload=payload,
-    )
+    path = f"/channels/{urllib.parse.quote(str(channel_id))}/messages"
+    if bot_token is None:
+        return discord_api_request("POST", path, payload=payload)
+    return discord_api_request("POST", path, payload=payload, bot_token=bot_token)
 
 
 def discord_jump_url(guild_id: str, conversation_id: str) -> str:
@@ -4911,9 +5268,15 @@ def discord_jump_url(guild_id: str, conversation_id: str) -> str:
     return f"https://discord.com/channels/{guild_id}/{conversation_id}"
 
 
-def policy_reason(config: dict[str, Any], guild_id: str, parent_channel_id: str, role_ids: list[str]) -> str:
-    normalized = normalize_config(config)
-    policy = normalized.get("policy", {})
+def policy_reason(
+    config: dict[str, Any],
+    guild_id: str,
+    parent_channel_id: str,
+    role_ids: list[str],
+    *,
+    app_name: str = "",
+) -> str:
+    policy = resolve_app_policy(config, app_name)
     guild_allowlist = set(_normalize_allowlist(policy.get("guild_allowlist")))
     channel_allowlist = set(_normalize_allowlist(policy.get("channel_allowlist")))
     role_allowlist = set(_normalize_allowlist(policy.get("role_allowlist")))
@@ -4923,4 +5286,21 @@ def policy_reason(config: dict[str, Any], guild_id: str, parent_channel_id: str,
         return "channel_not_allowed"
     if role_allowlist and not role_allowlist.intersection(set(role_ids)):
         return "role_not_allowed"
+    return ""
+
+
+def outbound_policy_reason(
+    config: dict[str, Any],
+    guild_id: str,
+    parent_channel_id: str,
+    *,
+    app_name: str = "",
+) -> str:
+    policy = resolve_app_policy(config, app_name)
+    guild_allowlist = set(_normalize_allowlist(policy.get("guild_allowlist")))
+    channel_allowlist = set(_normalize_allowlist(policy.get("channel_allowlist")))
+    if guild_allowlist and str(guild_id).strip() not in guild_allowlist:
+        return "guild_not_allowed"
+    if channel_allowlist and str(parent_channel_id).strip() not in channel_allowlist:
+        return "channel_not_allowed"
     return ""
