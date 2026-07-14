@@ -2,6 +2,13 @@
 Write the review verdict report to {{report_path}} with pass/fail, findings,
 missing evidence, and recommended fixes for subject {{subject_path}}.
 
+Read the subject input from workflow-root metadata `gc.var.subject_path` and
+resolve it to the canonical absolute path represented by `{{subject_path}}`.
+Record that exact path in `trace.upstream`, run `sha256sum` on the file, and
+record the resulting `sha256:` value with exactly 64 hexadecimal digits.
+Never use a placeholder digest, a label, or a guessed revision in place of
+the subject's actual bytes.
+
 The requested review authority is `{{review_mode}}`: in `report` mode, write
 findings and verdicts without mutating code; in `agent` mode, also include a
 structured fix handoff for the caller's review-fix formula to apply; in

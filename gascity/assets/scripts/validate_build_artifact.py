@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover
 
 
 FRONT_MATTER_RE = re.compile(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)(?P<body>.*)\Z", re.DOTALL)
+SHA256_RE = re.compile(r"sha256:[0-9a-fA-F]{64}\Z")
 SCHEMA_ROOT = Path(__file__).resolve().parents[2] / "schemas" / "build"
 FORBIDDEN_REQUIRED_FIELD_NAMES = {"owner", "stage-owner", "stage_owner", "persona", "role"}
 
@@ -147,6 +148,10 @@ def validate_upstream(trace: dict[str, Any]) -> list[dict[str, Any]]:
         validate_upstream_path(path, index)
         if ":" not in hash_value:
             raise ValidationError(f"trace.upstream[{index}].hash must include a hash or revision scheme")
+        if hash_value.lower().startswith("sha256:") and not SHA256_RE.fullmatch(hash_value):
+            raise ValidationError(
+                f"trace.upstream[{index}].hash with sha256 scheme must contain exactly 64 hexadecimal digits"
+            )
         ids = raw.get("ids")
         if ids is not None:
             if not isinstance(ids, list) or not all(isinstance(item, str) and item.strip() for item in ids):

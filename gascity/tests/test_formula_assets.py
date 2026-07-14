@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -703,6 +704,47 @@ class FormulaAssetTests(unittest.TestCase):
             "oversized descriptions are externalized before expansion, so their physical "
             "description_file paths must not contain the substituted {target} token",
         )
+
+    def test_base_review_prompt_requires_real_subject_provenance(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        prompt = (root / "assets" / "workflows" / "review" / "write-report.md").read_text(
+            encoding="utf-8"
+        )
+
+        for fragment in (
+            "gc.var.subject_path",
+            "sha256sum",
+            "64 hexadecimal digits",
+            "Never use a placeholder digest",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, prompt)
+
+    def test_methodology_review_terminals_require_internal_adapter_fidelity(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        formulas = {
+            "superpowers": "superpowers-code-review",
+            "gstack": "gstack-code-review",
+            "compound-engineering": "compound-code-review",
+            "bmad": "bmad-code-review-flow",
+        }
+
+        for pack, formula in formulas.items():
+            with self.subTest(pack=pack):
+                document = tomllib.loads(
+                    (packs_root / pack / "formulas" / f"{formula}.formula.toml").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                terminal = next(
+                    template
+                    for template in document["template"]
+                    if template["id"] == "{target}"
+                )
+                self.assertEqual(
+                    terminal["metadata"].get("gc.build.require_internal_review_report"),
+                    "true",
+                )
 
     def test_expected_formula_set_is_convoy_first(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
@@ -4733,7 +4775,7 @@ description = "Override sink that writes the base triage report contract."
                 self.assertIn("review_mode", expansion_data.get("vars", {}))
                 self.assertEqual(
                     expansion_data.get("vars", {}).get("artifact_path_keys", {}).get("default"),
-                    "gc.build.code_review_report_path,gc.build.review_report_path,gc.var.report_path",
+                    "gc.var.report_path,gc.build.review_report_path,gc.build.code_review_report_path",
                 )
                 self.assertEqual(
                     child_by_id(expansion_data, case["fix_child"]).get("condition"),
@@ -4877,6 +4919,35 @@ description = "Override sink that writes the base triage report contract."
             f"{body}\n"
         )
 
+    @staticmethod
+    def _valid_review_artifact(subject: pathlib.Path, *, hash_value: str = "") -> str:
+        digest = hash_value or f"sha256:{hashlib.sha256(subject.read_bytes()).hexdigest()}"
+        return (
+            "---\n"
+            "schema: gc.build.review.v1\n"
+            "workflow:\n"
+            "  id: review-20260714-001\n"
+            "  formula: review\n"
+            "methodology:\n"
+            "  pack: gascity\n"
+            "  name: review\n"
+            "producer:\n"
+            "  formula: code-review-base\n"
+            "  stage: write-report\n"
+            "  attempt: 1\n"
+            "status: changes_required\n"
+            "trace:\n"
+            "  upstream:\n"
+            f"    - path: {subject}\n"
+            f"      hash: {digest}\n"
+            "  coverage: []\n"
+            "---\n"
+            "\n"
+            "## Verdict\n\nChanges required.\n\n"
+            "## Findings\n\nShell injection through subprocess shell=True.\n\n"
+            "## Verification\n\nUse an argument vector with shell=False.\n"
+        )
+
     def test_build_artifact_check_passes_valid_recorded_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:
             artifact = pathlib.Path(artifact_dir) / "requirements.md"
@@ -4892,6 +4963,435 @@ description = "Override sink that writes the base triage report contract."
                 '[{"id": "root", "metadata": {'
                 f'"gc.build.requirements_path": "{artifact}"'
                 "}}]"
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("build artifact valid", result.stdout)
+
+    def test_build_artifact_check_ignores_worker_validator_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            artifact = root / "invalid-requirements.md"
+            artifact.write_text("# Not a schema-valid artifact\n", encoding="utf-8")
+            shadow = root / "gascity" / "assets" / "scripts" / "validate_build_artifact.py"
+            shadow.parent.mkdir(parents=True)
+            shadow.write_text("raise SystemExit(0)\n", encoding="utf-8")
+            control = json.dumps(
+                [{
+                    "id": "requirements",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.requirements.v1",
+                        "gc.build.artifact_path_keys": "gc.build.requirements_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {"gc.build.requirements_path": str(artifact)},
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"requirements": control, "root": root_bead},
+                "requirements",
+                extra_env={"GC_WORK_DIR": str(root)},
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("failed validation", result.stderr)
+
+    def test_review_artifact_check_rejects_invalid_internal_report(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            internal = root / "internal-review-report.md"
+            adapter.write_text(self._valid_review_artifact(subject), encoding="utf-8")
+            internal.write_text("# Freeform internal report\n", encoding="utf-8")
+            control = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(adapter),
+                        "gc.build.code_review_report_path": str(internal),
+                        "gc.build.review_subject_path": str(subject),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("internal review report", result.stderr)
+
+    def test_review_artifact_check_rejects_adapter_that_differs_from_internal(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            internal = root / "internal-review-report.md"
+            report = self._valid_review_artifact(subject)
+            internal.write_text(report, encoding="utf-8")
+            adapter.write_text(report + "\nAdapter-only rewrite.\n", encoding="utf-8")
+            control = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(adapter),
+                        "gc.build.code_review_report_path": str(internal),
+                        "gc.build.review_subject_path": str(subject),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("byte-identical", result.stderr)
+
+    def test_review_artifact_check_rejects_required_internal_report_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            adapter.write_text(self._valid_review_artifact(subject), encoding="utf-8")
+            control = json.dumps(
+                [{
+                    "id": "finalize-review",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                        "gc.build.require_internal_review_report": "true",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(adapter),
+                        "gc.var.subject_path": str(subject),
+                        "gc.build.code_review_report_path": str(adapter),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"finalize-review": control, "root": root_bead}, "finalize-review"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("must be distinct", result.stderr)
+
+    def test_review_artifact_check_rejects_required_internal_report_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            adapter.write_text(self._valid_review_artifact(subject), encoding="utf-8")
+            internal = root / "internal-review-report.md"
+            os.link(adapter, internal)
+            control = json.dumps(
+                [{
+                    "id": "finalize-review",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                        "gc.build.require_internal_review_report": "true",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(adapter),
+                        "gc.var.subject_path": str(subject),
+                        "gc.build.code_review_report_path": str(internal),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"finalize-review": control, "root": root_bead}, "finalize-review"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("must be distinct", result.stderr)
+
+    def test_review_artifact_check_rejects_missing_required_internal_report(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            adapter.write_text(self._valid_review_artifact(subject), encoding="utf-8")
+            control = json.dumps(
+                [{
+                    "id": "finalize-review",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                        "gc.build.require_internal_review_report": "true",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(adapter),
+                        "gc.var.subject_path": str(subject),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"finalize-review": control, "root": root_bead}, "finalize-review"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("required internal review report metadata", result.stderr)
+
+    def test_review_artifact_check_rejects_fake_subject_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            internal = root / "internal-review-report.md"
+            report = self._valid_review_artifact(subject, hash_value="literal:not-the-subject")
+            adapter.write_text(report, encoding="utf-8")
+            internal.write_text(report, encoding="utf-8")
+            control = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(adapter),
+                        "gc.build.code_review_report_path": str(internal),
+                        "gc.build.review_subject_path": str(subject),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("canonical review subject digest", result.stderr)
+
+    def test_review_artifact_check_uses_base_review_subject_var_for_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            report = root / "review-report.md"
+            report.write_text(
+                self._valid_review_artifact(subject, hash_value="literal:not-the-subject"),
+                encoding="utf-8",
+            )
+            control = json.dumps(
+                [{
+                    "id": "write-report",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(report),
+                        "gc.var.subject_path": str(subject),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"write-report": control, "root": root_bead}, "write-report"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("canonical review subject digest", result.stderr)
+
+    def test_review_artifact_check_rejects_conflicting_subject_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            caller_subject = root / "caller-subject.diff"
+            caller_subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            substituted_subject = root / "substituted-subject.diff"
+            substituted_subject.write_text("diff --git a/b.py b/b.py\n", encoding="utf-8")
+            report = root / "review-report.md"
+            report.write_text(
+                self._valid_review_artifact(substituted_subject), encoding="utf-8"
+            )
+            control = json.dumps(
+                [{
+                    "id": "write-report",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(report),
+                        "gc.var.subject_path": str(caller_subject),
+                        "gc.build.review_subject_path": str(substituted_subject),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"write-report": control, "root": root_bead}, "write-report"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("review subject metadata paths disagree", result.stderr)
+
+    def test_review_artifact_check_rejects_relative_canonical_subject_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            report = root / "review-report.md"
+            artifact = self._valid_review_artifact(subject).replace(
+                f"    - path: {subject}\n",
+                f"    - path: {subject.name}\n",
+                1,
+            )
+            report.write_text(artifact, encoding="utf-8")
+            control = json.dumps(
+                [{
+                    "id": "write-report",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(report),
+                        "gc.var.subject_path": str(subject),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"write-report": control, "root": root_bead}, "write-report"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("canonical review subject digest", result.stderr)
+
+    def test_review_artifact_check_allows_derived_build_scope_without_subject_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            derived_scope = root / "implementation-summary.md"
+            derived_scope.write_text("Implemented slugify.\n", encoding="utf-8")
+            report = root / "review-report.md"
+            report.write_text(self._valid_review_artifact(derived_scope), encoding="utf-8")
+            control = json.dumps(
+                [{
+                    "id": "finalize-build-review",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.build.review_report_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {"gc.build.review_report_path": str(report)},
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"finalize-build-review": control, "root": root_bead},
+                "finalize-build-review",
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("build artifact valid", result.stdout)
+
+    def test_review_artifact_check_accepts_identical_reports_with_real_subject_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            internal = root / "internal-review-report.md"
+            report = self._valid_review_artifact(subject)
+            adapter.write_text(report, encoding="utf-8")
+            internal.write_text(report, encoding="utf-8")
+            control = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.report_path": str(adapter),
+                        "gc.build.code_review_report_path": str(internal),
+                        "gc.build.review_subject_path": str(subject),
+                    },
+                }]
             )
             result = self._run_build_artifact_check(
                 {"loop": control, "root": root_bead}, "loop"
@@ -5759,9 +6259,9 @@ description = "Override sink that writes the base triage report contract."
         self.assertNotIn("SEC-001", finalize)
 
         expansion_artifact_keys = (
-            "gc.build.code_review_report_path,"
+            "gc.var.report_path,"
             "gc.build.review_report_path,"
-            "gc.var.report_path"
+            "gc.build.code_review_report_path"
         )
         self.assertEqual(
             expansion_formula["vars"]["artifact_path_keys"]["default"],

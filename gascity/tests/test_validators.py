@@ -337,6 +337,15 @@ trace:
         with self.assertRaisesRegex(build_artifact_validator.ValidationError, "hash"):
             build_artifact_validator.validate_artifact_text(text, expected_schema="gc.build.requirements.v1")
 
+    def test_build_artifact_rejects_malformed_sha256_upstream_hash(self) -> None:
+        text = self.valid_artifact().replace(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:review-subject-v1",
+        )
+
+        with self.assertRaisesRegex(build_artifact_validator.ValidationError, "sha256"):
+            build_artifact_validator.validate_artifact_text(text, expected_schema="gc.build.requirements.v1")
+
     def test_build_artifact_rejects_invalid_coverage_status_and_missing_rationale(self) -> None:
         invalid_status = self.valid_artifact().replace("status: deferred", "status: waiting", 1)
         missing_rationale = self.valid_artifact().replace(

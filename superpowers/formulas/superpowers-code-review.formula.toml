@@ -16,7 +16,7 @@ default = "superpowers.implementer"
 
 [vars.artifact_path_keys]
 description = "Comma-separated artifact metadata keys accepted by the terminal review report validator."
-default = "gc.build.code_review_report_path,gc.build.review_report_path,gc.var.report_path"
+default = "gc.var.report_path,gc.build.review_report_path,gc.build.code_review_report_path"
 
 [vars.review_mode]
 description = "Review authority: report, agent, or interactive."
@@ -67,7 +67,7 @@ description_file = "../assets/workflows/superpowers-code-review/{target}.process
 id = "{target}"
 title = "Finalize Superpowers code review"
 needs = ["{target}.superpowers-code-review-loop"]
-metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "{artifact_path_keys}" }
+metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "{artifact_path_keys}", "gc.build.require_internal_review_report" = "true" }
 description_file = "../assets/workflows/superpowers-code-review/finalize-code-review.md"
 
 [template.check]
