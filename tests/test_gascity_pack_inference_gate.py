@@ -260,6 +260,11 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert 'go-version: "1.26.5"' in workflow
     assert "name: Verify Beads compatibility" in workflow
     assert "github.com/steveyegge/beads" in workflow
+    assert "resolve-gascity-refs:" in workflow
+    assert "needs: [static-contracts, resolve-gascity-refs]" in workflow
+    assert "needs.resolve-gascity-refs.outputs.runtime_ref" in workflow
+    assert "needs.resolve-gascity-refs.outputs.setup_ref" in workflow
+    assert "git ls-remote https://github.com/gastownhall/gascity.git refs/heads/main" in workflow
     assert "ANTHROPIC_BASE_URL: https://ollama.com" in workflow
     assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
     assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}" in workflow

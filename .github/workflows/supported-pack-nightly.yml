@@ -78,9 +78,48 @@ jobs:
       - name: Run supported-pack contract tests
         run: python3 -m pytest tests/test_gascity_pack_inference_gate.py gascity/tests/test_formula_assets.py -q
 
+  resolve-gascity-refs:
+    name: resolve Gas City refs
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      runtime_ref: ${{ steps.refs.outputs.runtime_ref }}
+      setup_ref: ${{ steps.refs.outputs.setup_ref }}
+    steps:
+      - name: Resolve moving Gas City refs once
+        id: refs
+        env:
+          REQUESTED_RUNTIME_REF: ${{ github.event.inputs.gascity_ref || 'main' }}
+          REQUESTED_SETUP_REF: ${{ github.event.inputs.gascity_setup_ref || 'main' }}
+        run: |
+          main_ref="$(git ls-remote https://github.com/gastownhall/gascity.git refs/heads/main | awk 'NR == 1 { print $1 }')"
+          test -n "$main_ref" || { echo "Could not resolve Gas City main" >&2; exit 1; }
+
+          resolve_ref() {
+            requested="$1"
+            if [ "$requested" = "main" ]; then
+              printf '%s\n' "$main_ref"
+              return
+            fi
+            if git check-ref-format --branch "$requested" >/dev/null 2>&1 || [[ "$requested" =~ ^[0-9a-f]{40}$ ]]; then
+              printf '%s\n' "$requested"
+              return
+            fi
+            printf 'Invalid Gas City ref: %s\n' "$requested" >&2
+            return 1
+          }
+
+          runtime_ref="$(resolve_ref "$REQUESTED_RUNTIME_REF")"
+          setup_ref="$(resolve_ref "$REQUESTED_SETUP_REF")"
+          test -n "$runtime_ref" || { echo "Could not resolve Gas City runtime ref" >&2; exit 1; }
+          test -n "$setup_ref" || { echo "Could not resolve Gas City setup ref" >&2; exit 1; }
+          echo "runtime_ref=$runtime_ref" >> "$GITHUB_OUTPUT"
+          echo "setup_ref=$setup_ref" >> "$GITHUB_OUTPUT"
+          echo "Resolved Gas City refs: runtime=$runtime_ref setup=$setup_ref"
+
   inference:
     name: ${{ matrix.pack }} / ${{ matrix.gate }}
-    needs: static-contracts
+    needs: [static-contracts, resolve-gascity-refs]
     runs-on: blacksmith-32vcpu-ubuntu-2404
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
@@ -210,7 +249,7 @@ jobs:
         with:
           repository: gastownhall/gascity
           path: .gascity-ci
-          ref: ${{ github.event.inputs.gascity_setup_ref || 'main' }}
+          ref: ${{ needs.resolve-gascity-refs.outputs.setup_ref }}
 
       - name: Set up Python
         if: steps.subset.outputs.run_gate == 'true'
@@ -248,7 +287,7 @@ jobs:
       - name: Install Gas City
         if: steps.subset.outputs.run_gate == 'true'
         env:
-          GASCITY_REF: ${{ github.event.inputs.gascity_ref || 'main' }}
+          GASCITY_REF: ${{ needs.resolve-gascity-refs.outputs.runtime_ref }}
         run: |
           go install "github.com/gastownhall/gascity/cmd/gc@${GASCITY_REF}"
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
@@ -258,7 +297,7 @@ jobs:
         if: steps.subset.outputs.run_gate == 'true'
         run: |
           gc_beads_version="$(go version -m "$(go env GOPATH)/bin/gc" | awk '$1 == "dep" && $2 == "github.com/steveyegge/beads" { print $3 }')"
-          bd_cli_version="$(bd version | awk '{ print $3 }')"
+          bd_cli_version="$(bd version | awk '{ print $3 }')" # standalone-bd-version-preflight
           test -n "$gc_beads_version" || { echo "Gas City binary does not report its Beads dependency" >&2; exit 1; }
           test -n "$bd_cli_version" || { echo "Could not determine the bd CLI version" >&2; exit 1; }
           if [ "v${bd_cli_version#v}" != "$gc_beads_version" ]; then
