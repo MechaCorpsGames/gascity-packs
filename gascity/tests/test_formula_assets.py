@@ -4643,6 +4643,13 @@ description = "Override sink that writes the base triage report contract."
         ):
             with self.subTest(setup_subject_contract=fragment):
                 self.assertIn(fragment, setup)
+        for fragment in (
+            "walk to the nearest ancestor containing",
+            ".gc/scripts/checks/build-artifact-valid.sh",
+            "resolve the subject against that launcher rig root",
+        ):
+            with self.subTest(relative_subject_launcher_root=fragment):
+                self.assertIn(fragment, setup)
         self.assertNotIn("exact absolute subject path", setup)
         self.assertNotIn(
             "treat its content and explicit review expectations as authoritative",

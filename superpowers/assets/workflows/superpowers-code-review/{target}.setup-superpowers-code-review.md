@@ -7,8 +7,11 @@ the completed drain manifest. Use these exact handoff paths:
 First read workflow root metadata `gc.var.subject_path`. When it is non-empty,
 it selects the authoritative review scope supplied by the adapter. If the
 supplied value is absolute, retain it as-is. If it is a relative path, read the
-launcher rig root from the workflow root bead's `gc.work_dir` and resolve the
-value against that root, never against this lane's current directory or
+workflow root bead's `gc.work_dir`. That value may name this step's attempt
+worktree, so starting there, walk to the nearest ancestor containing
+`.gc/scripts/checks/build-artifact-valid.sh`; that ancestor is the launcher rig
+root. Then resolve the subject against that launcher rig root, never directly
+against the mutable `gc.work_dir`, this lane's current directory, or its
 worktree. Only the relative-path case requires `gc.work_dir`; do not block an
 absolute subject merely because that metadata is absent. Canonicalize the
 resolved value, verify that the canonical absolute path names an existing
