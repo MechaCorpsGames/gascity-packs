@@ -46,13 +46,13 @@ timeout = "10m"
 [[template.children]]
 id = "{target}.request-code-review"
 title = "Superpowers request code review"
-metadata = { "gc.run_target" = "superpowers.code-reviewer" }
+metadata = { "gc.run_target" = "superpowers.code-reviewer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.code_review_report_path" }
 description_file = "../assets/workflows/superpowers-code-review/{target}.request-code-review.md"
 
 [[template.children]]
 id = "{target}.gap-analysis-review"
 title = "Superpowers gap-analysis review"
-metadata = { "gc.run_target" = "superpowers.code-quality-reviewer" }
+metadata = { "gc.run_target" = "superpowers.code-quality-reviewer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.gap_analysis_report_path" }
 description_file = "../assets/workflows/superpowers-code-review/{target}.gap-analysis-review.md"
 
 [[template.children]]

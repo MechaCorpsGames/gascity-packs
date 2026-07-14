@@ -83,21 +83,40 @@ not use `violated`, `resolved`, `approved`, or `changes_required` as
 coverage table remains ID/status only; the rationale belongs in YAML front
 matter.
 
+Before closing, validate the exact gap-analysis report yourself. Read the
+launcher rig root from workflow root metadata `gc.work_dir`. If it is missing
+or does not contain the validator, use the nearest ancestor containing
+`.gc/scripts/checks/build-artifact-valid.sh`; do not run a relative validator
+from an attempt worktree that lacks it. Read the exact current bead ID from the
+startup claim output and substitute it literally into this same command; shell
+variables from earlier tool calls do not persist. From that launcher rig root
+run:
+
+```bash
+GC_BEAD_ID=<exact-claimed-bead-id> .gc/scripts/checks/build-artifact-valid.sh
+```
+
+Fix every validation error in the same canonical report, rerun the validator,
+and set `gc.outcome=pass` only after it exits successfully. Do not wait for the
+terminal adapter lane to normalize a freeform report.
+
 Close with `gc.outcome=pass`, `code_review.gap_verdict=approve|iterate`,
 `code_review.gap_report_path=<gap-analysis report path>`, and
 `code_review.output_path=<gap-analysis report path>`.
 
-Use the exact claimed bead id when updating metadata. Do not pass freeform notes
-or additional positional arguments to `gc bd update`; unquoted words can resolve to
-unrelated beads. Use this command shape:
+Use the exact claimed bead ID when updating metadata. Replace every
+`<exact-claimed-bead-id>` below with the literal value printed by the startup
+claim; do not reference a shell variable from an earlier tool call. Do not pass
+freeform notes or additional positional arguments to `gc bd update`; unquoted
+words can resolve to unrelated beads. Use this command shape:
 
 ```bash
-gc bd update "$CLAIMED_BEAD_ID" \
+gc bd update "<exact-claimed-bead-id>" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'code_review.gap_verdict=approve' \
   --set-metadata 'code_review.gap_report_path=<gap-analysis report path>' \
   --set-metadata 'code_review.output_path=<gap-analysis report path>'
-gc bd close "$CLAIMED_BEAD_ID" --reason 'Gap-analysis review approved with no required findings.'
+gc bd close "<exact-claimed-bead-id>" --reason 'Gap-analysis review approved with no required findings.'
 ```
 
 Do not set `code_review.verdict` or `code_review.report_path`; the

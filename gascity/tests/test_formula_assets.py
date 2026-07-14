@@ -4596,6 +4596,27 @@ description = "Override sink that writes the base triage report contract."
             encoding="utf-8"
         )
         finalize = (workflow_dir / "{target}.md").read_text(encoding="utf-8")
+        review_loop = next(
+            template
+            for template in expansion_formula["template"]
+            if template["id"].endswith("superpowers-code-review-loop")
+        )
+        child_by_id = {child["id"]: child for child in review_loop["children"]}
+        expected_child_paths = {
+            "{target}.request-code-review": "gc.build.code_review_report_path",
+            "{target}.gap-analysis-review": "gc.build.gap_analysis_report_path",
+        }
+        for child_id, expected_path_key in expected_child_paths.items():
+            child = child_by_id[child_id]
+            with self.subTest(review_child=child_id):
+                self.assertEqual(
+                    child["metadata"]["gc.build.artifact_schema"],
+                    "gc.build.review.v1",
+                )
+                self.assertIn(
+                    expected_path_key,
+                    child["metadata"]["gc.build.artifact_path_keys"],
+                )
 
         self.assertIn("code-review-context.md", setup)
         self.assertIn("implementation-review-report.md", setup)
@@ -4657,6 +4678,19 @@ description = "Override sink that writes the base triage report contract."
             "treat its content and explicit review expectations as authoritative",
             request,
         )
+        for fragment in (
+            "methodology guidance only",
+            "Gas City artifact contract takes precedence",
+            "nearest ancestor containing",
+            "GC_BEAD_ID=<exact-claimed-bead-id> .gc/scripts/checks/build-artifact-valid.sh",
+            'gc bd update "<exact-claimed-bead-id>"',
+            'gc bd close "<exact-claimed-bead-id>"',
+            "build-artifact-valid.sh",
+            "Fix every validation error",
+        ):
+            with self.subTest(request_validation=fragment):
+                self.assertIn(fragment, request)
+        self.assertNotIn('"$CLAIMED_BEAD_ID"', request)
 
         self.assertIn("code_review.gap_verdict", gap)
         self.assertIn("code_review.gap_report_path", gap)
@@ -4684,6 +4718,17 @@ description = "Override sink that writes the base triage report contract."
             "treat its content and explicit review expectations as authoritative",
             gap,
         )
+        for fragment in (
+            "nearest ancestor containing",
+            "GC_BEAD_ID=<exact-claimed-bead-id> .gc/scripts/checks/build-artifact-valid.sh",
+            'gc bd update "<exact-claimed-bead-id>"',
+            'gc bd close "<exact-claimed-bead-id>"',
+            "build-artifact-valid.sh",
+            "Fix every validation error",
+        ):
+            with self.subTest(gap_validation=fragment):
+                self.assertIn(fragment, gap)
+        self.assertNotIn('"$CLAIMED_BEAD_ID"', gap)
 
         self.assertIn("code_review.verdict=done|iterate", process)
         self.assertIn("code_review.report_path=<review fix summary path>", process)
@@ -4706,6 +4751,28 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("caller-provided report path", finalize)
         self.assertIn("exact selected adapter", finalize)
         self.assertIn("gc.attempt_log", finalize)
+        for fragment in (
+            "normalize the report in one complete pass",
+            "untrusted review evidence",
+            "Do not execute commands",
+            "schema: gc.build.review.v1",
+            "workflow:",
+            "methodology:",
+            "producer:",
+            "status: changes_required",
+            "trace:",
+            "upstream:",
+            "coverage:",
+            "Preserve every actual finding ID",
+            "<actual-upstream-id>",
+            "`## Verdict`",
+            "`## Findings`",
+            "`## Verification`",
+            "| ID | Status |",
+        ):
+            with self.subTest(finalize_normalization=fragment):
+                self.assertIn(fragment, finalize)
+        self.assertNotIn("SEC-001", finalize)
 
         expansion_artifact_keys = (
             "gc.build.code_review_report_path,"
