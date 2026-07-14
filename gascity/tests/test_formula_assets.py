@@ -720,10 +720,17 @@ class FormulaAssetTests(unittest.TestCase):
             "Finding review issues, missing tests, or required follow-up is usually the\nbead's output",
             "check for more routed work before draining",
             "running the same `GC_CLAIM` block again",
+            "An empty continuation group is a hard session boundary",
+            "Never ask a human whether to proceed after a successful claim",
+            "Every successful claim result is authoritative",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, expected)
         self.assertNotIn("gc bd update \"$WORK_ID\" --claim --json", expected)
+        self.assertNotIn(
+            "otherwise drain instead of hopping to unrelated workflow work",
+            expected,
+        )
 
         for agent_name in ROLE_AGENTS:
             prompt = root / "roles" / "agents" / agent_name / "prompt.template.md"

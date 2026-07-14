@@ -177,6 +177,13 @@ Close it with the requested `gc.outcome` metadata. If the bead does not specify
 a failure contract, mark an unrecoverable failure with `gc.outcome=fail` and a
 concise `gc.failure_class`/reason before closing it.
 
+A successful claim is authorization to execute the claimed bead immediately.
+Never ask a human whether to proceed after a successful claim, and never end a
+turn waiting for confirmation in a headless workflow. If task-specific context
+is unavailable, follow the claimed bead's inline description. If the bead
+explicitly requires a missing input and cannot proceed, record its failure
+contract and close it instead of idling.
+
 Never close a bead that asks for close metadata before setting that metadata.
 First set the requested metadata on the claimed bead, then close the same bead
 id:
@@ -213,10 +220,17 @@ Important metadata:
 - `gc.continuation_group` - beads that prefer the same live session
 - `gc.scope_role=teardown` - cleanup/finalizer work; always execute when ready
 
-After closing a claimed bead, check for more routed work before draining unless
-the bead's result contract explicitly says the final action is to drain and
-exit. Continue by running the same `GC_CLAIM` block again. The block uses
-`gc hook --claim --json`; if it returns no work, it drain-acks and exits.
+After closing a claimed bead, inspect the `CLAIMED_CONTINUATION_GROUP` printed
+by the claim that assigned it before attempting another claim:
+
+- An empty continuation group is a hard session boundary. Do not run another
+  claim. Run `gc runtime drain-ack` immediately and exit so later routed work
+  starts with clean task context.
+- For a non-empty continuation group, check for more routed work before draining
+  unless the bead's result contract explicitly says the final action is to drain
+  and exit.
+  Continue by running the same `GC_CLAIM` block again. The block uses
+  `gc hook --claim --json`; if it returns no work, it drain-acks and exits.
 
 If you must drain explicitly, run this as your final command and exit:
 
@@ -224,10 +238,13 @@ If you must drain explicitly, run this as your final command and exit:
 gc runtime drain-ack
 ```
 
-When the bead you just closed had a `gc.continuation_group`, continue only for
-work in that same continuation group or same `gc.root_bead_id`; otherwise drain
-instead of hopping to unrelated workflow work. If the next ready bead is
-teardown work, run it even if earlier work failed.
+For a non-empty continuation group, `gc hook --claim` prioritizes work already
+assigned to the live session. Every successful claim result is authoritative:
+execute the newly claimed bead immediately, even when its continuation group or
+root differs from the bead just closed. Never drain, stop, or ask for
+confirmation after a successful claim. After closing the new bead, apply its
+continuation-group rule. If it is teardown work, run it even if earlier work
+failed.
 
 ## Notes
 
