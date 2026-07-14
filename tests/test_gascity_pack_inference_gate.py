@@ -257,6 +257,7 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert '--timeout "$GATE_TIMEOUT"' in workflow
     assert 'DOLT_VERSION: "2.1.7"' in workflow
     assert 'BD_VERSION: "v1.1.0"' in workflow
+    assert 'go-version: "1.26.5"' in workflow
     assert "ANTHROPIC_BASE_URL: https://ollama.com" in workflow
     assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
     assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}" in workflow
@@ -297,6 +298,7 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
     assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
     assert 'DOLT_VERSION: "2.1.7"' in workflow
     assert 'BD_VERSION: "v1.1.0"' in workflow
+    assert 'go-version: "1.26.5"' in workflow
     assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
     assert "include-hidden-files: true" in workflow
 
