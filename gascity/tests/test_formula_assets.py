@@ -2378,9 +2378,33 @@ class FormulaAssetTests(unittest.TestCase):
             "implementation convoy",
             "workflow root bead",
             "before closing",
+            "schema: gc.build.decomposition.v1",
+            "workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}",
+            "methodology: {pack: superpowers, name: superpowers-decomposition}",
+            "producer: {formula: <producer-formula>, stage: decompose, attempt: <positive integer>}",
+            "trace: {upstream: [...], coverage: [...]}",
+            "Selected Downstream Formulas",
+            "Implementation Convoy",
+            "Work Items",
+            "gc.build.decomposition_path` (fallback `gc.var.decomposition_path`)",
+            "Use `status: approved` before closing",
+            "first line must be `---`",
+            "rationale",
+            'GC_BEAD_ID="$CLAIMED_BEAD_ID"',
+            "build-artifact-valid.sh",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, decompose_text)
+        decompose_sections = [
+            "`## Summary`",
+            "`## Selected Downstream Formulas`",
+            "`## Implementation Convoy`",
+            "`## Work Items`",
+        ]
+        self.assertEqual(
+            [decompose_text.index(section) for section in decompose_sections],
+            sorted(decompose_text.index(section) for section in decompose_sections),
+        )
 
         plan_text = (
             pack_root / "assets" / "workflows" / "superpowers-build" / "plan.md"
@@ -2389,9 +2413,35 @@ class FormulaAssetTests(unittest.TestCase):
             "Do not write `prepare`, `requirements`, `plan`",
             "Only `### Task N` sections are decomposed into implementation beads",
             "input task or convoy member",
+            "schema: gc.build.plan.v1",
+            "workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}",
+            "methodology: {pack: superpowers, name: writing-plans}",
+            "producer: {formula: <producer-formula>, stage: plan, attempt: <positive integer>}",
+            "trace: {upstream: [...], coverage: [...]}",
+            "Current System",
+            "Proposed Implementation",
+            "Non-Goals",
+            "Verification",
+            "gc.build.plan_path` (fallback `gc.var.plan_path`)",
+            "Use `status: draft` before plan approval",
+            "first line must be `---`",
+            "rationale",
+            'GC_BEAD_ID="$CLAIMED_BEAD_ID"',
+            "build-artifact-valid.sh",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, plan_text)
+        plan_sections = [
+            "`## Summary`",
+            "`## Current System`",
+            "`## Proposed Implementation`",
+            "`## Non-Goals`",
+            "`## Verification`",
+        ]
+        self.assertEqual(
+            [plan_text.index(section) for section in plan_sections],
+            sorted(plan_text.index(section) for section in plan_sections),
+        )
 
         plan_review_text = (
             pack_root
@@ -2496,6 +2546,14 @@ class FormulaAssetTests(unittest.TestCase):
         pack_root = packs_root / "superpowers"
         formula = load_formula(pack_root, "superpowers-brainstorming")
         templates = {template["id"]: template for template in formula["template"]}
+
+        for parent_formula_name in ("superpowers-build", "superpowers-planning"):
+            parent_formula = load_formula(pack_root, parent_formula_name)
+            requirements_step = next(
+                step for step in parent_formula["steps"] if step["id"] == "requirements"
+            )
+            with self.subTest(parent_formula=parent_formula_name):
+                self.assertEqual(requirements_step["expand"], "superpowers-brainstorming")
 
         self.assertEqual(
             [template["id"] for template in formula["template"]],
@@ -2608,6 +2666,44 @@ class FormulaAssetTests(unittest.TestCase):
         self.assertIn("docs/superpowers/specs/", write_spec)
         self.assertIn("On repeated attempts", write_spec)
         self.assertIn("without clobbering loop feedback", write_spec)
+        for fragment in (
+            "schema: gc.build.requirements.v1",
+            "workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}",
+            "methodology: {pack: superpowers, name: superpowers-brainstorming}",
+            "producer: {formula: superpowers-brainstorming, stage: requirements, attempt: <positive integer>}",
+            "trace: {upstream: [...], coverage: [...]}",
+            "Problem Statement",
+            "W6H",
+            "User Stories",
+            "Technical Stories",
+            "Behavior Requirements",
+            "Example Mapping",
+            "Acceptance Criteria",
+            "Out Of Scope",
+            "Open Questions",
+            "Use `status: draft` before written-spec approval",
+            "gc.build.requirements_path` (fallback `gc.var.requirements_path`)",
+            "first line must be `---`",
+            "rationale",
+            "validate_build_artifact.py --schema gc.build.requirements.v1",
+        ):
+            with self.subTest(write_spec_contract=fragment):
+                self.assertIn(fragment, write_spec)
+        requirements_sections = [
+            "`## Problem Statement`",
+            "`## W6H`",
+            "`## User Stories`",
+            "`## Technical Stories`",
+            "`## Behavior Requirements`",
+            "`## Example Mapping`",
+            "`## Acceptance Criteria`",
+            "`## Out Of Scope`",
+            "`## Open Questions`",
+        ]
+        self.assertEqual(
+            [write_spec.index(section) for section in requirements_sections],
+            sorted(write_spec.index(section) for section in requirements_sections),
+        )
         self.assertIn('gc bd update "$CLAIMED_BEAD_ID"', write_spec)
         self.assertIn("Do not pass `--metadata` or `--set-metadata` to `gc bd close`", write_spec)
         self.assertIn("written spec", spec_approval)
@@ -2643,7 +2739,17 @@ class FormulaAssetTests(unittest.TestCase):
         self.assertIn("where Superpowers\nwould invoke `writing-plans`", final_requirements)
         self.assertIn("stock checklist item 9", final_requirements)
         self.assertIn("do not invoke that skill directly", final_requirements)
-        self.assertIn("let the parent `superpowers-build` plan step", final_requirements)
+        self.assertIn("let the parent formula's plan step", final_requirements)
+        self.assertIn(
+            "gc.build.requirements_path` (fallback `gc.var.requirements_path`)",
+            final_requirements,
+        )
+        self.assertIn(
+            'GC_BEAD_ID="$CLAIMED_BEAD_ID"',
+            final_requirements,
+        )
+        self.assertIn("build-artifact-valid.sh", final_requirements)
+        self.assertIn("repair every validation error before closing", final_requirements)
 
         brainstorm_design = (
             pack_root

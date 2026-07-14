@@ -38,6 +38,53 @@ dependency edges. Close this step only after the decomposition artifact exists,
 the workflow root bead has `gc.input_convoy_id`, and the implementation convoy
 is ready for drain before closing.
 
+The decomposition artifact must be Markdown with YAML front matter, not JSON.
+Use mapping objects for nested front matter.
+The artifact's first line must be `---`; close the front matter with a second line containing exactly `---`
+before the Markdown body. Its top-level YAML shape must be:
+
+- `schema: gc.build.decomposition.v1`
+- `workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}`
+- `methodology: {pack: superpowers, name: superpowers-decomposition}`
+- `producer: {formula: <producer-formula>, stage: decompose, attempt: <positive integer>}`
+- Use `status: approved` before closing, and close only when the decomposition
+  and convoy are ready. Do not invent lifecycle values such as `ready`.
+- `trace: {upstream: [...], coverage: [...]}`
+
+Every `trace.upstream[]` value must be a mapping with a path and a
+scheme-qualified hash such as `bead:<id>`, `git:<revision>`, or
+`sha256:<digest>`; a scalar `gc://` URI is invalid. If an upstream entry names
+IDs, include each ID once in `trace.coverage` and in a Markdown table with
+matching `ID` and `Status` columns. Every non-`covered` coverage entry must have
+a non-empty `rationale`.
+
+Use these required second-level sections in this exact order:
+
+- `## Summary`
+- `## Selected Downstream Formulas`
+- `## Implementation Convoy`
+- `## Work Items`
+
+Additional details such as dependency graphs and skipped lifecycle sections
+must remain inside those sections or follow them without replacing them.
+
+Read and write the exact artifact path from workflow root metadata
+`gc.build.decomposition_path` (fallback `gc.var.decomposition_path`). Do not
+validate or publish a per-attempt `.gc/outputs/decomposition.md` substitute.
+
+Before closing, read the launcher rig root from the workflow root bead's
+`gc.work_dir`. If it names a per-step worktree without the check, walk to the
+nearest ancestor containing `.gc/scripts/checks/build-artifact-valid.sh`. From
+that launcher rig root, run the same canonical check used by the Ralph control:
+
+```bash
+GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-artifact-valid.sh
+```
+
+Repair every validation error in the exact root artifact and rerun the command
+until it passes.
+Do not close based only on the artifact's existence or convoy readiness.
+
 Do not invoke provider-native subagents or upstream plugin runtime commands.
 
 Artifact validation: this stage is gated by `.gc/scripts/checks/build-artifact-valid.sh`, which validates the artifact recorded at `gc.build.decomposition_path` (fallback `gc.var.decomposition_path`) against schema `gc.build.decomposition.v1`. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact in place instead of rewriting it. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.

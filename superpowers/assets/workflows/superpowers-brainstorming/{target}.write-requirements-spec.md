@@ -9,6 +9,40 @@ design into the normalized requirements artifact consumed by build-base. Include
 the requested outcome, constraints, non-goals, accepted design, acceptance
 criteria, testing expectations, risks, and any remaining questions.
 
+The normalized artifact is Markdown with YAML front matter, not a stock
+Superpowers design document and not JSON. Use mapping objects for nested front
+matter. The artifact's first line must be `---`; close the front matter with a
+second line containing exactly `---` before the Markdown body. Its top-level
+YAML shape must be:
+
+- `schema: gc.build.requirements.v1`
+- `workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}`
+- `methodology: {pack: superpowers, name: superpowers-brainstorming}`
+- `producer: {formula: superpowers-brainstorming, stage: requirements, attempt: <positive integer>}`
+- Use `status: draft` before written-spec approval. The approval lane changes
+  it to `status: approved`; do not invent lifecycle values such as `ready`.
+- `trace: {upstream: [...], coverage: [...]}`
+
+Every `trace.upstream[]` mapping must contain a path and a scheme-qualified
+hash such as `bead:<id>`, `git:<revision>`, or `sha256:<digest>`. If an upstream
+entry names IDs, include every ID once in `trace.coverage` and in a Markdown
+table with matching `ID` and `Status` columns. Use coverage statuses such as
+`covered`, `deferred`, or `out_of_scope`; do not use artifact statuses such as
+`approved` as coverage statuses. Every non-`covered` coverage entry must have a
+non-empty `rationale`.
+
+Use these required second-level sections in this exact order:
+
+- `## Problem Statement`
+- `## W6H`
+- `## User Stories`
+- `## Technical Stories`
+- `## Behavior Requirements`
+- `## Example Mapping`
+- `## Acceptance Criteria`
+- `## Out Of Scope`
+- `## Open Questions`
+
 The approved design candidate is the Gas City artifact for the stock design-doc state.
 If the run can safely mirror that document into the target repository, use the
 stock `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` location; otherwise
@@ -28,10 +62,25 @@ Run the stock Spec self-review before closing:
 - Scope check: keep the spec focused enough for one implementation plan.
 - Ambiguity check: make any two-way interpretation explicit.
 
-Write or update the normalized requirements artifact path from workflow root
-metadata. If the target repo can safely mirror a design doc under
+Write or update the exact path from workflow root metadata
+`gc.build.requirements_path` (fallback `gc.var.requirements_path`). Do not
+substitute a per-attempt output path. If the target repo can safely mirror a design doc under
 `docs/superpowers/specs/`, record that mirror path in the artifact, but do not
 commit from this lane unless the routed bead explicitly asks for it.
+
+Before closing, validate the normalized artifact directly. Read the launcher
+rig root from the workflow root bead's `gc.work_dir`. If it names a per-step
+worktree without the validator, walk to the nearest ancestor containing
+`.gc/scripts/validate_build_artifact.py`. Run:
+
+```text
+python3 <launcher-rig>/.gc/scripts/validate_build_artifact.py --schema gc.build.requirements.v1 --path <requirements-artifact-path>
+```
+
+Repair every validation error in that exact root artifact and rerun this
+command until it passes.
+Do not mark the lane passed based only on file existence or written-spec
+approval metadata.
 
 Before closing, update the exact claimed bead id with the lane metadata:
 
