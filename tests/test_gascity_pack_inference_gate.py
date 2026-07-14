@@ -6,11 +6,111 @@ import os
 import re
 import shutil
 import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import gascity_pack_inference_gate
+
+
+SUPPORTED_PACK_NIGHTLY_WORKFLOW = (
+    gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows" / "supported-pack-nightly.yml"
+)
+
+
+def supported_pack_nightly_document() -> dict:
+    document = yaml.safe_load(SUPPORTED_PACK_NIGHTLY_WORKFLOW.read_text(encoding="utf-8"))
+    assert isinstance(document, dict)
+    return document
+
+
+def supported_pack_nightly_step_script(name: str) -> str:
+    for job in supported_pack_nightly_document()["jobs"].values():
+        for step in job.get("steps", []):
+            if step.get("name") == name:
+                script = step.get("run")
+                assert isinstance(script, str), f"workflow step {name!r} does not have a run script"
+                return script
+    raise AssertionError(f"workflow step {name!r} was not found")
+
+
+def run_workflow_script(script: str, tmp_path: Path, **env_overrides: str) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    github_output = tmp_path / "github-output"
+    github_output.unlink(missing_ok=True)
+    env = os.environ.copy()
+    env.update(env_overrides)
+    env["GITHUB_OUTPUT"] = str(github_output)
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", script],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    outputs: dict[str, str] = {}
+    if github_output.is_file():
+        for line in github_output.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            assert separator, f"invalid GITHUB_OUTPUT line: {line!r}"
+            outputs[key] = value
+    return result, outputs
+
+
+def run_git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+
+def create_ref_resolution_remote(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
+    run_git(source, "config", "user.name", "Nightly Test")
+    run_git(source, "config", "user.email", "nightly@example.invalid")
+
+    fixture = source / "fixture.txt"
+    fixture.write_text("one\n", encoding="utf-8")
+    run_git(source, "add", "fixture.txt")
+    run_git(source, "commit", "-q", "-m", "first")
+    first = run_git(source, "rev-parse", "HEAD")
+    run_git(source, "tag", "v1.2.0")
+    run_git(source, "branch", "feature/ref-resolution", first)
+
+    fixture.write_text("two\n", encoding="utf-8")
+    run_git(source, "commit", "-q", "-am", "second")
+    unadvertised = run_git(source, "rev-parse", "HEAD")
+
+    fixture.write_text("three\n", encoding="utf-8")
+    run_git(source, "commit", "-q", "-am", "stable")
+    v2_stable = run_git(source, "rev-parse", "HEAD")
+    run_git(source, "tag", "-a", "v2.0.0", "-m", "stable v2")
+
+    fixture.write_text("four\n", encoding="utf-8")
+    run_git(source, "commit", "-q", "-am", "stable without tag prefix")
+    stable = run_git(source, "rev-parse", "HEAD")
+    run_git(source, "tag", "2.1.0")
+
+    fixture.write_text("release candidate\n", encoding="utf-8")
+    run_git(source, "commit", "-q", "-am", "release candidate")
+    main = run_git(source, "rev-parse", "HEAD")
+    run_git(source, "tag", "v3.0.0-rc.1")
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(source), str(remote)], check=True)
+    return remote, {
+        "first": first,
+        "unadvertised": unadvertised,
+        "v2_stable": v2_stable,
+        "stable": stable,
+        "main": main,
+    }
 
 
 def gate_workspace(root: Path) -> gascity_pack_inference_gate.GateWorkspace:
@@ -229,9 +329,7 @@ def test_build_gate_env_uses_nightly_ollama_auth_shape(tmp_path) -> None:
 
 
 def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matrix() -> None:
-    workflow = (gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows" / "supported-pack-nightly.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = SUPPORTED_PACK_NIGHTLY_WORKFLOW.read_text(encoding="utf-8")
 
     assert "name: Supported Pack Nightly" in workflow
     assert "\n  schedule:" in workflow
@@ -240,10 +338,9 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert 'default: main' in workflow
     assert "description: \"Supported pack or group to exercise for manual subset checks.\"" in workflow
     assert "description: \"Inference gate to run for manual subset checks.\"" in workflow
-    assert '[ "$EVENT_NAME" != "workflow_dispatch" ]' in workflow
+    assert "name: Select gates and validate timeout" in workflow
     assert "id: subset" in workflow
-    assert "INPUT_PACK: ${{ github.event.inputs.pack }}" in workflow
-    assert "INPUT_GATE: ${{ github.event.inputs.gate }}" in workflow
+    assert "SELECTED_GATES: ${{ needs.resolve-nightly-inputs.outputs.selected_gates }}" in workflow
     assert "MATRIX_PACK: ${{ matrix.pack }}" in workflow
     assert "MATRIX_GATE: ${{ matrix.gate }}" in workflow
     assert "github.event.inputs.pack == matrix.pack" not in workflow
@@ -253,18 +350,18 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert "if: always() && steps.subset.outputs.run_gate == 'true'" in workflow
     assert "max-parallel: 1" in workflow
     assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
-    assert "GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}" in workflow
+    assert "GATE_TIMEOUT: ${{ needs.resolve-nightly-inputs.outputs.gate_timeout || matrix.gate_timeout }}" in workflow
     assert '--timeout "$GATE_TIMEOUT"' in workflow
     assert 'DOLT_VERSION: "2.1.7"' in workflow
     assert 'BD_VERSION: "v1.1.0"' in workflow
     assert 'go-version: "1.26.5"' in workflow
     assert "name: Verify Beads compatibility" in workflow
     assert "github.com/steveyegge/beads" in workflow
-    assert "resolve-gascity-refs:" in workflow
-    assert "needs: [static-contracts, resolve-gascity-refs]" in workflow
-    assert "needs.resolve-gascity-refs.outputs.runtime_ref" in workflow
-    assert "needs.resolve-gascity-refs.outputs.setup_ref" in workflow
-    assert "git ls-remote https://github.com/gastownhall/gascity.git refs/heads/main" in workflow
+    assert "resolve-nightly-inputs:" in workflow
+    assert "needs: [resolve-nightly-inputs, static-contracts]" in workflow
+    assert "needs.resolve-nightly-inputs.outputs.runtime_ref" in workflow
+    assert "needs.resolve-nightly-inputs.outputs.setup_ref" in workflow
+    assert 'GASCITY_REMOTE: https://github.com/gastownhall/gascity.git' in workflow
     assert "ANTHROPIC_BASE_URL: https://ollama.com" in workflow
     assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
     assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}" in workflow
@@ -290,6 +387,269 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert '--gate "${{ matrix.gate }}"' in workflow
     assert "name: supported-pack-nightly-${{ matrix.pack }}-${{ matrix.gate }}" in workflow
     assert "include-hidden-files: true" in workflow
+
+
+@pytest.mark.parametrize(
+    ("selected_pack", "selected_gate", "expected"),
+    (
+        ("gascity", "build", {"gascity:build-basic"}),
+        (
+            "all-supported",
+            "build",
+            {
+                "gascity:build-basic",
+                "superpowers:build",
+                "compound-engineering:build",
+                "gstack:build",
+                "bmad:build",
+            },
+        ),
+        (
+            "methodology",
+            "all",
+            {
+                "superpowers:review",
+                "superpowers:build",
+                "compound-engineering:review",
+                "compound-engineering:build",
+                "gstack:review",
+                "gstack:build",
+                "bmad:review",
+                "bmad:build",
+            },
+        ),
+        (
+            "",
+            "",
+            {
+                "gascity:review",
+                "gascity:build-basic",
+                "superpowers:review",
+                "superpowers:build",
+                "compound-engineering:review",
+                "compound-engineering:build",
+                "gstack:review",
+                "gstack:build",
+                "bmad:review",
+                "bmad:build",
+                "gastown:gastown-orchestration",
+            },
+        ),
+    ),
+)
+def test_supported_pack_nightly_selects_manual_matrix_rows(
+    tmp_path, selected_pack: str, selected_gate: str, expected: set[str]
+) -> None:
+    document = supported_pack_nightly_document()
+    result, outputs = run_workflow_script(
+        supported_pack_nightly_step_script("Select gates and validate timeout"),
+        tmp_path,
+        INPUT_PACK=selected_pack,
+        INPUT_GATE=selected_gate,
+        INPUT_TIMEOUT="",
+        SUPPORTED_PACK_GATES=document["env"]["SUPPORTED_PACK_GATES"],
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert set(outputs["selected_gates"].split(",")) == expected
+    assert outputs["gate_timeout"] == ""
+    assert outputs["job_timeout_minutes"] == ""
+
+    selected_rows: set[str] = set()
+    subset_script = supported_pack_nightly_step_script("Decide manual subset")
+    for entry in document["jobs"]["inference"]["strategy"]["matrix"]["include"]:
+        result, subset_outputs = run_workflow_script(
+            subset_script,
+            tmp_path,
+            SELECTED_GATES=outputs["selected_gates"],
+            MATRIX_PACK=entry["pack"],
+            MATRIX_GATE=entry["gate"],
+        )
+        assert result.returncode == 0, result.stderr
+        if subset_outputs["run_gate"] == "true":
+            selected_rows.add(f"{entry['pack']}:{entry['gate']}")
+    assert selected_rows == expected
+
+
+@pytest.mark.parametrize(
+    ("selected_pack", "selected_gate"),
+    (
+        ("gascity", "gastown-orchestration"),
+        ("methodology", "build-basic"),
+        ("superpowers", "build-basic"),
+        ("gastown", "review"),
+    ),
+)
+def test_supported_pack_nightly_rejects_empty_manual_selections(
+    tmp_path, selected_pack: str, selected_gate: str
+) -> None:
+    document = supported_pack_nightly_document()
+    result, _ = run_workflow_script(
+        supported_pack_nightly_step_script("Select gates and validate timeout"),
+        tmp_path,
+        INPUT_PACK=selected_pack,
+        INPUT_GATE=selected_gate,
+        INPUT_TIMEOUT="",
+        SUPPORTED_PACK_GATES=document["env"]["SUPPORTED_PACK_GATES"],
+    )
+
+    assert result.returncode != 0
+    assert "selects no supported pack gates" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("timeout_override", "expected_outer_minutes"),
+    (
+        ("90m", "120"),
+        ("1.5h", "120"),
+        ("30", "31"),
+        ("330m", "360"),
+    ),
+)
+def test_supported_pack_nightly_bounds_manual_timeout(
+    tmp_path, timeout_override: str, expected_outer_minutes: str
+) -> None:
+    document = supported_pack_nightly_document()
+    result, outputs = run_workflow_script(
+        supported_pack_nightly_step_script("Select gates and validate timeout"),
+        tmp_path,
+        INPUT_PACK="gascity",
+        INPUT_GATE="review",
+        INPUT_TIMEOUT=timeout_override,
+        SUPPORTED_PACK_GATES=document["env"]["SUPPORTED_PACK_GATES"],
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert outputs["gate_timeout"] == timeout_override
+    assert outputs["job_timeout_minutes"] == expected_outer_minutes
+
+
+@pytest.mark.parametrize("timeout_override", ("-1m", "0s", "331m", "5.6h", "soon"))
+def test_supported_pack_nightly_rejects_invalid_manual_timeout(tmp_path, timeout_override: str) -> None:
+    document = supported_pack_nightly_document()
+    result, _ = run_workflow_script(
+        supported_pack_nightly_step_script("Select gates and validate timeout"),
+        tmp_path,
+        INPUT_PACK="gascity",
+        INPUT_GATE="review",
+        INPUT_TIMEOUT=timeout_override,
+        SUPPORTED_PACK_GATES=document["env"]["SUPPORTED_PACK_GATES"],
+    )
+
+    assert result.returncode != 0
+    assert "Invalid timeout override" in result.stderr
+
+
+def test_supported_pack_nightly_resolves_remote_refs_to_commit_shas(tmp_path) -> None:
+    resolver = supported_pack_nightly_step_script("Resolve immutable refs")
+    remote, refs = create_ref_resolution_remote(tmp_path)
+    common_env = {
+        "GASCITY_REMOTE": str(remote),
+        "PACK_REMOTE": str(remote),
+        "DEFAULT_PACK_SHA": refs["main"],
+    }
+
+    result, outputs = run_workflow_script(
+        resolver,
+        tmp_path,
+        REQUESTED_RUNTIME_REF="latest",
+        REQUESTED_SETUP_REF="feature/ref-resolution",
+        REQUESTED_PACK_REF="v1.2.0",
+        **common_env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs["runtime_ref"] == refs["stable"]
+    assert outputs["setup_ref"] == refs["first"]
+    assert outputs["pack_ref"] == refs["first"]
+
+    result, outputs = run_workflow_script(
+        resolver,
+        tmp_path,
+        REQUESTED_RUNTIME_REF=refs["unadvertised"],
+        REQUESTED_SETUP_REF="v2.0.0",
+        REQUESTED_PACK_REF="",
+        **common_env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs["runtime_ref"] == refs["unadvertised"]
+    assert outputs["setup_ref"] == refs["v2_stable"]
+    assert outputs["pack_ref"] == refs["main"]
+
+    result, outputs = run_workflow_script(
+        resolver,
+        tmp_path,
+        REQUESTED_RUNTIME_REF="main",
+        REQUESTED_SETUP_REF="main",
+        REQUESTED_PACK_REF="main",
+        **common_env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs == {
+        "runtime_ref": refs["main"],
+        "setup_ref": refs["main"],
+        "pack_ref": refs["main"],
+    }
+
+    result, outputs = run_workflow_script(
+        resolver,
+        tmp_path,
+        REQUESTED_RUNTIME_REF="main",
+        REQUESTED_SETUP_REF="missing/ref",
+        REQUESTED_PACK_REF="main",
+        **common_env,
+    )
+    assert result.returncode != 0
+    assert outputs == {}
+    assert "Could not resolve Gas City setup ref" in result.stderr
+
+    result, outputs = run_workflow_script(
+        resolver,
+        tmp_path,
+        REQUESTED_RUNTIME_REF="f" * 40,
+        REQUESTED_SETUP_REF="main",
+        REQUESTED_PACK_REF="main",
+        **common_env,
+    )
+    assert result.returncode != 0
+    assert outputs == {}
+    assert "Could not resolve Gas City runtime ref" in result.stderr
+
+    result, outputs = run_workflow_script(
+        resolver,
+        tmp_path,
+        REQUESTED_RUNTIME_REF="main",
+        REQUESTED_SETUP_REF="latest",
+        REQUESTED_PACK_REF="v9.9.9",
+        **common_env,
+    )
+    assert result.returncode != 0
+    assert outputs == {}
+    assert "Could not resolve Gas City setup ref" in result.stderr
+
+
+def test_supported_pack_nightly_consumes_only_resolved_refs_and_timeout() -> None:
+    document = supported_pack_nightly_document()
+    workflow = SUPPORTED_PACK_NIGHTLY_WORKFLOW.read_text(encoding="utf-8")
+    jobs = document["jobs"]
+    resolver = jobs["resolve-nightly-inputs"]
+    matrix_entries = jobs["inference"]["strategy"]["matrix"]["include"]
+    expected_matrix = {f"{entry['pack']}:{entry['gate']}" for entry in matrix_entries}
+
+    assert set(document["env"]["SUPPORTED_PACK_GATES"].split()) == expected_matrix
+    assert jobs["static-contracts"]["needs"] == "resolve-nightly-inputs"
+    assert jobs["inference"]["needs"] == ["resolve-nightly-inputs", "static-contracts"]
+    assert resolver["outputs"]["pack_ref"] == "${{ steps.refs.outputs.pack_ref }}"
+    assert resolver["outputs"]["runtime_ref"] == "${{ steps.refs.outputs.runtime_ref }}"
+    assert resolver["outputs"]["setup_ref"] == "${{ steps.refs.outputs.setup_ref }}"
+    assert jobs["inference"]["timeout-minutes"] == (
+        "${{ fromJSON(needs.resolve-nightly-inputs.outputs.job_timeout_minutes || '0') || matrix.timeout_minutes }}"
+    )
+    assert workflow.count("ref: ${{ needs.resolve-nightly-inputs.outputs.pack_ref }}") == 2
+    assert "ref: ${{ needs.resolve-nightly-inputs.outputs.setup_ref }}" in workflow
+    assert "GASCITY_REF: ${{ needs.resolve-nightly-inputs.outputs.runtime_ref }}" in workflow
+    assert "GATE_TIMEOUT: ${{ needs.resolve-nightly-inputs.outputs.gate_timeout || matrix.gate_timeout }}" in workflow
+    assert "ref: ${{ github.event.inputs.pack_ref || github.ref }}" not in workflow
+    assert "printf '%s\\n' \"$requested\"" not in supported_pack_nightly_step_script("Resolve immutable refs")
 
 
 def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
