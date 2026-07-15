@@ -2569,6 +2569,30 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(pack=pack_name, check=step_id):
                 self.assertEqual(step["check"]["check"]["path"], expected_path)
 
+    def test_supported_build_decomposition_uses_independent_vertical_slices(self) -> None:
+        gascity_root = pathlib.Path(__file__).resolve().parents[1]
+        packs_root = gascity_root.parent
+        prompts = {
+            "gascity": gascity_root / "assets/workflows/build-basic/decompose.md",
+            "compound-engineering": packs_root
+            / "compound-engineering/assets/workflows/compound-decomposition/decompose.md",
+            "bmad": packs_root / "bmad/assets/workflows/bmad-build/decompose.md",
+            "gstack": packs_root / "gstack/assets/workflows/gstack-build/decompose.md",
+            "superpowers": packs_root
+            / "superpowers/assets/workflows/superpowers-build/decompose.md",
+        }
+        for pack_name, prompt in prompts.items():
+            normalized = " ".join(prompt.read_text(encoding="utf-8").lower().split())
+            for fragment in (
+                "complete, independently verifiable vertical product slice",
+                "isolated, non-integrated source-anchor worktree",
+                "test-only",
+                "cleanup-only",
+                "create one work item",
+            ):
+                with self.subTest(pack=pack_name, fragment=fragment):
+                    self.assertIn(fragment, normalized)
+
     def test_third_party_methodology_contract_wrappers_are_adapter_selectable(self) -> None:
         gascity_root = pathlib.Path(__file__).resolve().parents[1]
         packs_root = gascity_root.parent

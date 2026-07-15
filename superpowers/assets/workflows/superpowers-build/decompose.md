@@ -6,6 +6,14 @@ Superpowers task structure with checkbox steps for test writing, verification,
 implementation, and commit. Treat those checkbox steps as execution procedure,
 not as task-bead content.
 
+Drain topology constraint: every work item runs in its own isolated,
+non-integrated source-anchor worktree. Therefore each work item must be a
+complete, independently verifiable vertical product slice. Do not create
+package-only, implementation-only, test-only, or cleanup-only members whose
+correctness depends on another member's unmerged commit. If the requested
+change is one smallest coherent behavior, create one work item instead of an
+artificial horizontal split.
+
 For each `### Task N` section, create one implementation bead containing only
 the work unit scope:
 

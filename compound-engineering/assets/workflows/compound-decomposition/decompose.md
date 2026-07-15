@@ -3,6 +3,14 @@ Translate the approved plan at `{{plan_path}}` and optional context
 canonical plan from workflow root metadata `gc.build.plan_path` (fallback
 `gc.var.plan_path`) when the rendered plan path is blank.
 
+Drain topology constraint: every work item runs in its own isolated,
+non-integrated source-anchor worktree. Therefore each work item must be a
+complete, independently verifiable vertical product slice. Do not create
+package-only, implementation-only, test-only, or cleanup-only members whose
+correctness depends on another member's unmerged commit. If the requested
+change is one smallest coherent behavior, create one work item instead of an
+artificial horizontal split.
+
 Create the implementation work-item beads first. Each item must define one
 complete, independently verifiable product slice and preserve the actual
 requirement and plan identifiers it covers. Then create one new non-empty

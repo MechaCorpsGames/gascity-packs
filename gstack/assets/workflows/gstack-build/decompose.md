@@ -5,6 +5,14 @@ workflow root bead. Each bead must map to one vertical slice and include
 acceptance criteria, files or modules likely affected, first verification
 command, and expected proof command.
 
+Drain topology constraint: every work item runs in its own isolated,
+non-integrated source-anchor worktree. Therefore each work item must be a
+complete, independently verifiable vertical product slice. Do not create
+package-only, implementation-only, test-only, or cleanup-only members whose
+correctness depends on another member's unmerged commit. If the requested
+change is one smallest coherent behavior, create one work item instead of an
+artificial horizontal split.
+
 Create the implementation work-item beads first and capture every returned ID.
 These beads are inputs to the implementation drain, not directly routed work.
 Create each one open, unassigned, and unrouted, with metadata

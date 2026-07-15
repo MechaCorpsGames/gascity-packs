@@ -6,6 +6,14 @@ wait for user input in headless mode. Never wait for an interactive selection;
 use the approved requirements and architecture as authoritative inputs and record
 ambiguity in the artifact.
 
+Drain topology constraint: every work item runs in its own isolated,
+non-integrated source-anchor worktree. Therefore each work item must be a
+complete, independently verifiable vertical product slice. Do not create
+package-only, implementation-only, test-only, or cleanup-only members whose
+correctness depends on another member's unmerged commit. If the requested
+change is one smallest coherent behavior, create one work item instead of an
+artificial horizontal split.
+
 Create the implementation story beads first, then create one new non-empty
 implementation convoy from those actual bead IDs. Do not reuse the workflow's
 launch or source convoy. Record the new convoy ID on the workflow root bead as
