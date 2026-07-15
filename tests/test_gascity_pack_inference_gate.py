@@ -1979,6 +1979,81 @@ def test_build_basic_work_item_targets_code_and_pytest() -> None:
     assert "Do not change tests" in text
 
 
+def test_build_basic_source_id_requires_one_exact_launcher_source() -> None:
+    source = {"id": "fi-source", "title": gascity_pack_inference_gate.BUILD_SOURCE_TITLE}
+
+    assert gascity_pack_inference_gate.build_basic_source_id([source]) == "fi-source"
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="exactly one.*source"):
+        gascity_pack_inference_gate.build_basic_source_id([])
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="exactly one.*source"):
+        gascity_pack_inference_gate.build_basic_source_id(
+            [source, {"id": "fi-other", "title": gascity_pack_inference_gate.BUILD_SOURCE_TITLE}]
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_entries", "expected"),
+    (
+        ([], r"fi-source.*exactly one identity"),
+        (
+            [
+                {"path": "beads/fi-source", "hash": "bead:fi-source"},
+                {"path": "beads/fi-source", "hash": "bead:fi-source"},
+            ],
+            r"fi-source.*exactly one identity",
+        ),
+        (
+            [{"path": "beads/fi-source", "hash": "bead:fi-other"}],
+            r"fi-source.*exactly one identity",
+        ),
+    ),
+)
+def test_validate_build_basic_source_provenance_rejects_unbound_requirements(
+    tmp_path, source_entries, expected
+) -> None:
+    requirements_path = tmp_path / "requirements.md"
+    artifact = valid_build_artifact("gc.build.requirements.v1")
+    rendered_entries = "".join(
+        f"    - path: {entry['path']}\n      hash: {entry['hash']}\n"
+        for entry in source_entries
+    )
+    requirements_path.write_text(
+        artifact.replace("  upstream:\n", "  upstream:\n" + rendered_entries, 1),
+        encoding="utf-8",
+    )
+    root = {"metadata": {"gc.build.requirements_path": str(requirements_path)}}
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=expected):
+        gascity_pack_inference_gate.validate_build_basic_source_provenance(
+            root,
+            source_id="fi-source",
+            rig_dir=tmp_path,
+        )
+
+
+def test_validate_build_basic_source_provenance_accepts_exact_source_trace(tmp_path) -> None:
+    requirements_path = tmp_path / "requirements.md"
+    artifact = valid_build_artifact("gc.build.requirements.v1")
+    requirements_path.write_text(
+        artifact.replace(
+            "  upstream:\n",
+            "  upstream:\n"
+            "    - path: beads/fi-source\n"
+            "      hash: bead:fi-source\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    root = {"metadata": {"gc.build.requirements_path": str(requirements_path)}}
+
+    gascity_pack_inference_gate.validate_build_basic_source_provenance(
+        root,
+        source_id="fi-source",
+        rig_dir=tmp_path,
+    )
+
+
 def valid_convoy_status_payload() -> dict:
     return {
         "schema_version": "1",

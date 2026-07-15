@@ -1537,6 +1537,17 @@ def find_unique_bead_by_title(beads: Sequence[Mapping[str, Any]], title: str) ->
     return None
 
 
+def build_basic_source_id(beads: Sequence[Mapping[str, Any]]) -> str:
+    matches = [bead for bead in beads if bead.get("title") == BUILD_SOURCE_TITLE]
+    source_ids = [str(bead.get("id") or "").strip() for bead in matches]
+    if len(source_ids) != 1 or not source_ids[0]:
+        raise GateError(
+            "build-basic gate requires exactly one launcher source bead titled "
+            f"{BUILD_SOURCE_TITLE!r}; observed={source_ids}"
+        )
+    return source_ids[0]
+
+
 def find_bead_by_id(beads: Sequence[Mapping[str, Any]], bead_id: str) -> Mapping[str, Any] | None:
     for bead in beads:
         if bead.get("id") == bead_id:
@@ -2710,6 +2721,47 @@ def artifact_upstream(
     return [entry for entry in upstream if isinstance(entry, Mapping)]
 
 
+def validate_build_basic_source_provenance(
+    root_bead: Mapping[str, Any],
+    *,
+    source_id: str,
+    rig_dir: Path,
+) -> None:
+    root_id = str(root_bead.get("id") or "<unknown>")
+    raw_path = metadata_value(root_bead, "gc.build.requirements_path").strip()
+    if not raw_path:
+        raw_path = metadata_value(root_bead, "gc.var.requirements_path").strip()
+    if not raw_path:
+        raise GateError(f"build-basic root {root_id} is missing gc.build.requirements_path")
+    requirements_path = resolve_artifact_path(raw_path, base=rig_dir).resolve()
+    if not requirements_path.is_file():
+        raise GateError(f"build-basic requirements artifact is missing: {requirements_path}")
+
+    upstream = build_artifact_upstream(requirements_path)
+    expected_path = f"beads/{source_id}"
+    expected_hash = f"bead:{source_id}"
+    identity_entries = [
+        entry
+        for entry in upstream
+        if entry.get("path") == expected_path or entry.get("hash") == expected_hash
+    ]
+    identity = identity_entries[0] if len(identity_entries) == 1 else None
+    if identity is None or (identity.get("path"), identity.get("hash")) != (
+        expected_path,
+        expected_hash,
+    ):
+        observed = [(entry.get("path"), entry.get("hash")) for entry in upstream]
+        raise GateError(
+            f"build-basic source {source_id} requirements must trace exactly one identity entry with "
+            f"path {expected_path} and hash {expected_hash}; observed={observed}"
+        )
+
+    print(
+        f"validated build-basic launcher source provenance: source={source_id} path={requirements_path}",
+        flush=True,
+    )
+
+
 def validate_build_basic_artifacts(
     root_bead: Mapping[str, Any],
     *,
@@ -3436,11 +3488,18 @@ def run_build_gate(
         timeout=timeout,
         poll_interval=poll_interval,
     )
+    beads = list_beads(gc_bin, workspace, env=env)
+    source_id = build_basic_source_id(beads)
     expected_member_ids = implementation_convoy_member_ids(gc_bin, workspace, root_bead, env=env)
     validate_build_basic_artifacts(root_bead, rig_dir=workspace.rig_dir, env=env, validator_source=pack_spec.validator_source)
+    validate_build_basic_source_provenance(
+        root_bead,
+        source_id=source_id,
+        rig_dir=workspace.rig_dir,
+    )
     validate_build_basic_result(
         workspace.rig_dir,
-        list_beads(gc_bin, workspace, env=env),
+        beads,
         root_bead=root_bead,
         expected_member_ids=expected_member_ids,
         launcher_commit=launcher_commit,
@@ -3449,7 +3508,7 @@ def run_build_gate(
         validator_source=pack_spec.validator_source,
     )
     validate_required_routes(
-        list_beads(gc_bin, workspace, env=env),
+        beads,
         pack_spec.required_build_routes,
         context=f"{pack_spec.name} build gate",
     )

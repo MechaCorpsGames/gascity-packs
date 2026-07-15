@@ -222,6 +222,9 @@ MODE_VAR_DEFAULTS = {
 }
 
 BUILD_ARTIFACT_CHECK_SCRIPT = ".gc/scripts/checks/build-artifact-valid.sh"
+BUILD_REQUIREMENTS_SOURCE_CHECK_SCRIPT = (
+    ".gc/scripts/checks/build-requirements-source-valid.sh"
+)
 
 # One produce attempt plus two bounded schema-repair attempts per artifact stage.
 BUILD_ARTIFACT_GATE_MAX_ATTEMPTS = 3
@@ -278,7 +281,10 @@ BUILD_ARTIFACT_VALIDATION_GATES = {
     # Concrete and continuation overrides replace base steps wholesale
     # (mergeSteps replaces by ID), so every producer override must
     # re-declare its gate instead of assuming inheritance.
-    ("build-basic", "requirements"): REQUIREMENTS_GATE,
+    ("build-basic", "requirements"): (
+        *REQUIREMENTS_GATE,
+        BUILD_REQUIREMENTS_SOURCE_CHECK_SCRIPT,
+    ),
     ("build-basic", "plan"): PLAN_GATE,
     ("build-basic", "decompose"): DECOMPOSITION_GATE,
     ("build-basic-review", "{target}"): BUILD_REVIEW_GATE,
@@ -1931,6 +1937,16 @@ class FormulaAssetTests(unittest.TestCase):
         )
         for fragment in ("goal", "constraints", "acceptance criteria", "non-goals", "open questions"):
             with self.subTest(asset="requirements", fragment=fragment):
+                self.assertIn(fragment, requirements_text)
+        for fragment in (
+            "gc.var.convoy_id",
+            "gc convoy status <launch-convoy-id> --json",
+            "gc bd show <source-target-id> --json",
+            "every direct launch-convoy member",
+            "path: beads/<source-target-id>",
+            "fail closed",
+        ):
+            with self.subTest(asset="requirements-source", fragment=fragment):
                 self.assertIn(fragment, requirements_text)
 
         plan_review_text = (root / "assets/workflows/build-basic/plan-review.md").read_text(
@@ -6299,6 +6315,7 @@ description = "Override sink that writes the base triage report contract."
             [script.name for script in scripts],
             [
                 "build-artifact-valid.sh",
+                "build-requirements-source-valid.sh",
                 "design-review-approved.sh",
                 "gap-analysis-approved.sh",
                 "implementation-review-approved.sh",
@@ -6313,8 +6330,10 @@ description = "Override sink that writes the base triage report contract."
     def test_producer_stages_gate_artifacts_with_bounded_repair(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
 
-        for (formula_name, step_id), (schema, path_keys) in BUILD_ARTIFACT_VALIDATION_GATES.items():
+        for (formula_name, step_id), gate in BUILD_ARTIFACT_VALIDATION_GATES.items():
             with self.subTest(formula=formula_name, step=step_id):
+                schema, path_keys, *check_paths = gate
+                check_path = check_paths[0] if check_paths else BUILD_ARTIFACT_CHECK_SCRIPT
                 formula = load_formula(root, formula_name)
                 nodes = formula.get("steps") or formula.get("template") or []
                 nodes_by_id = {node["id"]: node for node in nodes}
@@ -6335,12 +6354,155 @@ description = "Override sink that writes the base triage report contract."
                     step["check"]["check"],
                     {
                         "mode": "exec",
-                        "path": BUILD_ARTIFACT_CHECK_SCRIPT,
+                        "path": check_path,
                         "timeout": "5m",
                     },
                 )
                 self.assertEqual(step["metadata"]["gc.build.artifact_schema"], schema)
                 self.assertEqual(step["metadata"]["gc.build.artifact_path_keys"], path_keys)
+
+    def _run_build_requirements_source_check(
+        self,
+        *,
+        beads_by_id: dict[str, object],
+        convoys_by_id: dict[str, object],
+        bead_id: str,
+    ) -> subprocess.CompletedProcess:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        source_script = (
+            root
+            / "assets"
+            / "scripts"
+            / "checks"
+            / "build-requirements-source-valid.sh"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            launcher = tmp / "launcher"
+            checks_dir = launcher / ".gc" / "scripts" / "checks"
+            checks_dir.mkdir(parents=True)
+            staged_script = checks_dir / source_script.name
+            shutil.copy2(source_script, staged_script)
+            staged_script.chmod(0o755)
+            base_check = checks_dir / "build-artifact-valid.sh"
+            base_check.write_text(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho 'base artifact valid'\n",
+                encoding="utf-8",
+            )
+            base_check.chmod(0o755)
+
+            show_dir = tmp / "show"
+            convoy_dir = tmp / "convoys"
+            bin_dir = tmp / "bin"
+            show_dir.mkdir()
+            convoy_dir.mkdir()
+            bin_dir.mkdir()
+            for current_id, payload in beads_by_id.items():
+                (show_dir / f"{current_id}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+            for current_id, payload in convoys_by_id.items():
+                (convoy_dir / f"{current_id}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "case \"${1:-}:${2:-}\" in\n"
+                "  bd:show) cat \"$BD_SHOW_DIR/$3.json\" ;;\n"
+                "  convoy:status) cat \"$CONVOY_STATUS_DIR/$3.json\" ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+
+            env = {
+                **os.environ,
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                "BD_SHOW_DIR": str(show_dir),
+                "CONVOY_STATUS_DIR": str(convoy_dir),
+                "GC_BEAD_ID": bead_id,
+                "GC_WORK_DIR": str(launcher),
+            }
+            return subprocess.run(
+                [str(staged_script)],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+    def test_build_requirements_source_check_requires_each_launch_source_once(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            requirements = pathlib.Path(td) / "requirements.md"
+            control = {
+                "id": "requirements-step",
+                "metadata": {"gc.root_bead_id": "root"},
+            }
+            root = {
+                "id": "root",
+                "metadata": {
+                    "gc.var.convoy_id": "launch",
+                    "gc.build.requirements_path": str(requirements),
+                },
+            }
+            source_beads = {
+                "source-1": {"id": "source-1", "title": "First source"},
+                "source-2": {"id": "source-2", "title": "Second source"},
+            }
+            launch = self._gstack_convoy_status(
+                "launch",
+                "input convoy",
+                "open",
+                [("source-1", "open"), ("source-2", "open")],
+            )
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n---\n",
+                encoding="utf-8",
+            )
+            missing = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root, **source_beads},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+            self.assertIn("missing launch source trace", missing.stderr)
+            self.assertIn("source-1", missing.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n---\n",
+                encoding="utf-8",
+            )
+            duplicate = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root, **source_beads},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(duplicate.returncode, 0, duplicate.stdout + duplicate.stderr)
+            self.assertIn("duplicate launch source trace", duplicate.stderr)
+            self.assertIn("source-1", duplicate.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n---\n",
+                encoding="utf-8",
+            )
+            complete = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root, **source_beads},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertEqual(complete.returncode, 0, complete.stdout + complete.stderr)
 
     def _run_build_artifact_check(
         self,
