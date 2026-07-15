@@ -40,6 +40,15 @@ jobs:
       - name: Run Python pack tests
         run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests slack-full/tests slack-channel/tests pr-pipeline/tests -q
 
+      - name: Lint and exercise shared role prompt composition
+        run: |
+          go install github.com/gastownhall/gascity/cmd/gc@latest
+          GC_BIN="$(go env GOPATH)/bin/gc"
+          for pack in gascity gascity/roles bmad compound-engineering gstack superpowers; do
+            "$GC_BIN" lint "$pack"
+          done
+          GC_TEST_BIN="$GC_BIN" python3 -m pytest tests/test_gc_role_prompt_integration.py -q
+
       - name: Run Gastown shell tests
         run: |
           for test_script in gastown/tests/test_*.sh; do
