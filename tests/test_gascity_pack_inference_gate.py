@@ -8,6 +8,7 @@ import re
 import shutil
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -190,6 +191,7 @@ def test_write_gate_workspace_uses_city_and_rig_scope_imports(tmp_path) -> None:
     assert "includes =" not in city_toml
     assert "[workspace.env]" in city_toml
     assert f"HOME = \"{workspace.gc_home}\"" in city_toml
+    assert 'PYTHONDONTWRITEBYTECODE = "1"' in city_toml
     assert '[providers.claude]\nbase = "builtin:claude"\n' in city_toml
     assert "args_append" not in city_toml
     assert "accept_startup_dialogs" not in city_toml
@@ -243,6 +245,10 @@ def test_write_gate_workspace_materializes_pack_check_scripts(tmp_path) -> None:
     check_script.chmod(0o755)
     validator = pack_source / "assets" / "scripts" / "validate_build_artifact.py"
     validator.write_text("print('ok')\n", encoding="utf-8")
+    provenance_verifier = (
+        pack_source / "assets" / "scripts" / "verify_implementation_provenance.py"
+    )
+    provenance_verifier.write_text("print('verified')\n", encoding="utf-8")
     schema = schemas_source / "requirements.v1.yaml"
     schema.write_text("schema_id: gc.build.requirements.v1\n", encoding="utf-8")
 
@@ -256,12 +262,37 @@ def test_write_gate_workspace_materializes_pack_check_scripts(tmp_path) -> None:
 
     materialized_check = workspace.rig_dir / ".gc" / "scripts" / "checks" / "build-artifact-valid.sh"
     materialized_validator = workspace.rig_dir / ".gc" / "scripts" / "validate_build_artifact.py"
+    materialized_provenance_verifier = (
+        workspace.rig_dir / ".gc" / "scripts" / "verify_implementation_provenance.py"
+    )
     materialized_schema = workspace.rig_dir / "schemas" / "build" / "requirements.v1.yaml"
 
     assert materialized_check.read_text(encoding="utf-8") == "#!/usr/bin/env bash\nexit 0\n"
     assert os.access(materialized_check, os.X_OK)
     assert materialized_validator.read_text(encoding="utf-8") == "print('ok')\n"
+    assert materialized_provenance_verifier.read_text(encoding="utf-8") == "print('verified')\n"
     assert materialized_schema.read_text(encoding="utf-8") == "schema_id: gc.build.requirements.v1\n"
+
+
+def test_materialize_pack_check_scripts_rejects_missing_runtime_helper(tmp_path) -> None:
+    pack_source = tmp_path / "gascity"
+    checks_source = pack_source / "assets" / "scripts" / "checks"
+    checks_source.mkdir(parents=True)
+    (checks_source / "build-artifact-valid.sh").write_text(
+        "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+    )
+    (pack_source / "assets" / "scripts" / "validate_build_artifact.py").write_text(
+        "print('ok')\n", encoding="utf-8"
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="verify_implementation_provenance.py",
+    ):
+        gascity_pack_inference_gate.materialize_pack_check_scripts(
+            pack_source,
+            tmp_path / "fixture",
+        )
 
 
 def test_write_gate_workspace_imports_selected_pack_and_shared_validator(tmp_path) -> None:
@@ -277,6 +308,10 @@ def test_write_gate_workspace_imports_selected_pack_and_shared_validator(tmp_pat
     check_script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     validator = validator_source / "assets" / "scripts" / "validate_build_artifact.py"
     validator.write_text("print('shared-validator')\n", encoding="utf-8")
+    provenance_verifier = (
+        validator_source / "assets" / "scripts" / "verify_implementation_provenance.py"
+    )
+    provenance_verifier.write_text("print('shared-verifier')\n", encoding="utf-8")
 
     workspace = gascity_pack_inference_gate.write_gate_workspace(
         tmp_path / "gate",
@@ -302,6 +337,9 @@ def test_write_gate_workspace_imports_selected_pack_and_shared_validator(tmp_pat
     assert (
         workspace.rig_dir / ".gc" / "scripts" / "validate_build_artifact.py"
     ).read_text(encoding="utf-8") == "print('shared-validator')\n"
+    assert (
+        workspace.rig_dir / ".gc" / "scripts" / "verify_implementation_provenance.py"
+    ).read_text(encoding="utf-8") == "print('shared-verifier')\n"
 
 
 def test_write_gate_workspace_wires_gastown_city_and_rig_imports(tmp_path) -> None:
@@ -856,6 +894,50 @@ printf '{{"root_bead_id":"fi-root"}}\\n'
     assert f"report_path={gascity_pack_inference_gate.REVIEW_REPORT_PATH}" not in args
 
 
+def test_launch_build_formula_uses_absolute_rig_artifact_root(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "gate with spaces"
+    root.mkdir()
+    workspace = gate_workspace(root)
+    fake_gc = tmp_path / "gc"
+    args_path = tmp_path / "gc-args.txt"
+    fake_gc.write_text(
+        f"""#!/bin/sh
+printf '%s\\n' "$@" > {shlex.quote(str(args_path))}
+printf '{{"root_bead_id":"fi-root"}}\\n'
+""",
+        encoding="utf-8",
+    )
+    fake_gc.chmod(0o755)
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "resolve_workflow_root_id",
+        lambda *args, candidate_id, **kwargs: candidate_id,
+    )
+
+    root_id = gascity_pack_inference_gate.launch_build_formula(
+        str(fake_gc),
+        workspace,
+        env={},
+        pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],
+    )
+
+    assert root_id == "fi-root"
+    args = args_path.read_text(encoding="utf-8").splitlines()
+    artifact_root = (
+        workspace.rig_dir
+        / gascity_pack_inference_gate.build_artifact_root(
+            gascity_pack_inference_gate.PACK_SPECS["gascity"]
+        )
+    ).resolve()
+    assert f"artifact_root={artifact_root}" in args
+    assert (
+        f"artifact_root={gascity_pack_inference_gate.BUILD_ARTIFACT_ROOT}"
+        not in args
+    )
+
+
 def test_list_beads_uses_gc_bd_list_when_file_store_absent(tmp_path) -> None:
     workspace = gascity_pack_inference_gate.GateWorkspace(
         root=tmp_path,
@@ -1103,6 +1185,54 @@ esac
         )
 
 
+@pytest.mark.parametrize("failed_outcome", ["fail", "", "blocked"])
+def test_wait_for_workflow_pass_fails_fast_while_root_is_open(
+    tmp_path, monkeypatch, failed_outcome
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    root = {"id": "fi-root", "status": "in_progress", "metadata": {}}
+    failed_control = {
+        "id": "fi-review",
+        "title": "Review implementation",
+        "status": "closed",
+        "metadata": {
+            "gc.root_bead_id": "fi-root",
+            "gc.kind": "ralph",
+            "gc.step_ref": "build.review",
+        },
+    }
+    if failed_outcome:
+        failed_control["metadata"]["gc.outcome"] = failed_outcome
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "show_bead",
+        lambda *args, **kwargs: root,
+    )
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "list_beads",
+        lambda *args, **kwargs: [failed_control],
+    )
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "collect_diagnostics",
+        lambda *args, **kwargs: "diagnostics",
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="workflow fi-root cannot pass.*fi-review.*build.review",
+    ):
+        gascity_pack_inference_gate.wait_for_workflow_pass(
+            "gc",
+            workspace,
+            "fi-root",
+            env={},
+            timeout=0.05,
+            poll_interval=0.001,
+        )
+
+
 def test_wait_for_workflow_pass_rejects_failed_nested_implementation_control(
     tmp_path, monkeypatch
 ) -> None:
@@ -1285,7 +1415,7 @@ def test_wait_for_workflow_pass_waits_for_non_attempt_finalizer(tmp_path, monkey
                     "gc.root_bead_id": "fi-root",
                     "gc.kind": "workflow-finalize",
                     "gc.attempt": "1",
-                    "gc.outcome": "pass",
+                    "gc.outcome": "fail",
                 },
             }
         ],
@@ -2048,7 +2178,43 @@ def test_build_basic_work_item_targets_code_and_pytest() -> None:
     assert text.splitlines()[0] == gascity_pack_inference_gate.BUILD_SOURCE_TITLE
     assert "slugger.py" in text
     assert "pytest -q" in text
+    assert "PYTHONDONTWRITEBYTECODE=1" in text
+    assert "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" in text
     assert "Do not change tests" in text
+
+
+def test_build_basic_proof_command_leaves_no_python_cache_artifacts(tmp_path) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "slugger.py").write_text(
+        "def slugify(value: str) -> str:\n    return value.lower()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_slugger.py").write_text(
+        "from slugger import slugify\n\n"
+        "def test_slugify():\n"
+        "    assert slugify('HELLO') == 'hello'\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+
+    subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    generated = [
+        path.relative_to(tmp_path).as_posix()
+        for path in tmp_path.rglob("*")
+        if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+    ]
+    assert generated == []
+    assert not (tmp_path / ".pytest_cache").exists()
 
 
 def test_build_basic_source_id_requires_one_exact_launcher_source() -> None:

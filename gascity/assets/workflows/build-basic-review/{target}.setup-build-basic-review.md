@@ -1,10 +1,12 @@
 Prepare the build-basic starter factory review.
 
-Gather the requirements, plan, decomposition, canonical implementation summary,
-task evidence, changed files, and proof commands into one review context file
-under the resolved build artifact root. Record its canonical absolute path as
+Read the canonical absolute artifact root from root metadata
+`gc.build.artifact_root` and require it to be a real directory. Gather the
+requirements, plan, decomposition, canonical implementation summary, task
+evidence, changed files, and proof commands into exactly
+`<artifact-root>/review-context.md`. Record that canonical absolute path as
 `gc.build.code_review_context_path`. The context and canonical summary must be
-distinct regular non-symlink files under that root.
+distinct regular non-symlink files directly under that same root.
 
 The implementation source of truth is the closed source anchor/worktree recorded
 by the implementation summary and task evidence. Include the source anchor id,

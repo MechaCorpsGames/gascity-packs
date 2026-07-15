@@ -4,6 +4,18 @@ Summarize requirements, implementation-plan, design-review, create-beads,
 implementation, and review artifacts. Record the final outcome, artifact paths,
 and remaining follow-up beads on the workflow root bead.
 
+Before reading or writing build artifacts, inspect every direct dependency
+control. Require each dependency control to be closed with `gc.outcome=pass`.
+If any dependency failed or lacks that exact outcome, do not write a final
+report or attempt infrastructure repair. Record `gc.build.status=failed`,
+`gc.failure_class=upstream_validation`, and a concise `gc.blocked_reason` on the
+workflow root; set the claimed step to `gc.outcome=fail`, close it, and stop.
+
+Treat installed validation code as immutable infrastructure. Never create,
+reconstruct, or modify `.gc/scripts`. If an installed validator or helper is
+missing, record `gc.failure_class=validation_infrastructure`, close with
+`gc.outcome=fail`, and stop; never author a substitute validator.
+
 The build-basic implementation result may live in a source anchor/worktree. A
 launcher rig root that still contains the original fixture is not a partial build
 when the canonical implementation summary and review artifact show the source

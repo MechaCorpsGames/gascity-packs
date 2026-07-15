@@ -40,6 +40,11 @@ using the exact `##` headings below in this order:
 The `## Verification` section must include both the first verification command
 and the final proof command, with the observed pass/fail result.
 
+Run Python proof commands with `PYTHONDONTWRITEBYTECODE=1`. Before recording
+success, remove only
+workflow-generated `__pycache__`, `.pyc`, and `.pyo` files; leave no generated
+code/cache artifacts and never delete pre-existing user files to satisfy a gate.
+
 Write the summary as a `gc.build.implementation-summary.v1` artifact and record
 its absolute path on the workflow root bead as `gc.implementation.summary_path`
 before closing. If no path is recorded, use

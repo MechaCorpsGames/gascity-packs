@@ -566,6 +566,12 @@ def verify(
         launcher_top=launcher_top,
         label="workflow root",
     )
+    expected_summary = artifact_root / "implementation-summary.md"
+    if recorded_summary != expected_summary:
+        raise ProvenanceError(
+            "canonical implementation summary must use the workflow artifact root filename: "
+            f"summary={recorded_summary} expected={expected_summary}"
+        )
     for expected_artifact in expected_artifacts:
         resolved_artifact = required_regular_path(
             expected_artifact,
@@ -588,6 +594,12 @@ def verify(
     recorded_context = required_regular_file(
         root, "gc.build.code_review_context_path", label="workflow root"
     )
+    expected_context = artifact_root / "review-context.md"
+    if recorded_context != expected_context:
+        raise ProvenanceError(
+            "canonical review context must use the workflow artifact root filename: "
+            f"context={recorded_context} expected={expected_context}"
+        )
     try:
         recorded_context.relative_to(artifact_root)
     except ValueError as exc:

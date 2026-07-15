@@ -57,10 +57,11 @@ review_evidence_path() {
 }
 
 validate_review_evidence_path() {
-  local path label artifact_root canonical
+  local path label artifact_root expected_name canonical expected
   path="$1"
   label="$2"
   artifact_root="$3"
+  expected_name="$4"
   case "$path" in
     /*) ;;
     *) implementation_provenance_fail "$label must be an absolute path: ${path:-<missing>}" ;;
@@ -70,15 +71,11 @@ validate_review_evidence_path() {
   canonical="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)/$(basename "$path")" || \
     implementation_provenance_fail "$label does not resolve: $path"
   case "$artifact_root" in
-    /) ;;
-    *)
-      case "$canonical" in
-        "$artifact_root"/*) ;;
-        *) implementation_provenance_fail \
-          "$label must be under the workflow artifact root: path=$canonical root=$artifact_root" ;;
-      esac
-      ;;
+    /) expected="/$expected_name" ;;
+    *) expected="$artifact_root/$expected_name" ;;
   esac
+  [ "$canonical" = "$expected" ] || implementation_provenance_fail \
+    "$label must use canonical path: path=$canonical expected=$expected"
 }
 
 ROOT_JSON="$(gc bd show "$ROOT_ID" --json 2>/dev/null || true)"
@@ -590,25 +587,25 @@ if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
 
   validate_review_evidence_path \
     "$(review_evidence_path "$CURRENT_MATCHES" "$ACCEPTANCE_STEP" "code_review.output_path")" \
-    "acceptance review output" "$ARTIFACT_ROOT"
+    "acceptance review output" "$ARTIFACT_ROOT" "acceptance-review-report.md"
   validate_review_evidence_path \
     "$(review_evidence_path "$CURRENT_MATCHES" "$TEST_EVIDENCE_STEP" "code_review.output_path")" \
-    "test evidence review output" "$ARTIFACT_ROOT"
+    "test evidence review output" "$ARTIFACT_ROOT" "test-evidence-review-report.md"
   validate_review_evidence_path \
     "$(review_evidence_path "$CURRENT_MATCHES" "$SIMPLICITY_STEP" "code_review.output_path")" \
-    "simplicity review output" "$ARTIFACT_ROOT"
+    "simplicity review output" "$ARTIFACT_ROOT" "simplicity-review-report.md"
   validate_review_evidence_path \
     "$(review_evidence_path "$CURRENT_MATCHES" "$SYNTHESIS_STEP" "code_review.synthesis_path")" \
-    "review synthesis" "$ARTIFACT_ROOT"
+    "review synthesis" "$ARTIFACT_ROOT" "starter-review-synthesis.md"
   validate_review_evidence_path \
     "$(review_evidence_path "$CURRENT_MATCHES" "$SYNTHESIS_STEP" "code_review.output_path")" \
-    "review synthesis output" "$ARTIFACT_ROOT"
+    "review synthesis output" "$ARTIFACT_ROOT" "starter-review-synthesis.md"
   validate_review_evidence_path \
     "$(review_evidence_path "$CURRENT_MATCHES" "$APPLY_STEP" "code_review.report_path")" \
-    "review apply report" "$ARTIFACT_ROOT"
+    "review apply report" "$ARTIFACT_ROOT" "apply-review-findings-report.md"
   validate_review_evidence_path \
     "$(review_evidence_path "$CURRENT_MATCHES" "$APPLY_STEP" "code_review.output_path")" \
-    "review apply output" "$ARTIFACT_ROOT"
+    "review apply output" "$ARTIFACT_ROOT" "apply-review-findings-report.md"
   approve "Implementation review approved"
 fi
 

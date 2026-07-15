@@ -786,6 +786,7 @@ def write_gate_workspace(
             "",
             "[workspace.env]",
             f"HOME = {toml_string(gc_home)}",
+            'PYTHONDONTWRITEBYTECODE = "1"',
             "",
             "[providers.claude]",
             'base = "builtin:claude"',
@@ -884,9 +885,14 @@ def materialize_pack_check_scripts(pack_source: Path, rig_dir: Path) -> None:
     for script in sorted(checks_source.glob("*.sh")):
         shutil.copy2(script, checks_target / script.name)
 
-    validator_source = scripts_source / "validate_build_artifact.py"
-    if validator_source.is_file():
-        shutil.copy2(validator_source, scripts_target / validator_source.name)
+    for helper_name in (
+        "validate_build_artifact.py",
+        "verify_implementation_provenance.py",
+    ):
+        helper_source = scripts_source / helper_name
+        if not helper_source.is_file():
+            raise GateError(f"pack check runtime helper is missing: {helper_source}")
+        shutil.copy2(helper_source, scripts_target / helper_name)
 
     schemas_source = pack_source / "schemas" / "build"
     if schemas_source.is_dir():
@@ -986,7 +992,8 @@ Expected behavior:
 Constraints:
 - Do not change tests/test_slugger.py.
 - Keep the implementation small and deterministic.
-- Run `python3 -m pytest -q` from the repository root and record that proof.
+- Run `PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q -p no:cacheprovider`
+  from the repository root and record that proof.
 """
 
 
@@ -1337,7 +1344,7 @@ def launch_build_formula(gc_bin: str, workspace: GateWorkspace, *, env: Mapping[
         "--title",
         build_title(pack_spec),
         "--var",
-        f"artifact_root={build_artifact_root(pack_spec)}",
+        f"artifact_root={(workspace.rig_dir / build_artifact_root(pack_spec)).resolve()}",
         "--var",
         "interaction_mode=headless",
         "--var",
@@ -1857,6 +1864,24 @@ def workflow_finalizers(
     )
 
 
+def terminal_nonpassing_workflow_controls(
+    beads: Sequence[Mapping[str, Any]],
+    root_id: str,
+) -> list[Mapping[str, Any]]:
+    return sorted(
+        (
+            bead
+            for bead in beads
+            if metadata_value(bead, "gc.root_bead_id") == root_id
+            and metadata_value(bead, "gc.kind") in LOGICAL_CONTROL_KINDS
+            and not metadata_value(bead, "gc.attempt")
+            and str(bead.get("status") or "") == "closed"
+            and metadata_value(bead, "gc.outcome") != "pass"
+        ),
+        key=lambda bead: str(bead.get("id") or ""),
+    )
+
+
 def wait_for_workflow_pass(
     gc_bin: str,
     workspace: GateWorkspace,
@@ -1873,9 +1898,20 @@ def wait_for_workflow_pass(
         status = str(last_bead.get("status") or "")
         outcome = metadata_value(last_bead, "gc.outcome")
         print(f"workflow {root_id}: status={status or '<unset>'} outcome={outcome or '<unset>'}", flush=True)
+        beads = list_beads(gc_bin, workspace, env=env)
+        failed_controls = terminal_nonpassing_workflow_controls(beads, root_id)
+        if failed_controls:
+            failures = ", ".join(
+                f"{bead.get('id', '<unknown>')} "
+                f"({metadata_value(bead, 'gc.step_ref') or bead.get('title', '<untitled>')})"
+                for bead in failed_controls
+            )
+            raise GateError(
+                f"workflow {root_id} cannot pass: logical workflow control failed: {failures}\n"
+                + collect_diagnostics(gc_bin, workspace, env=env)
+            )
         if status == "closed":
             if outcome == "pass":
-                beads = list_beads(gc_bin, workspace, env=env)
                 finalizers = workflow_finalizers(beads, root_id)
                 if not finalizers:
                     print(f"workflow {root_id}: waiting for workflow-finalize control", flush=True)

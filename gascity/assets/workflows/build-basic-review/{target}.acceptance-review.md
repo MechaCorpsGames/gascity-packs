@@ -23,7 +23,12 @@ summary/context paths, their current raw-byte SHA-256 digests, and that
 implementation snapshot. Require an exact root match and carry it as
 `code_review.review_input_snapshot`; otherwise use `iterate`.
 
-Write findings at a canonical absolute path under the build artifact root.
+Read `<artifact-root>` from root `gc.build.artifact_root`; require it to be
+absolute and equal the parent of `gc.build.code_review_context_path`. Write exactly
+`<artifact-root>/acceptance-review-report.md`; never write review evidence into
+the authoritative implementation worktree.
+Run Python proof with `PYTHONDONTWRITEBYTECODE=1` and leave no `__pycache__` or
+bytecode files.
 Required findings must include the relevant requirement or task reference plus
 the file, command, or artifact that proves the issue.
 

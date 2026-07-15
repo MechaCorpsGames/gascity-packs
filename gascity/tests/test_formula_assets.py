@@ -1531,6 +1531,33 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(asset="build-base/prepare.md", fragment=fragment):
                 self.assertIn(fragment, prepare)
 
+    def test_build_prepare_records_one_canonical_absolute_artifact_root(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        prepare = (root / "assets/workflows/build-base/prepare.md").read_text(
+            encoding="utf-8"
+        )
+        summarize = (
+            root / "assets/workflows/build-base/summarize-implementation.md"
+        ).read_text(encoding="utf-8")
+        prepare = " ".join(prepare.split())
+        summarize = " ".join(summarize.split())
+
+        for fragment in (
+            "canonical absolute artifact root",
+            "gc.build.artifact_root",
+            "Never reinterpret the relative `gc.var.artifact_root`",
+            "later stage's `gc.work_dir`",
+        ):
+            with self.subTest(prompt="prepare", fragment=fragment):
+                self.assertIn(fragment, prepare)
+        for fragment in (
+            "canonical absolute `gc.build.artifact_root`",
+            "Never reinterpret a relative",
+            "later stage's `gc.work_dir`",
+        ):
+            with self.subTest(prompt="summarize", fragment=fragment):
+                self.assertIn(fragment, summarize)
+
     def test_build_base_is_full_lifecycle_virtual_contract(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         data = load_formula(root, "build-base")
@@ -2135,6 +2162,27 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(contract=contract):
                 self.assertRegex(normalized, pattern)
 
+    def test_build_basic_finalize_fails_fast_on_failed_controls_or_missing_validators(self) -> None:
+        prompt = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "assets"
+            / "workflows"
+            / "build-basic"
+            / "finalize.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(prompt.split())
+
+        for fragment in (
+            "Before reading or writing build artifacts",
+            "dependency control",
+            "gc.outcome=pass",
+            "`gc.outcome=fail`",
+            "Never create, reconstruct, or modify `.gc/scripts`",
+            "validator or helper is missing",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, normalized)
+
     def test_build_basic_review_producers_record_absolute_evidence_paths(self) -> None:
         workflow_root = (
             pathlib.Path(__file__).resolve().parents[1]
@@ -2142,20 +2190,69 @@ class FormulaAssetTests(unittest.TestCase):
             / "workflows"
             / "build-basic-review"
         )
-        for filename in (
-            "{target}.acceptance-review.md",
-            "{target}.test-evidence-review.md",
-            "{target}.simplicity-review.md",
-            "{target}.synthesize-review.md",
-            "{target}.apply-review-findings.md",
-        ):
+        expected_outputs = {
+            "{target}.acceptance-review.md": "acceptance-review-report.md",
+            "{target}.test-evidence-review.md": "test-evidence-review-report.md",
+            "{target}.simplicity-review.md": "simplicity-review-report.md",
+            "{target}.synthesize-review.md": "starter-review-synthesis.md",
+            "{target}.apply-review-findings.md": "apply-review-findings-report.md",
+        }
+        for filename, output_name in expected_outputs.items():
             prompt = (workflow_root / filename).read_text(encoding="utf-8")
             normalized = " ".join(prompt.split())
             with self.subTest(prompt=filename):
-                self.assertIn(
-                    "canonical absolute path under the build artifact root",
-                    normalized,
+                self.assertIn("gc.build.artifact_root", normalized)
+                self.assertIn("gc.build.code_review_context_path", normalized)
+                self.assertIn("absolute and equal the parent", normalized)
+                self.assertIn(output_name, normalized)
+                self.assertRegex(
+                    normalized.lower(),
+                    r"never.{0,120}(?:authoritative )?implementation worktree",
                 )
+
+        setup = (workflow_root / "{target}.setup-build-basic-review.md").read_text(
+            encoding="utf-8"
+        )
+        setup = " ".join(setup.split())
+        self.assertIn("gc.build.artifact_root", setup)
+        self.assertIn("<artifact-root>/review-context.md", setup)
+
+        for filename in (
+            "{target}.acceptance-review.md",
+            "{target}.test-evidence-review.md",
+            "{target}.apply-review-findings.md",
+        ):
+            prompt = (workflow_root / filename).read_text(encoding="utf-8")
+            with self.subTest(cache_safe_proof=filename):
+                self.assertIn("PYTHONDONTWRITEBYTECODE=1", prompt)
+
+    def test_implementation_prompts_require_provenance_clean_proof_commands(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        for relative_path in (
+            "assets/workflows/do-work/implement.md",
+            "assets/workflows/do-work-item/implement-item.md",
+        ):
+            prompt = (root / relative_path).read_text(encoding="utf-8")
+            with self.subTest(prompt=relative_path):
+                self.assertIn("PYTHONDONTWRITEBYTECODE=1", prompt)
+                self.assertIn("__pycache__", prompt)
+
+    def test_build_basic_review_finalizer_uses_latest_review_attempt_and_artifact_root(self) -> None:
+        prompt = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "assets"
+            / "workflows"
+            / "build-basic-review"
+            / "{target}.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(prompt.split()).lower()
+
+        self.assertIn("gc.build.artifact_root", normalized)
+        self.assertIn("gc.build.code_review_context_path", normalized)
+        self.assertIn("absolute and equal the parent", normalized)
+        self.assertIn("<artifact-root>/review-report.md", normalized)
+        self.assertIn("highest numeric", normalized)
+        self.assertIn("do not use this finalizer step's own `gc.attempt`", normalized)
 
     def test_build_basic_apply_prompt_has_expansion_headroom(self) -> None:
         prompt = (
@@ -2167,6 +2264,8 @@ class FormulaAssetTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertNotIn("{{implementation_target}}", prompt)
+        self.assertNotIn("<summary>", prompt)
+        self.assertIn("<apply-report>", prompt)
         self.assertLessEqual(len(prompt.encode("utf-8")), 3840)
 
     def test_build_basic_required_review_fixes_reconcile_authoritative_provenance(self) -> None:
@@ -7372,8 +7471,16 @@ description = "Override sink that writes the base triage report contract."
             evidence_root / "review-context.md",
         )
 
+        evidence_filenames = {
+            "acceptance": "acceptance-review-report.md",
+            "test-evidence": "test-evidence-review-report.md",
+            "simplicity": "simplicity-review-report.md",
+            "synthesis": "starter-review-synthesis.md",
+            "apply": "apply-review-findings-report.md",
+        }
+
         def evidence(name: str) -> str:
-            path = evidence_root / f"{name}.md"
+            path = evidence_root / evidence_filenames[name]
             path.write_text(f"# {name}\n", encoding="utf-8")
             return str(path)
 
@@ -7421,6 +7528,7 @@ description = "Override sink that writes the base triage report contract."
                     },
                 }
             )
+        synthesis_path = evidence("synthesis")
         rows.append(
             {
                 "id": "synthesis",
@@ -7428,11 +7536,12 @@ description = "Override sink that writes the base triage report contract."
                 "metadata": {
                     **common,
                     "gc.step_id": "review.synthesize-review",
-                    "code_review.synthesis_path": evidence("synthesis"),
-                    "code_review.output_path": str(evidence_root / "synthesis.md"),
+                    "code_review.synthesis_path": synthesis_path,
+                    "code_review.output_path": synthesis_path,
                 },
             }
         )
+        apply_path = evidence("apply")
         rows.append(
             {
                 "id": "apply",
@@ -7441,8 +7550,8 @@ description = "Override sink that writes the base triage report contract."
                     **common,
                     "gc.step_id": "review.apply-review-findings",
                     "code_review.verdict": apply,
-                    "code_review.report_path": evidence("apply"),
-                    "code_review.output_path": str(evidence_root / "apply.md"),
+                    "code_review.report_path": apply_path,
+                    "code_review.output_path": apply_path,
                 },
             }
         )
@@ -7511,7 +7620,10 @@ description = "Override sink that writes the base triage report contract."
         artifact_root: str | pathlib.Path | None = None,
     ) -> dict[str, str]:
         context = canonical_summary.parent / "review-context.md"
-        return {
+        selected_artifact_root = pathlib.Path(
+            artifact_root or canonical_summary.parent
+        )
+        values = {
             "gc.build.implementation_snapshot": implementation_snapshot,
             "gc.build.implementation_summary_path": str(canonical_summary),
             "gc.build.code_review_context_path": str(context),
@@ -7520,8 +7632,13 @@ description = "Override sink that writes the base triage report contract."
                 canonical_summary,
                 context,
             ),
-            "gc.var.artifact_root": str(artifact_root or canonical_summary.parent),
+            "gc.var.artifact_root": str(selected_artifact_root),
         }
+        if selected_artifact_root.is_absolute():
+            values["gc.build.artifact_root"] = str(
+                selected_artifact_root.resolve(strict=True)
+            )
+        return values
 
     @staticmethod
     def _write_build_basic_canonical_summary(
@@ -8899,6 +9016,19 @@ description = "Override sink that writes the base triage report contract."
             rows = json.loads(current_lanes)
             del rows[0]["metadata"]["code_review.output_path"]
             strict_results["missing lane output"] = run_contract_case(rows)
+
+            for row_index, key, case in (
+                (0, "code_review.output_path", "noncanonical acceptance output"),
+                (1, "code_review.output_path", "noncanonical test evidence output"),
+                (2, "code_review.output_path", "noncanonical simplicity output"),
+                (3, "code_review.synthesis_path", "noncanonical synthesis path"),
+                (3, "code_review.output_path", "noncanonical synthesis output"),
+                (4, "code_review.report_path", "noncanonical apply report"),
+                (4, "code_review.output_path", "noncanonical apply output"),
+            ):
+                rows = json.loads(current_lanes)
+                rows[row_index]["metadata"][key] = str(canonical_summary)
+                strict_results[case] = run_contract_case(rows)
 
             rows = [row for row in json.loads(current_lanes) if row["id"] != "apply"]
             strict_results["missing apply"] = run_contract_case(rows)

@@ -68,7 +68,19 @@ this virtual contract. Entrypoint adapters may launch those formulas explicitly;
 concrete build formulas may instead override stage steps while preserving the
 same artifact names and close semantics.
 
-Persist the normalized values on the workflow root bead using `gc.var.<name>` for each launch input and `gc.build.<artifact>_path` for resolved artifact paths. If an optional path input is blank, derive it under the resolved artifact root and record the derived absolute path.
+Resolve the artifact root exactly once during this prepare stage. Create it when
+needed, canonicalize it to an absolute physical path, and record that canonical
+absolute artifact root on the workflow root as `gc.build.artifact_root`. Never
+reinterpret the relative `gc.var.artifact_root` against a later stage's
+`gc.work_dir`; later producers and validators must consume
+`gc.build.artifact_root`. Require every derived build artifact path to be under
+that same root.
+
+Persist the normalized values on the workflow root bead using `gc.var.<name>`
+for each launch input, `gc.build.artifact_root` for the resolved root, and
+`gc.build.<artifact>_path` for resolved artifact paths. If an optional path
+input is blank, derive it under the resolved artifact root and record the
+derived absolute path.
 
 Build artifacts are Markdown files with YAML front matter, not JSON. When a
 path input is blank, derive these canonical filenames under the artifact root:
@@ -93,6 +105,7 @@ markers in the same command:
 
 ```bash
 gc bd update <workflow-root-id> \
+  --set-metadata 'gc.build.artifact_root=<canonical absolute artifact root>' \
   --set-metadata 'gc.build.status=ready' \
   --unset-metadata gc.blocked_reason \
   --unset-metadata gc.failure_class

@@ -11,8 +11,9 @@ workflow artifact recorded as `gc.build.implementation_summary_path`, normally
 
 Resolve the workflow root bead and artifact root from root metadata. If
 `gc.build.implementation_summary_path` is empty, derive an absolute path under
-`gc.var.artifact_root` or `gc.build.artifact_root` as
-`implementation-summary.md`, then record it on the workflow root:
+the canonical absolute `gc.build.artifact_root` as `implementation-summary.md`,
+then record it on the workflow root. Never reinterpret a relative
+`gc.var.artifact_root` against this later stage's `gc.work_dir`:
 
 `gc bd update "<workflow-root-id>" --set-metadata "gc.build.implementation_summary_path=<absolute path>"`
 

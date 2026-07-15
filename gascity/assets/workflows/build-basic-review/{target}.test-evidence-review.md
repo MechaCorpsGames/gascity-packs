@@ -16,9 +16,13 @@ summary/context paths, their current raw-byte SHA-256 digests, and that
 implementation snapshot. Require an exact root match and carry it as
 `code_review.review_input_snapshot`; otherwise use `iterate`.
 
-Write concrete findings at a canonical absolute path under the build artifact
-root. Distinguish missing proof from real product defects so the fix lane can
-either run the missing command or change code.
+Read `<artifact-root>` from root `gc.build.artifact_root`; require it to be
+absolute and equal the parent of `gc.build.code_review_context_path`. Write exactly
+`<artifact-root>/test-evidence-review-report.md`; never write review evidence
+into the authoritative implementation worktree.
+Run Python proof with `PYTHONDONTWRITEBYTECODE=1` and leave no `__pycache__` or
+bytecode files.
+Distinguish missing proof from product defects so the fix lane can act directly.
 
 Close with `gc.outcome=pass`,
 `code_review.test_evidence_verdict=approve|iterate`, and

@@ -20,10 +20,10 @@ three lanes approve, state explicitly that implementation changes are not
 authorized and that the apply lane must produce a no-op result. Do not turn
 wording such as "consider", "recommend", or "simpler alternative" into work.
 
-Write one starter review synthesis at a canonical absolute path under the build
-artifact root. The synthesis must be short enough for a first-time factory user
-to scan, but concrete enough for the fix lane to act without another planning
-pass.
+Read `<artifact-root>` from root `gc.build.artifact_root`; require it to be
+absolute and equal the parent of `gc.build.code_review_context_path`. Write exactly
+`<artifact-root>/starter-review-synthesis.md`; never write review evidence into
+the authoritative implementation worktree. Keep it short and actionable.
 
 Close with `gc.outcome=pass`,
 `code_review.reviewed_attempt=<current gc.attempt>`,

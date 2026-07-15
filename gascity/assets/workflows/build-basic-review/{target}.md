@@ -1,14 +1,20 @@
 Finalize the build-basic starter factory review.
 
 Verify one exact current-attempt lane/synthesis/apply group approved the live
-implementation and review inputs. Read `code_review.reviewed_attempt` and
-`code_review.review_input_snapshot` from its apply bead; every row must carry
-the same values. Recompute the combined snapshot from the implementation
-snapshot plus canonical summary/context paths and raw-byte digests. Any mismatch
-requires iteration, never a replacement input.
+implementation and review inputs. Query all closed review-loop member rows for
+this workflow root and select the group with the highest numeric `gc.attempt`.
+Read `code_review.reviewed_attempt` and `code_review.review_input_snapshot` from
+that group's apply bead, and require `code_review.reviewed_attempt` to equal the
+selected apply bead's `gc.attempt`; every row must carry the same values. Do not
+use this finalizer step's own `gc.attempt` as the reviewed attempt. Recompute the
+combined snapshot from the implementation snapshot plus canonical
+summary/context paths and raw-byte digests. Any mismatch requires iteration,
+never a replacement input.
 
-Write the approved report under the build artifact root and record its absolute
-path with:
+Read `<artifact-root>` from root `gc.build.artifact_root`; require it to be
+absolute and equal the parent of `gc.build.code_review_context_path`. Write exactly
+`<artifact-root>/review-report.md`; never write review evidence into an
+implementation worktree. Record its absolute path with:
 `gc bd update "<workflow-root-id>" --set-metadata "gc.build.review_report_path=<absolute path>"`.
 Do not use `gc bd update --metadata 'key=value'`; `--metadata` only accepts a JSON
 object.

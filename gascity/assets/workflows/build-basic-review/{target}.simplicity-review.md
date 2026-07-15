@@ -16,7 +16,10 @@ summary/context paths, their current raw-byte SHA-256 digests, and that
 implementation snapshot. Require an exact root match and carry it as
 `code_review.review_input_snapshot`; otherwise use `iterate`.
 
-Write findings at a canonical absolute path under the build artifact root.
+Read `<artifact-root>` from root `gc.build.artifact_root`; require it to be
+absolute and equal the parent of `gc.build.code_review_context_path`. Write exactly
+`<artifact-root>/simplicity-review-report.md`; never write review evidence into
+the authoritative implementation worktree.
 Required findings must be tied to specific changed files or artifacts and must
 explain the smallest useful fix.
 
