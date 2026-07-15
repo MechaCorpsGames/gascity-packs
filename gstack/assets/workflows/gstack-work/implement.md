@@ -75,6 +75,33 @@ Include intended behavior, the first verification command and observed result,
 changed files, the final proof command and observed result, remaining risks,
 and any release consideration.
 
+Bind the proof to the source anchor bead and authoritative implementation
+worktree, not to the launcher checkout. After the focused commit, read the full
+commit SHA with `git rev-parse HEAD` from `$WORKTREE`. The summary must contain
+the exact `beads/<source-anchor-id>` reference, canonical absolute worktree
+path, full commit SHA, changed files from that commit, and the observed passing
+result of the final proof command run from that worktree. Then persist all
+three proof values on the source anchor bead itself:
+
+```bash
+gc bd update <source-anchor-id> \
+  --set-metadata 'gc.implementation.worktree_path=<canonical absolute worktree>' \
+  --set-metadata 'gc.implementation.commit=<full commit SHA>' \
+  --set-metadata 'gc.implementation.summary_path=<absolute summary path inside that worktree>'
+```
+
+Read the source anchor bead back and require `work_dir` and
+`gc.implementation.worktree_path` to resolve to the same worktree, the recorded
+commit to equal that worktree's `HEAD`, and the recorded summary to exist
+inside that worktree. Do not record or accept launcher-checkout proof.
+
+From `$WORKTREE`, run `git status --porcelain --untracked-files=all` after
+writing the post-commit summary. Each recorded per-item summary is the only
+permitted uncommitted path for its member; other already-recorded member
+summaries in the same shared worktree are also evidence-only exceptions. Fail
+instead of closing if status reports any other staged, unstaged, or untracked
+path. An untracked product file is incomplete implementation, not evidence.
+
 Before closing, return only as needed to the launcher rig root resolved from
 the workflow root bead's `gc.work_dir` and run the canonical check without
 using the launcher checkout for source operations. If that root does not contain

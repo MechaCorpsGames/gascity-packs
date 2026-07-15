@@ -102,8 +102,9 @@ These steps go from a fresh machine to a completed gstack sprint.
 
 6. Artifacts land under your `artifact_root` (here
    `plans/csv-export/build/` in the rig): requirements, plan, decomposition,
-   review report, QA summary, release-readiness summary, and the final sprint
-   report. Inspect the formula surface at any time with:
+   implementation summary, review report, QA summary, release-readiness
+   summary, and the final sprint report. Inspect the formula surface at any
+   time with:
 
    ```sh
    gc formula catalog --json
@@ -114,8 +115,9 @@ These steps go from a fresh machine to a completed gstack sprint.
 
 `gstack-build` extends `build-base` and keeps the inherited anchor order
 `prepare -> requirements -> plan -> plan-review -> decompose ->
-implement/implement-same-session -> review -> finalize -> publish`. No base
-anchor is renamed, skipped, or reordered; `prepare` stays inherited.
+implement/implement-same-session -> summarize-implementation -> review ->
+finalize -> publish`. No base anchor is renamed, skipped, or reordered;
+`prepare` stays inherited.
 
 | Stage | gstack behavior | Route |
 | --- | --- | --- |
@@ -124,6 +126,7 @@ anchor is renamed, skipped, or reordered; `prepare` stays inherited.
 | `plan-review` | `gstack-plan-review` fanout: founder scope, design, engineering, developer-experience lanes | `gstack.review-synthesizer` |
 | `decompose` | Implementation convoy creation | `gstack.decomposer` |
 | `implement` / `implement-same-session` | Drains `gstack-work` (separate) or `gstack-work-item` (same-session) | `{implementation_target}` |
+| `summarize-implementation` | Verifies exact convoy closure and worktree-bound commit evidence, then writes the canonical implementation summary | `gc.run-operator` |
 | `review` | `gstack-code-review` fanout: staff, QA-evidence, CSO-security, gap-analysis lanes | `gstack.review-synthesizer` |
 | `qa` (pack-added) | `gstack-qa-review` fanout: browser QA and regression-test evidence | `gstack.qa-lead` |
 | `release-readiness` (pack-added) | `gstack-release-readiness` fanout: documentation, ship readiness, deployment readiness | `gstack.release-engineer` |
@@ -162,7 +165,9 @@ Supported modes and drain policies, as declared in
 - `implementation_strategy`: `drain` with `allowed_drain_policies` of
   `separate` (drains `gstack-work` item formulas with exclusive member access)
   and `same-session` (drains `gstack-work-item` in one shared single-lane
-  session with `on_item_failure = "skip_remaining"`)
+  session with `on_item_failure = "skip_remaining"`; a machine-gated prepare
+  step creates or reuses a deterministic sibling worktree and records it on
+  every source member before implementation)
 
 The native stage formulas extend the matching base methodology contracts:
 `gstack-planning` (`planning-base`), `gstack-decomposition`

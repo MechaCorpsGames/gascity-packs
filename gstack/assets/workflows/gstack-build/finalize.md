@@ -46,6 +46,17 @@ decomposition, implementation summary, review, QA, and release-readiness
 evidence support a successful build. Use `status: blocked` and keep failure
 metadata when required evidence failed.
 
+Re-read runtime implementation state before approving. The launch requirements
+must trace every direct member of `gc.var.convoy_id`. The implementation convoy
+IDs and `gc.build.implementation_member_ids` must agree with `gc convoy status`,
+the convoy and all exact members must be closed, and every member must retain
+worktree-bound proof whose recorded worktree, full commit SHA, and summary
+match the authoritative implementation worktree. Never approve evidence or QA
+fixes produced only in the launcher checkout. Require the canonical artifact
+at `gc.build.implementation_summary_path` to trace every current per-item
+summary with its current `sha256` digest and to name every member's current
+worktree and full commit; pre-QA or pre-review provenance is stale.
+
 Every `trace.upstream` entry must contain a path and scheme-qualified hash.
 Preserve actual source IDs verbatim; never invent, substitute, or renumber
 them. Account for each declared ID exactly once in `trace.coverage`; when no
@@ -98,4 +109,4 @@ Close with `gc.outcome=pass` and the sprint report path.
 
 Do not invoke provider-native subagents.
 
-Artifact validation: this stage is gated by `.gc/scripts/checks/build-artifact-valid.sh`, which validates the artifact recorded at `gc.build.final_report_path` against schema `gc.build.final-report.v1`. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact in place instead of rewriting it. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.
+Artifact validation: this stage is gated by the shipped `../assets/scripts/checks/gstack-build-state-valid.sh`, which first validates the artifact recorded at `gc.build.final_report_path` against schema `gc.build.final-report.v1`, then revalidates launch-source trace, exact implementation membership and closure, and authoritative worktree proof. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact or fail closed; never manufacture missing implementation proof. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.

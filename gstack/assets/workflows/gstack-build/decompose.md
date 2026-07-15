@@ -5,13 +5,38 @@ workflow root bead. Each bead must map to one vertical slice and include
 acceptance criteria, files or modules likely affected, first verification
 command, and expected proof command.
 
-Create the implementation work-item beads first, then create one new non-empty
-implementation convoy from those bead IDs. Do not reuse the workflow's launch
-or source convoy. Record the new convoy ID on the workflow root bead as both
+Create the implementation work-item beads first and capture every returned ID.
+Each work item must name the launch source target ID or IDs it implements under
+`Source Targets`; across all work items, every direct member of the launch
+convoy from `gc.var.convoy_id` must be accounted for. Then create one new
+non-empty implementation convoy in one command, with the descriptive name as
+the first positional argument and every captured work-item ID after it:
+
+```bash
+gc convoy create "gstack implementation for <workflow-root-id>" <all-work-item-id...> --json
+```
+
+Do not run `gc convoy create <first-work-item-id> ...`: the CLI interprets its
+first positional argument as the convoy name and silently omits that work item
+from membership. Do not reuse the workflow's launch or source convoy, and do
+not add members later in a second command.
+
+Parse both `convoy_id` and `issue_ids` from the create response. Require
+`issue_ids` to be exactly equal to the complete captured work-item ID list,
+with no missing, extra, or duplicate ID. Run
+`gc convoy status <implementation-convoy-id> --json` and independently require its `children`
+IDs to be exactly equal to the same list. Record the comma-separated complete
+list on the workflow root as
+`gc.build.implementation_member_ids=<work-item-id-1,work-item-id-2,...>`.
+
+Record the new convoy ID on the workflow root bead as both
 `gc.input_convoy_id=<implementation-convoy-id>` and
 `gc.build.implementation_convoy_id=<implementation-convoy-id>`. Do not record
 these only on the current step. Before closing, verify both workflow root
-metadata values identify the new implementation convoy.
+metadata values identify the new implementation convoy and the member metadata
+matches the status response exactly. Downstream summary and final gates require
+that this same convoy and every exact recorded member later reach
+`status=closed`; a closed subset is not successful implementation.
 
 Do not copy review-lane procedure into implementation beads. The convoy should
 describe product work; `gstack-work` carries the execution process.
@@ -69,9 +94,10 @@ Use these schema-required second-level headings in this exact order:
 - `## Implementation Convoy`
 - `## Work Items`
 
-Record each work-item bead ID, dependency, accepted requirement IDs, plan
-section, affected files, first verification command, and expected proof command
-under `## Work Items`. Record the new convoy ID and its members under
+Record each work-item bead ID as a `### <work-item-id>: <title>` heading, plus
+its dependency, `Source Targets`, accepted requirement IDs, plan section,
+affected files, first verification command, and expected proof command under
+`## Work Items`. Record the new convoy ID and its members under
 `## Implementation Convoy`.
 
 Record `gc.build.decomposition_path=<absolute path>` on the workflow root bead.
@@ -92,4 +118,4 @@ Close with `gc.outcome=pass`.
 
 Do not invoke provider-native subagents. Gas City graph lanes own fanout.
 
-Artifact validation: this stage is gated by `.gc/scripts/checks/build-artifact-valid.sh`, which validates the artifact recorded at `gc.build.decomposition_path` (fallback `gc.var.decomposition_path`) against schema `gc.build.decomposition.v1`. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact in place instead of rewriting it. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.
+Artifact validation: this stage is gated by the shipped `../assets/scripts/checks/gstack-build-state-valid.sh`, which first validates the artifact recorded at `gc.build.decomposition_path` (fallback `gc.var.decomposition_path`) against schema `gc.build.decomposition.v1`, then verifies launch-source accounting, the descriptive convoy name, and exact recorded membership. On repair attempts (`gc.attempt` greater than 1), read validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact and runtime metadata in place. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable failure metadata that blocks downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.

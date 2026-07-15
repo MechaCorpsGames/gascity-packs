@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -2046,6 +2047,20 @@ class FormulaAssetTests(unittest.TestCase):
                         resolved_shared["steps"][1]["needs"],
                         ["implement-item"],
                     )
+                elif pack_name == "gstack":
+                    resolved_steps = {step["id"]: step for step in resolved_shared["steps"]}
+                    self.assertEqual(
+                        set(resolved_steps),
+                        {"prepare-shared-worktree", "implement-item"},
+                    )
+                    self.assertEqual(
+                        resolved_steps["implement-item"]["needs"],
+                        ["prepare-shared-worktree"],
+                    )
+                    self.assertEqual(
+                        resolved_steps["prepare-shared-worktree"]["check"]["check"]["path"],
+                        "../assets/scripts/prepare-shared-worktree.sh",
+                    )
                 else:
                     self.assertEqual([step["id"] for step in resolved_shared["steps"]], ["implement-item"])
                 self.assertTrue(any(step["id"] == "implement-item" for step in shared_item_formula["steps"]))
@@ -2427,6 +2442,1088 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(finalize_lifecycle=fragment):
                 self.assertIn(fragment, finalize)
 
+    def test_gstack_build_semantic_gates_cover_source_convoy_and_worktrees(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        pack_root = packs_root / "gstack"
+        build = load_formula(pack_root, "gstack-build")
+        step_by_id = {step["id"]: step for step in build["steps"]}
+        semantic_check = "../assets/scripts/checks/gstack-build-state-valid.sh"
+
+        for step_id in (
+            "requirements",
+            "decompose",
+            "summarize-implementation",
+            "finalize",
+        ):
+            with self.subTest(step=step_id):
+                self.assertEqual(
+                    step_by_id[step_id]["check"]["check"]["path"],
+                    semantic_check,
+                )
+
+        requirements = (
+            pack_root / "assets" / "workflows" / "gstack-build" / "requirements.md"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            "gc.var.convoy_id",
+            "gc convoy status <launch-convoy-id> --json",
+            "path: beads/<source-target-id>",
+            "hash: bead:<source-target-id>",
+            "every direct launch-convoy member",
+        ):
+            with self.subTest(requirements=fragment):
+                self.assertIn(fragment, requirements)
+
+        decompose = (
+            pack_root / "assets" / "workflows" / "gstack-build" / "decompose.md"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            'gc convoy create "gstack implementation for <workflow-root-id>" <all-work-item-id...> --json',
+            "gc.build.implementation_member_ids",
+            "gc convoy status <implementation-convoy-id> --json",
+            "exactly equal",
+            "status=closed",
+        ):
+            with self.subTest(decompose=fragment):
+                self.assertIn(fragment, decompose)
+
+        implementation = (
+            pack_root / "assets" / "workflows" / "gstack-work" / "implement.md"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            "gc.implementation.worktree_path",
+            "gc.implementation.commit",
+            "gc.implementation.summary_path",
+            "full commit SHA",
+            "source anchor bead",
+        ):
+            with self.subTest(implementation=fragment):
+                self.assertIn(fragment, implementation)
+
+        qa_root = pack_root / "assets" / "workflows" / "gstack-qa-review"
+        for filename in (
+            "{target}.setup-gstack-qa.md",
+            "{target}.browser-qa.md",
+            "{target}.regression-test-review.md",
+            "{target}.qa-fix-findings.md",
+            "{target}.synthesize-qa.md",
+        ):
+            text = (qa_root / filename).read_text(encoding="utf-8")
+            for fragment in (
+                "gc.build.implementation_member_ids",
+                "authoritative implementation worktree",
+                "launcher checkout",
+            ):
+                with self.subTest(qa_prompt=filename, fragment=fragment):
+                    self.assertIn(fragment, text)
+
+        qa_fix = (qa_root / "{target}.qa-fix-findings.md").read_text(encoding="utf-8")
+        for fragment in (
+            "gc.build.implementation_summary_path",
+            "current full commit",
+            "sha256",
+        ):
+            with self.subTest(qa_fix=fragment):
+                self.assertIn(fragment, qa_fix)
+
+        review_fix = (
+            pack_root
+            / "assets"
+            / "workflows"
+            / "gstack-code-review"
+            / "{target}.apply-review-findings.md"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            "gc.build.implementation_member_ids",
+            "authoritative implementation worktree",
+            "launcher checkout",
+            "gc.implementation.worktree_path",
+            "gc.implementation.commit",
+            "gc.implementation.summary_path",
+            "gc.build.implementation_summary_path",
+            "sha256",
+        ):
+            with self.subTest(review_fix=fragment):
+                self.assertIn(fragment, review_fix)
+
+        summarize = (
+            pack_root
+            / "assets"
+            / "workflows"
+            / "gstack-build"
+            / "summarize-implementation.md"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            "git status --porcelain --untracked-files=all",
+            "recorded summary artifacts",
+        ):
+            with self.subTest(summarize=fragment):
+                self.assertIn(fragment, summarize)
+
+    def _run_gstack_build_state_check(
+        self,
+        *,
+        beads_by_id: dict[str, object],
+        convoys_by_id: dict[str, object],
+        bead_id: str,
+        launcher_root: pathlib.Path | None = None,
+    ) -> subprocess.CompletedProcess:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        source_script = (
+            packs_root
+            / "gstack"
+            / "assets"
+            / "scripts"
+            / "checks"
+            / "gstack-build-state-valid.sh"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            launcher = launcher_root or (tmp / "launcher")
+            checks_dir = launcher / ".gc" / "scripts" / "checks"
+            checks_dir.mkdir(parents=True, exist_ok=True)
+            staged_script = checks_dir / source_script.name
+            shutil.copy2(source_script, staged_script)
+            staged_script.chmod(0o755)
+            base_check = checks_dir / "build-artifact-valid.sh"
+            base_check.write_text(
+                "#!/usr/bin/env bash\nset -euo pipefail\necho 'base artifact valid'\n",
+                encoding="utf-8",
+            )
+            base_check.chmod(0o755)
+            shutil.copy2(
+                packs_root / "gascity" / "assets" / "scripts" / "validate_build_artifact.py",
+                launcher / ".gc" / "scripts" / "validate_build_artifact.py",
+            )
+            shutil.copytree(
+                packs_root / "gascity" / "schemas" / "build",
+                launcher / "schemas" / "build",
+                dirs_exist_ok=True,
+            )
+
+            show_dir = tmp / "show"
+            convoy_dir = tmp / "convoys"
+            bin_dir = tmp / "bin"
+            show_dir.mkdir()
+            convoy_dir.mkdir()
+            bin_dir.mkdir()
+            for current_id, payload in beads_by_id.items():
+                (show_dir / f"{current_id}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+            for current_id, payload in convoys_by_id.items():
+                (convoy_dir / f"{current_id}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "case \"${1:-}:${2:-}\" in\n"
+                "  bd:show) cat \"$BD_SHOW_DIR/$3.json\" ;;\n"
+                "  convoy:status) cat \"$CONVOY_STATUS_DIR/$3.json\" ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+
+            env = {
+                **os.environ,
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                "BD_SHOW_DIR": str(show_dir),
+                "CONVOY_STATUS_DIR": str(convoy_dir),
+                "GC_BEAD_ID": bead_id,
+                "GC_WORK_DIR": str(launcher),
+            }
+            return subprocess.run(
+                [str(staged_script)],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+    @staticmethod
+    def _gstack_convoy_status(
+        convoy_id: str,
+        title: str,
+        status: str,
+        children: list[tuple[str, str]],
+    ) -> dict[str, object]:
+        return {
+            "schema_version": "1",
+            "ok": True,
+            "convoy": {"id": convoy_id, "title": title, "status": status, "owned": False},
+            "progress": {
+                "closed": sum(child_status == "closed" for _, child_status in children),
+                "total": len(children),
+            },
+            "children": [
+                {
+                    "id": child_id,
+                    "title": child_id,
+                    "status": child_status,
+                    "type": "task",
+                }
+                for child_id, child_status in children
+            ],
+        }
+
+    @staticmethod
+    def _write_gstack_root_implementation_summary(
+        path: pathlib.Path,
+        members: list[tuple[str, pathlib.Path, str, pathlib.Path]],
+    ) -> None:
+        upstream = "".join(
+            "    - path: "
+            f"{json.dumps(str(summary.resolve()))}\n"
+            "      hash: sha256:"
+            f"{hashlib.sha256(summary.read_bytes()).hexdigest()}\n"
+            for _, _, _, summary in members
+        )
+        evidence = "\n".join(
+            f"{member_id} {worktree.resolve()} {commit} {summary.resolve()}"
+            for member_id, worktree, commit, summary in members
+        )
+        path.write_text(
+            "---\n"
+            "schema: gc.build.implementation-summary.v1\n"
+            "workflow:\n"
+            "  id: root\n"
+            "  formula: gstack-build\n"
+            "methodology:\n"
+            "  pack: gstack\n"
+            "  name: gstack-build\n"
+            "producer:\n"
+            "  formula: gstack-build\n"
+            "  stage: summarize-implementation\n"
+            "  attempt: 1\n"
+            "status: approved\n"
+            "trace:\n"
+            "  upstream:\n"
+            f"{upstream}"
+            "  coverage: []\n"
+            "---\n\n"
+            "## Summary\n\n"
+            f"{evidence}\n\n"
+            "## Intended Behavior\n\nAll exact implementation members are complete.\n\n"
+            "## Changed Files\n\nRecorded in the per-item summaries.\n\n"
+            "## Verification\n\nAll member proof passed.\n\n"
+            "## Remaining Risks\n\nNone recorded.\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_gstack_item_summary(
+        path: pathlib.Path,
+        member_id: str,
+        worktree: pathlib.Path,
+        commit: str,
+    ) -> None:
+        path.write_text(
+            "---\n"
+            "schema: gc.build.implementation-summary.v1\n"
+            "workflow:\n"
+            f"  id: {member_id}\n"
+            "  formula: gstack-work-item\n"
+            "methodology:\n"
+            "  pack: gstack\n"
+            "  name: gstack-work-item\n"
+            "producer:\n"
+            "  formula: gstack-work-item\n"
+            "  stage: implement-item\n"
+            "  attempt: 1\n"
+            "status: approved\n"
+            "trace:\n"
+            "  upstream:\n"
+            f"    - path: beads/{member_id}\n"
+            f"      hash: bead:{member_id}\n"
+            "  coverage: []\n"
+            "---\n\n"
+            "## Summary\n\n"
+            f"source anchor bead: beads/{member_id}\n\n"
+            "## Intended Behavior\n\nThe assigned behavior is implemented.\n\n"
+            "## Changed Files\n\nA product file changed.\n\n"
+            "## Verification\n\n"
+            f"authoritative implementation worktree: {worktree.resolve()}\n\n"
+            f"full commit SHA: {commit}\n\npytest -q passed\n\n"
+            "## Remaining Risks\n\nNone recorded.\n",
+            encoding="utf-8",
+        )
+
+    def test_gstack_state_check_requires_every_launch_source_in_requirements_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            requirements = pathlib.Path(td) / "requirements.md"
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n    - path: beads/source-2\n"
+                "      hash: bead:source-2\n---\n",
+                encoding="utf-8",
+            )
+            control = {
+                "id": "requirements-step",
+                "metadata": {
+                    "gc.root_bead_id": "root",
+                    "gc.build.artifact_schema": "gc.build.requirements.v1",
+                },
+            }
+            root = {
+                "id": "root",
+                "metadata": {
+                    "gc.var.convoy_id": "launch",
+                    "gc.build.requirements_path": str(requirements),
+                },
+            }
+            launch = self._gstack_convoy_status(
+                "launch", "input convoy", "open", [("source-1", "open"), ("source-2", "open")]
+            )
+
+            missing = self._run_gstack_build_state_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+            self.assertIn("missing launch source trace", missing.stderr)
+            self.assertIn("source-1", missing.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n---\n",
+                encoding="utf-8",
+            )
+            duplicate = self._run_gstack_build_state_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(duplicate.returncode, 0, duplicate.stdout + duplicate.stderr)
+            self.assertIn("duplicate launch source trace", duplicate.stderr)
+            self.assertIn("source-1", duplicate.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n---\n",
+                encoding="utf-8",
+            )
+            complete = self._run_gstack_build_state_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertEqual(complete.returncode, 0, complete.stdout + complete.stderr)
+
+    def test_gstack_state_check_rejects_convoy_that_omits_first_work_item(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root_dir = pathlib.Path(td)
+            requirements = root_dir / "requirements.md"
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n    - path: beads/source-1\n"
+                "      hash: bead:source-1\n---\n",
+                encoding="utf-8",
+            )
+            decomposition = root_dir / "decomposition.md"
+            decomposition.write_text(
+                "---\ntrace: {upstream: [], coverage: []}\n---\n\n"
+                "## Work Items\n\n### work-1: First\n\nSource Targets: source-1\n\n"
+                "### work-2: Second\n\nSource Targets: source-1\n",
+                encoding="utf-8",
+            )
+            control = {
+                "id": "decompose-step",
+                "metadata": {
+                    "gc.root_bead_id": "root",
+                    "gc.build.artifact_schema": "gc.build.decomposition.v1",
+                },
+            }
+            root = {
+                "id": "root",
+                "metadata": {
+                    "gc.var.convoy_id": "launch",
+                    "gc.build.requirements_path": str(requirements),
+                    "gc.build.decomposition_path": str(decomposition),
+                    "gc.input_convoy_id": "implementation",
+                    "gc.build.implementation_convoy_id": "implementation",
+                    "gc.build.implementation_member_ids": "work-1,work-2",
+                },
+            }
+            launch = self._gstack_convoy_status(
+                "launch", "input convoy", "open", [("source-1", "open")]
+            )
+            omitted = self._gstack_convoy_status(
+                "implementation", "work-1", "open", [("work-2", "open")]
+            )
+            rejected = self._run_gstack_build_state_check(
+                beads_by_id={"decompose-step": control, "root": root},
+                convoys_by_id={"launch": launch, "implementation": omitted},
+                bead_id="decompose-step",
+            )
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+            self.assertIn("implementation convoy title mismatch", rejected.stderr)
+
+            omitted["convoy"]["title"] = "gstack implementation for root"
+            missing_member = self._run_gstack_build_state_check(
+                beads_by_id={"decompose-step": control, "root": root},
+                convoys_by_id={"launch": launch, "implementation": omitted},
+                bead_id="decompose-step",
+            )
+            self.assertNotEqual(
+                missing_member.returncode, 0, missing_member.stdout + missing_member.stderr
+            )
+            self.assertIn("implementation convoy membership mismatch", missing_member.stderr)
+
+            complete = self._gstack_convoy_status(
+                "implementation",
+                "gstack implementation for root",
+                "open",
+                [("work-1", "open"), ("work-2", "open")],
+            )
+            accepted = self._run_gstack_build_state_check(
+                beads_by_id={"decompose-step": control, "root": root},
+                convoys_by_id={"launch": launch, "implementation": complete},
+                bead_id="decompose-step",
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n---\n",
+                encoding="utf-8",
+            )
+            decomposition.write_text(
+                "---\ntrace: {upstream: [], coverage: []}\n---\n\n"
+                "## Work Items\n\n### work-1: First\n\nSource Targets: source-1\n\n"
+                "Notes: source-2 is deferred.\n\n### work-2: Second\n\n"
+                "Source Targets: source-1\n",
+                encoding="utf-8",
+            )
+            two_sources = self._gstack_convoy_status(
+                "launch",
+                "input convoy",
+                "open",
+                [("source-1", "open"), ("source-2", "open")],
+            )
+            notes_only = self._run_gstack_build_state_check(
+                beads_by_id={"decompose-step": control, "root": root},
+                convoys_by_id={"launch": two_sources, "implementation": complete},
+                bead_id="decompose-step",
+            )
+            self.assertNotEqual(notes_only.returncode, 0, notes_only.stdout + notes_only.stderr)
+            self.assertIn("Source Targets do not account", notes_only.stderr)
+
+            decomposition.write_text(
+                "---\ntrace: {upstream: [], coverage: []}\n---\n\n"
+                "## Work Items\n\n### work-1: First\n\nSource Targets: source-1\n\n"
+                "### work-2: Second\n\nSource Targets: source-2\n",
+                encoding="utf-8",
+            )
+            explicit_targets = self._run_gstack_build_state_check(
+                beads_by_id={"decompose-step": control, "root": root},
+                convoys_by_id={"launch": two_sources, "implementation": complete},
+                bead_id="decompose-step",
+            )
+            self.assertEqual(
+                explicit_targets.returncode,
+                0,
+                explicit_targets.stdout + explicit_targets.stderr,
+            )
+
+    def test_gstack_state_check_rejects_non_authoritative_or_uncommitted_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root_dir = pathlib.Path(td)
+            launcher = root_dir / "launcher"
+            launcher.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=launcher, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=launcher, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"], cwd=launcher, check=True
+            )
+            (launcher / "slugger.py").write_text("raise NotImplementedError\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=launcher, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=launcher, check=True)
+            worktree = root_dir / "worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "-q", "--detach", str(worktree)],
+                cwd=launcher,
+                check=True,
+            )
+            (worktree / "slugger.py").write_text("def slugify(value): return value\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-qm", "implement"], cwd=worktree, check=True)
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+
+            requirements = launcher / "requirements.md"
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n    - path: beads/source-1\n"
+                "      hash: bead:source-1\n---\n",
+                encoding="utf-8",
+            )
+            root_summary = launcher / "implementation-summary.md"
+            decomposition = launcher / "decomposition.md"
+            decomposition.write_text(
+                "---\ntrace: {upstream: [], coverage: []}\n---\n\n"
+                "## Work Items\n\n### work-1: Implement source\n\n"
+                "Source Targets: source-1\n",
+                encoding="utf-8",
+            )
+            item_summary = worktree / "item-summary.md"
+            self._write_gstack_item_summary(item_summary, "work-1", worktree, commit)
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [("work-1", worktree, commit, item_summary)],
+            )
+            control = {
+                "id": "summary-step",
+                "metadata": {
+                    "gc.root_bead_id": "root",
+                    "gc.build.artifact_schema": "gc.build.implementation-summary.v1",
+                },
+            }
+            root = {
+                "id": "root",
+                "metadata": {
+                    "gc.var.convoy_id": "launch",
+                    "gc.build.requirements_path": str(requirements),
+                    "gc.build.decomposition_path": str(decomposition),
+                    "gc.build.implementation_summary_path": str(root_summary),
+                    "gc.input_convoy_id": "implementation",
+                    "gc.build.implementation_convoy_id": "implementation",
+                    "gc.build.implementation_member_ids": "work-1",
+                },
+            }
+            member = {
+                "id": "work-1",
+                "status": "closed",
+                "metadata": {
+                    "gc.outcome": "pass",
+                    "work_dir": str(launcher),
+                    "gc.implementation.worktree_path": str(launcher),
+                    "gc.implementation.summary_path": str(item_summary),
+                    "gc.implementation.commit": commit,
+                },
+            }
+            launch = self._gstack_convoy_status(
+                "launch", "input convoy", "open", [("source-1", "open")]
+            )
+            implementation = self._gstack_convoy_status(
+                "implementation",
+                "gstack implementation for root",
+                "closed",
+                [("work-1", "closed")],
+            )
+            incomplete = self._gstack_convoy_status(
+                "implementation",
+                "gstack implementation for root",
+                "open",
+                [("work-1", "open")],
+            )
+            open_result = self._run_gstack_build_state_check(
+                beads_by_id={"summary-step": control, "root": root, "work-1": member},
+                convoys_by_id={"launch": launch, "implementation": incomplete},
+                bead_id="summary-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(open_result.returncode, 0, open_result.stdout + open_result.stderr)
+            self.assertIn("implementation convoy implementation is not closed", open_result.stderr)
+
+            rejected = self._run_gstack_build_state_check(
+                beads_by_id={"summary-step": control, "root": root, "work-1": member},
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="summary-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+            self.assertIn("must differ from launcher checkout", rejected.stderr)
+
+            unrelated = root_dir / "unrelated"
+            subprocess.run(
+                ["git", "clone", "-q", str(launcher), str(unrelated)], check=True
+            )
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=unrelated, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"], cwd=unrelated, check=True
+            )
+            (unrelated / "slugger.py").write_text(
+                "def slugify(value): return value.lower()\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "add", "slugger.py"], cwd=unrelated, check=True)
+            subprocess.run(["git", "commit", "-qm", "unrelated implementation"], cwd=unrelated, check=True)
+            unrelated_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=unrelated,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            unrelated_summary = unrelated / "item-summary.md"
+            self._write_gstack_item_summary(
+                unrelated_summary, "work-1", unrelated, unrelated_commit
+            )
+            member["metadata"].update(
+                {
+                    "work_dir": str(unrelated),
+                    "gc.implementation.worktree_path": str(unrelated),
+                    "gc.implementation.summary_path": str(unrelated_summary),
+                    "gc.implementation.commit": unrelated_commit,
+                }
+            )
+            unrelated_result = self._run_gstack_build_state_check(
+                beads_by_id={"summary-step": control, "root": root, "work-1": member},
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="summary-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(
+                unrelated_result.returncode,
+                0,
+                unrelated_result.stdout + unrelated_result.stderr,
+            )
+            self.assertIn("not linked to launcher repository", unrelated_result.stderr)
+
+            member["metadata"]["work_dir"] = str(worktree)
+            member["metadata"]["gc.implementation.worktree_path"] = str(worktree)
+            member["metadata"]["gc.implementation.summary_path"] = str(item_summary)
+            member["metadata"]["gc.implementation.commit"] = commit
+            accepted = self._run_gstack_build_state_check(
+                beads_by_id={"summary-step": control, "root": root, "work-1": member},
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="summary-step",
+                launcher_root=launcher,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+            self.assertIn("base artifact valid", accepted.stdout)
+            self.assertIn("gstack build state valid", accepted.stdout)
+
+            (worktree / "untracked-implementation.py").write_text(
+                "UNCOMMITTED = True\n", encoding="utf-8"
+            )
+            untracked = self._run_gstack_build_state_check(
+                beads_by_id={"summary-step": control, "root": root, "work-1": member},
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="summary-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(untracked.returncode, 0, untracked.stdout + untracked.stderr)
+            self.assertIn("uncommitted worktree state", untracked.stderr)
+
+            (worktree / "untracked-implementation.py").unlink()
+            subprocess.run(["git", "add", "item-summary.md"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "commit evidence only"], cwd=worktree, check=True
+            )
+            summary_only_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            self._write_gstack_item_summary(
+                item_summary, "work-1", worktree, summary_only_commit
+            )
+            member["metadata"]["gc.implementation.commit"] = summary_only_commit
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [("work-1", worktree, summary_only_commit, item_summary)],
+            )
+            summary_only = self._run_gstack_build_state_check(
+                beads_by_id={"summary-step": control, "root": root, "work-1": member},
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="summary-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(
+                summary_only.returncode, 0, summary_only.stdout + summary_only.stderr
+            )
+            self.assertIn("changed only recorded summary artifacts", summary_only.stderr)
+
+    def test_gstack_state_check_validates_each_same_session_recorded_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root_dir = pathlib.Path(td)
+            launcher = root_dir / "launcher"
+            launcher.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=launcher, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=launcher, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"], cwd=launcher, check=True
+            )
+            (launcher / "shared.txt").write_text("initial\n", encoding="utf-8")
+            subprocess.run(["git", "add", "shared.txt"], cwd=launcher, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=launcher, check=True)
+
+            worktree = root_dir / "shared-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "-q", "--detach", str(worktree)],
+                cwd=launcher,
+                check=True,
+            )
+            (worktree / "shared.txt").write_text("member one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "shared.txt"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-qm", "member one"], cwd=worktree, check=True)
+            member_one_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-qm", "empty member proof"],
+                cwd=worktree,
+                check=True,
+            )
+            empty_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            (worktree / "shared.txt").write_text("member two\n", encoding="utf-8")
+            subprocess.run(["git", "add", "shared.txt"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-qm", "member two"], cwd=worktree, check=True)
+            member_two_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+
+            requirements = launcher / "requirements.md"
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n    - path: beads/source-1\n"
+                "      hash: bead:source-1\n---\n",
+                encoding="utf-8",
+            )
+            decomposition = launcher / "decomposition.md"
+            decomposition.write_text(
+                "---\ntrace: {upstream: [], coverage: []}\n---\n\n"
+                "## Work Items\n\n### work-1: First\n\nSource Targets: source-1\n\n"
+                "### work-2: Second\n\nSource Targets: source-1\n",
+                encoding="utf-8",
+            )
+            root_summary = launcher / "implementation-summary.md"
+            summary_one = worktree / "work-1-summary.md"
+            summary_two = worktree / "work-2-summary.md"
+
+            def write_summary(path: pathlib.Path, member_id: str, commit: str) -> None:
+                self._write_gstack_item_summary(path, member_id, worktree, commit)
+
+            write_summary(summary_one, "work-1", empty_commit)
+            write_summary(summary_two, "work-2", member_two_commit)
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [
+                    ("work-1", worktree, empty_commit, summary_one),
+                    ("work-2", worktree, member_two_commit, summary_two),
+                ],
+            )
+
+            control = {
+                "id": "summary-step",
+                "metadata": {
+                    "gc.root_bead_id": "root",
+                    "gc.build.artifact_schema": "gc.build.implementation-summary.v1",
+                },
+            }
+            root = {
+                "id": "root",
+                "metadata": {
+                    "gc.var.convoy_id": "launch",
+                    "gc.var.drain_policy": "same-session",
+                    "gc.build.requirements_path": str(requirements),
+                    "gc.build.decomposition_path": str(decomposition),
+                    "gc.build.implementation_summary_path": str(root_summary),
+                    "gc.input_convoy_id": "implementation",
+                    "gc.build.implementation_convoy_id": "implementation",
+                    "gc.build.implementation_member_ids": "work-1,work-2",
+                },
+            }
+
+            def member(
+                member_id: str,
+                commit: str,
+                summary: pathlib.Path,
+                member_worktree: pathlib.Path = worktree,
+            ) -> dict[str, object]:
+                return {
+                    "id": member_id,
+                    "status": "closed",
+                    "metadata": {
+                        "gc.outcome": "pass",
+                        "work_dir": str(member_worktree),
+                        "gc.implementation.worktree_path": str(member_worktree),
+                        "gc.implementation.summary_path": str(summary),
+                        "gc.implementation.commit": commit,
+                    },
+                }
+
+            launch = self._gstack_convoy_status(
+                "launch", "input convoy", "open", [("source-1", "open")]
+            )
+            implementation = self._gstack_convoy_status(
+                "implementation",
+                "gstack implementation for root",
+                "closed",
+                [("work-1", "closed"), ("work-2", "closed")],
+            )
+            invalid = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "summary-step": control,
+                    "root": root,
+                    "work-1": member("work-1", empty_commit, summary_one),
+                    "work-2": member("work-2", member_two_commit, summary_two),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="summary-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(invalid.returncode, 0, invalid.stdout + invalid.stderr)
+            self.assertIn("work-1 recorded an empty implementation commit", invalid.stderr)
+
+            write_summary(summary_one, "work-1", member_one_commit)
+            finalize_control = {
+                "id": "finalize-step",
+                "metadata": {
+                    "gc.root_bead_id": "root",
+                    "gc.build.artifact_schema": "gc.build.final-report.v1",
+                },
+            }
+            stale = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "finalize-step": finalize_control,
+                    "root": root,
+                    "work-1": member("work-1", member_one_commit, summary_one),
+                    "work-2": member("work-2", member_two_commit, summary_two),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="finalize-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(stale.returncode, 0, stale.stdout + stale.stderr)
+            self.assertIn("canonical implementation summary is stale", stale.stderr)
+
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [
+                    ("work-1", worktree, member_one_commit, summary_one),
+                    ("work-2", worktree, member_two_commit, summary_two),
+                ],
+            )
+            valid = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "finalize-step": finalize_control,
+                    "root": root,
+                    "work-1": member("work-1", member_one_commit, summary_one),
+                    "work-2": member("work-2", member_two_commit, summary_two),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="finalize-step",
+                launcher_root=launcher,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+
+            root_summary.write_text(
+                root_summary.read_text(encoding="utf-8").replace(
+                    "status: approved", "status: draft", 1
+                ),
+                encoding="utf-8",
+            )
+            draft_root = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "finalize-step": finalize_control,
+                    "root": root,
+                    "work-1": member("work-1", member_one_commit, summary_one),
+                    "work-2": member("work-2", member_two_commit, summary_two),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="finalize-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(draft_root.returncode, 0, draft_root.stdout + draft_root.stderr)
+            self.assertIn("canonical implementation summary must be approved", draft_root.stderr)
+
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [
+                    ("work-1", worktree, member_one_commit, summary_one),
+                    ("work-2", worktree, member_two_commit, summary_two),
+                ],
+            )
+            summary_one.write_text(
+                summary_one.read_text(encoding="utf-8").replace(
+                    "status: approved", "status: draft", 1
+                ),
+                encoding="utf-8",
+            )
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [
+                    ("work-1", worktree, member_one_commit, summary_one),
+                    ("work-2", worktree, member_two_commit, summary_two),
+                ],
+            )
+            draft_item = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "finalize-step": finalize_control,
+                    "root": root,
+                    "work-1": member("work-1", member_one_commit, summary_one),
+                    "work-2": member("work-2", member_two_commit, summary_two),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="finalize-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(draft_item.returncode, 0, draft_item.stdout + draft_item.stderr)
+            self.assertIn("per-item summary must be approved", draft_item.stderr)
+
+            write_summary(summary_one, "work-1", member_one_commit)
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [
+                    ("work-1", worktree, member_one_commit, summary_one),
+                    ("work-2", worktree, member_two_commit, summary_two),
+                ],
+            )
+
+            divergent_worktree = root_dir / "divergent-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "-q", "--detach", str(divergent_worktree)],
+                cwd=launcher,
+                check=True,
+            )
+            (divergent_worktree / "divergent.txt").write_text(
+                "independent\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "add", "divergent.txt"], cwd=divergent_worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "divergent member"],
+                cwd=divergent_worktree,
+                check=True,
+            )
+            divergent_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=divergent_worktree,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            divergent_summary = divergent_worktree / "work-2-summary.md"
+            self._write_gstack_item_summary(
+                divergent_summary,
+                "work-2",
+                divergent_worktree,
+                divergent_commit,
+            )
+            summary_two.unlink()
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [
+                    ("work-1", worktree, member_one_commit, summary_one),
+                    (
+                        "work-2",
+                        divergent_worktree,
+                        divergent_commit,
+                        divergent_summary,
+                    ),
+                ],
+            )
+            divergent_same_session = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "finalize-step": finalize_control,
+                    "root": root,
+                    "work-1": member("work-1", member_one_commit, summary_one),
+                    "work-2": member(
+                        "work-2",
+                        divergent_commit,
+                        divergent_summary,
+                        divergent_worktree,
+                    ),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="finalize-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(
+                divergent_same_session.returncode,
+                0,
+                divergent_same_session.stdout + divergent_same_session.stderr,
+            )
+            self.assertIn(
+                "same-session implementation members must share exactly one",
+                divergent_same_session.stderr,
+            )
+
+            write_summary(summary_two, "work-2", member_two_commit)
+
+            summary_one.write_text(
+                f"beads/work-1 {worktree.resolve()} {member_one_commit} passed\n",
+                encoding="utf-8",
+            )
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [
+                    ("work-1", worktree, member_one_commit, summary_one),
+                    ("work-2", worktree, member_two_commit, summary_two),
+                ],
+            )
+            malformed_after_review = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "finalize-step": finalize_control,
+                    "root": root,
+                    "work-1": member("work-1", member_one_commit, summary_one),
+                    "work-2": member("work-2", member_two_commit, summary_two),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="finalize-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(
+                malformed_after_review.returncode,
+                0,
+                malformed_after_review.stdout + malformed_after_review.stderr,
+            )
+            self.assertIn("per-item summary failed schema validation", malformed_after_review.stderr)
+
+            write_summary(summary_one, "work-1", member_one_commit)
+            root_summary.write_text(
+                f"work-1 {worktree.resolve()} {member_one_commit} {summary_one.resolve()} passed\n",
+                encoding="utf-8",
+            )
+            malformed_root_after_review = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "finalize-step": finalize_control,
+                    "root": root,
+                    "work-1": member("work-1", member_one_commit, summary_one),
+                    "work-2": member("work-2", member_two_commit, summary_two),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="finalize-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(
+                malformed_root_after_review.returncode,
+                0,
+                malformed_root_after_review.stdout + malformed_root_after_review.stderr,
+            )
+            self.assertIn(
+                "canonical implementation summary failed schema validation",
+                malformed_root_after_review.stderr,
+            )
+
     def test_gstack_implementation_prompts_preserve_worktree_and_summary_contract(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
         workflow_root = packs_root / "gstack" / "assets" / "workflows"
@@ -2452,6 +3549,8 @@ class FormulaAssetTests(unittest.TestCase):
                 "GC_BEAD_ID=<exact-claimed-bead-id>",
                 "nearest ancestor containing",
                 "gc.attempt_log",
+                "git status --porcelain --untracked-files=all",
+                "permitted uncommitted path",
             ):
                 with self.subTest(prompt=relative_path, fragment=fragment):
                     self.assertIn(fragment, text)
@@ -2469,6 +3568,143 @@ class FormulaAssetTests(unittest.TestCase):
                 [text.index(marker) for marker in markers],
                 sorted(text.index(marker) for marker in markers),
             )
+
+        shared_prepare = (
+            workflow_root / "gstack-work-item" / "prepare-shared-worktree.md"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            "gc.drain_control_id",
+            "gc.drain_index",
+            "persists `work_dir` on the current source anchor",
+            "creates or reuses",
+        ):
+            with self.subTest(shared_worktree_lifecycle=fragment):
+                self.assertIn(fragment, shared_prepare)
+
+    def test_gstack_same_session_prepares_and_reuses_authoritative_worktree(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        script = (
+            packs_root
+            / "gstack"
+            / "assets"
+            / "scripts"
+            / "prepare-shared-worktree.sh"
+        )
+        self.assertTrue(script.is_file(), script)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            launcher = root / "launcher"
+            launcher.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=launcher, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=launcher, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=launcher,
+                check=True,
+            )
+            (launcher / "product.txt").write_text("initial\n", encoding="utf-8")
+            subprocess.run(["git", "add", "product.txt"], cwd=launcher, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=launcher, check=True)
+            nested_session_dir = launcher / ".gc" / "sessions" / "shared-drain"
+            nested_session_dir.mkdir(parents=True)
+
+            state_dir = root / "state"
+            bin_dir = root / "bin"
+            state_dir.mkdir()
+            bin_dir.mkdir()
+            fake_gc = bin_dir / "gc"
+            fake_gc.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                "args = sys.argv[1:]\n"
+                "state = pathlib.Path(os.environ['GC_STATE_DIR'])\n"
+                "bead_id = args[2]\n"
+                "path = state / f'{bead_id}.json'\n"
+                "payload = json.loads(path.read_text()) if path.exists() else "
+                "{'id': bead_id, 'metadata': {}}\n"
+                "if ':'.join(args[:2]) == 'bd:show':\n"
+                "    print(json.dumps(payload))\n"
+                "elif ':'.join(args[:2]) == 'bd:update':\n"
+                "    raw = args[args.index('--set-metadata') + 1]\n"
+                "    key, value = raw.split('=', 1)\n"
+                "    payload.setdefault('metadata', {})[key] = value\n"
+                "    path.write_text(json.dumps(payload))\n"
+                "else:\n"
+                "    raise SystemExit(2)\n",
+                encoding="utf-8",
+            )
+            fake_gc.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                "GC_STATE_DIR": str(state_dir),
+            }
+
+            prepared_paths = []
+            for item_index, member_id in enumerate(("work-1", "work-2")):
+                item_root_id = f"item-root-{item_index}"
+                step_id = f"prepare-step-{item_index}"
+                (state_dir / f"{step_id}.json").write_text(
+                    json.dumps(
+                        {
+                            "id": step_id,
+                            "metadata": {"gc.root_bead_id": item_root_id},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (state_dir / f"{item_root_id}.json").write_text(
+                    json.dumps(
+                        {
+                            "id": item_root_id,
+                            "metadata": {
+                                "gc.work_dir": str(nested_session_dir),
+                                "gc.drain_control_id": "drain-1",
+                                "gc.drain_member_id": member_id,
+                                "gc.drain_index": str(item_index),
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                prepared = subprocess.run(
+                    [str(script)],
+                    env={**env, "GC_BEAD_ID": step_id},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+                prepared_paths.append(pathlib.Path(prepared.stdout.strip()).resolve())
+
+            self.assertEqual(prepared_paths[0], prepared_paths[1])
+            self.assertNotEqual(prepared_paths[0], launcher.resolve())
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "status", "--porcelain", "--untracked-files=all"],
+                    cwd=launcher,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout,
+                "",
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(prepared_paths[0]), "rev-parse", "--git-common-dir"],
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout.strip(),
+                str((launcher / ".git").resolve()),
+            )
+            for member_id in ("work-1", "work-2"):
+                payload = json.loads((state_dir / f"{member_id}.json").read_text())
+                self.assertEqual(
+                    pathlib.Path(payload["metadata"]["work_dir"]).resolve(),
+                    prepared_paths[0],
+                )
 
     def test_gstack_review_terminal_honors_selected_artifact_path(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]

@@ -1,13 +1,19 @@
 Implement the assigned gstack shared-drain item.
 
-Gas City owns the shared drain and source-anchor lifecycle. Resolve the source
-anchor from the reserved input convoy and `gc.drain_member_id`, not from a
-dependency bead. Read the source anchor's `work_dir` and require it to identify
-the existing authoritative shared worktree. Set `WORKTREE` to that absolute
-path, run `cd "$WORKTREE"`, and verify `pwd -P` equals `$WORKTREE` before any
-source read, edit, test, hash, commit, or proof command. The workflow root
-bead's `gc.work_dir` identifies the launcher rig root for validation, not the
-implementation worktree.
+Gas City owns the shared drain and source-anchor lifecycle. Read the claimed
+step's workflow root bead, then require its `gc.drain_member_id`,
+`gc.drain_index`, and `gc.drain_control_id`. The drain member is the exact
+source anchor; do not infer one from a dependency or use the synthetic input
+convoy. The item index must be a non-negative integer.
+
+The required `prepare-shared-worktree` step must already have created or reused
+one deterministic shared worktree and persisted `work_dir` on the current
+source anchor. Read the source anchor back and require that path to be
+absolute, existing, linked to the launcher repository, and distinct from the
+launcher checkout. Set `WORKTREE` to that path, run `cd "$WORKTREE"`, and
+verify `pwd -P` equals `$WORKTREE` before any source read, edit, test, hash,
+commit, or proof command. The workflow root bead's `gc.work_dir` remains the
+launcher rig root for validation, not the implementation worktree.
 
 Read only the assigned item scope, implement the smallest complete change, and
 run focused proof. Write the item summary as Markdown with YAML front matter
@@ -64,7 +70,25 @@ Use these schema-required second-level headings in this exact order:
 
 Record intended behavior, the first verification command and observed result,
 changed files, the final proof command and observed result, and remaining
-risks. Before closing, resolve the launcher rig root from the workflow root
+risks. Bind those claims to the source anchor bead and authoritative
+implementation worktree: make a focused commit, read its full commit SHA with
+`git rev-parse HEAD` from `$WORKTREE`, and include the exact
+`beads/<source-anchor-id>` reference, canonical worktree path, commit SHA,
+changed files, and observed passing result in the summary. Record
+`gc.implementation.worktree_path`, `gc.implementation.commit`, and
+`gc.implementation.summary_path` on the source anchor bead; the summary path
+must be inside that worktree. Read the source anchor back and require those
+values to match `work_dir`, worktree `HEAD`, and the existing summary. Never
+record or accept launcher-checkout proof.
+
+From `$WORKTREE`, run `git status --porcelain --untracked-files=all` after
+writing the post-commit summary. Each recorded per-item summary is the only
+permitted uncommitted path for its member; other already-recorded member
+summaries in the shared worktree are also evidence-only exceptions. Fail
+instead of closing if status reports any other staged, unstaged, or untracked
+path. An untracked product file is incomplete implementation, not evidence.
+
+Before closing, resolve the launcher rig root from the workflow root
 bead's `gc.work_dir`. If that root does not contain the validator, use the
 nearest ancestor containing `.gc/scripts/checks/build-artifact-valid.sh`.
 Read the exact current bead ID from the startup claim output and substitute it

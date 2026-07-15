@@ -291,7 +291,7 @@ METHODOLOGY_FLOW_CONTRACTS = {
             "requirements": {
                 "run_target": "gstack.office-hours",
                 "artifact_schema": "gc.build.requirements.v1",
-                "check": "build-artifact-valid.sh",
+                "check": "gstack-build-state-valid.sh",
             },
             "plan": {
                 "run_target": "gstack.founder-reviewer",
@@ -305,7 +305,7 @@ METHODOLOGY_FLOW_CONTRACTS = {
             "decompose": {
                 "run_target": "gstack.decomposer",
                 "artifact_schema": "gc.build.decomposition.v1",
-                "check": "build-artifact-valid.sh",
+                "check": "gstack-build-state-valid.sh",
             },
             "implement": {
                 "run_target": "{{implementation_target}}",
@@ -317,6 +317,12 @@ METHODOLOGY_FLOW_CONTRACTS = {
                 "drain_formula": "gstack-work-item",
                 "drain_context": "shared",
                 "single_lane": True,
+            },
+            "summarize-implementation": {
+                "run_target": "gc.run-operator",
+                "artifact_schema": "gc.build.implementation-summary.v1",
+                "needs": ("implement", "implement-same-session"),
+                "check": "gstack-build-state-valid.sh",
             },
             "review": {
                 "run_target": "gstack.review-synthesizer",
@@ -338,7 +344,7 @@ METHODOLOGY_FLOW_CONTRACTS = {
                 "run_target": "gstack.release-engineer",
                 "artifact_schema": "gc.build.final-report.v1",
                 "needs": ("release-readiness",),
-                "check": "build-artifact-valid.sh",
+                "check": "gstack-build-state-valid.sh",
             },
             "publish": {
                 "run_target": "gc.publisher",

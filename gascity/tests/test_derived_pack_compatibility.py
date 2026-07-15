@@ -421,6 +421,7 @@ class DerivedPackCompatibilityTests(unittest.TestCase):
             "requirements": base_contract.REQUIREMENTS_GATE,
             "plan": base_contract.PLAN_GATE,
             "decompose": base_contract.DECOMPOSITION_GATE,
+            "summarize-implementation": base_contract.ROOT_IMPLEMENTATION_SUMMARY_GATE,
             "review": base_contract.BUILD_REVIEW_GATE,
             "finalize": base_contract.FINAL_REPORT_GATE,
         }
@@ -473,11 +474,26 @@ class DerivedPackCompatibilityTests(unittest.TestCase):
                             step["check"]["max_attempts"],
                             base_contract.BUILD_ARTIFACT_GATE_MAX_ATTEMPTS,
                         )
+                        expected_check_path = base_contract.BUILD_ARTIFACT_CHECK_SCRIPT
+                        if (
+                            pack_name == "gstack"
+                            and formula_name == expected["formula"]
+                            and step_id
+                            in {
+                                "requirements",
+                                "decompose",
+                                "summarize-implementation",
+                                "finalize",
+                            }
+                        ):
+                            expected_check_path = (
+                                "../assets/scripts/checks/gstack-build-state-valid.sh"
+                            )
                         self.assertEqual(
                             step["check"]["check"],
                             {
                                 "mode": "exec",
-                                "path": base_contract.BUILD_ARTIFACT_CHECK_SCRIPT,
+                                "path": expected_check_path,
                                 "timeout": "5m",
                             },
                         )

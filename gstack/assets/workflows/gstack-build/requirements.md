@@ -10,6 +10,24 @@ focused question at a time when demand, status quo, user specificity, narrowest
 wedge, observation, or future-fit is missing. In autonomous mode, write the
 best requirements artifact from available context and record assumptions.
 
+Resolve the actual build request before drafting methodology content. Read the
+workflow root bead's reserved `gc.var.convoy_id` as `<launch-convoy-id>`, then
+run `gc convoy status <launch-convoy-id> --json`. Treat every direct
+launch-convoy member as a source target. Read each source target with `gc bd
+show <source-target-id> --json` and use its title, description, acceptance
+criteria, and constraints as the authoritative requested outcome. The workflow
+root description and gstack formula describe process, not product scope. Never
+replace the source target with a plan for improving the gstack workflow itself.
+If the launch convoy is missing, empty, or unreadable, fail closed instead of
+inventing requirements.
+
+Trace every direct launch-convoy member exactly once as an upstream source
+using `path: beads/<source-target-id>` and `hash: bead:<source-target-id>`.
+When a source target contains its own requirement IDs, preserve those IDs in
+`ids` and coverage as described below. Source targets without declared
+requirement IDs still require the exact bead path/hash entry; do not trace only
+the workflow root or launch convoy.
+
 Read the exact requirements path from workflow root metadata
 `gc.build.requirements_path` (fallback `gc.var.requirements_path`) and write the
 canonical artifact there. Do not substitute a path under this attempt's
@@ -35,8 +53,8 @@ producer:
 status: approved
 trace:
   upstream:
-    - path: beads/<source-bead-id>
-      hash: bead:<source-bead-id>
+    - path: beads/<source-target-id>
+      hash: bead:<source-target-id>
   coverage: []
 ---
 ```
@@ -98,4 +116,4 @@ Close with `gc.outcome=pass` and the requirements artifact path.
 Do not invoke provider-native subagents. This Gas City lane is the office-hours
 worker for the build.
 
-Artifact validation: this stage is gated by `.gc/scripts/checks/build-artifact-valid.sh`, which validates the artifact recorded at `gc.build.requirements_path` (fallback `gc.var.requirements_path`) against schema `gc.build.requirements.v1`. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact in place instead of rewriting it. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.
+Artifact validation: this stage is gated by the shipped `../assets/scripts/checks/gstack-build-state-valid.sh`, which first runs the shared schema validator for the artifact recorded at `gc.build.requirements_path` (fallback `gc.var.requirements_path`) and then verifies exact launch-source trace coverage. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact in place instead of rewriting it. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.
