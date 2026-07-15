@@ -32,10 +32,12 @@ MAX_STATUS_PREVIEW = 160
 GATEWAY_WORKER_THREADS = 8
 GATEWAY_NAMED_WORKER_THREADS = 1
 GATEWAY_MAX_PENDING_MESSAGES = 128
+GATEWAY_WORKER_STOP_TIMEOUT_SECONDS = 5.0
 RECONNECT_BASE_DELAY_SECONDS = 5
 RECONNECT_MAX_DELAY_SECONDS = 60
 GATEWAY_IDENTIFY_STAGGER_SECONDS = 5.5
 PRUNE_INTERVAL_SECONDS = 60
+PENDING_RECOVERY_INTERVAL_SECONDS = 60
 HEALTH_RECONNECT_GRACE_SECONDS = 90
 GC_API_HEALTH_TTL_SECONDS = 30
 GC_API_HEALTH_PROBE_TIMEOUT_SECONDS = 3.0
@@ -48,6 +50,7 @@ STALE_PROCESSING_RECEIPT_SECONDS = (
     + PROCESSING_RECEIPT_STALE_MARGIN_SECONDS
 )
 FAILED_RECEIPT_RETRY_SECONDS = 60
+INGRESS_DELIVERY_PROTOCOL_VERSION = 2
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
@@ -901,6 +904,337 @@ def persist_ingress_receipt(payload: dict[str, Any]) -> dict[str, Any]:
     return common.save_chat_ingress(payload)
 
 
+def ingress_delivery_status(targets: list[dict[str, Any]], fallback: str = "pending") -> str:
+    statuses = [str(target.get("status", "")).strip() for target in targets if isinstance(target, dict)]
+    if not statuses:
+        return fallback
+    if any(status in {"pending", "submitting", "awaiting_result"} for status in statuses):
+        return "pending"
+    if "delivery_unknown" in statuses:
+        return "delivery_unknown"
+    failure_count = sum(status == "failed" for status in statuses)
+    if failure_count == 0:
+        return "delivered"
+    if failure_count < len(statuses):
+        return "partial_failed"
+    return "failed"
+
+
+def persist_ingress_target_patch(
+    receipt: dict[str, Any],
+    target_index: int,
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    targets = [dict(target) for target in receipt.get("targets", []) if isinstance(target, dict)]
+    if target_index < 0 or target_index >= len(targets):
+        raise IndexError(f"ingress target index {target_index} is out of range")
+    targets[target_index].update(patch)
+    updated = {**receipt, "targets": targets}
+    updated["status"] = ingress_delivery_status(targets, str(receipt.get("status", "pending")).strip() or "pending")
+    return persist_ingress_receipt(updated)
+
+
+def ingress_delivery_protocol_version(receipt: dict[str, Any]) -> int:
+    try:
+        return int(receipt.get("delivery_protocol_version", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def ingress_routing_delivery_order(receipt: dict[str, Any]) -> str:
+    message_id = str(receipt.get("discord_message_id", "")).strip()
+    if message_id.isdigit():
+        return f"snowflake:{int(message_id):020d}"
+    return ":".join(
+        [
+            "timestamp",
+            str(receipt.get("created_at", "")).strip(),
+            message_id,
+            str(receipt.get("ingress_id", "")).strip(),
+        ]
+    )
+
+
+def apply_ingress_routing_state(receipt: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if ingress_delivery_protocol_version(receipt) != INGRESS_DELIVERY_PROTOCOL_VERSION:
+        return receipt, False
+    if str(receipt.get("status", "")).strip() != "delivered":
+        return receipt, False
+    if str(receipt.get("route_kind", "")).strip() != "room_launch_thread":
+        return receipt, False
+    if str(receipt.get("routing_state_applied_at", "")).strip():
+        return receipt, False
+    launch_id = str(receipt.get("launch_id", "")).strip()
+    qualified_handle = str(receipt.get("qualified_handle", "")).strip()
+    if not launch_id or not qualified_handle:
+        return receipt, False
+    updated_launch = common.set_room_launch_last_addressed(
+        launch_id,
+        qualified_handle,
+        delivery_order=ingress_routing_delivery_order(receipt),
+    )
+    if not isinstance(updated_launch, dict):
+        return receipt, False
+    updated_receipt = persist_ingress_receipt(
+        {
+            **receipt,
+            "routing_state_applied_at": common.utcnow(),
+        }
+    )
+    return updated_receipt, True
+
+
+def resume_ingress_delivery(
+    receipt: dict[str, Any],
+    *,
+    cancel_event: threading.Event | None = None,
+    delivery_envelopes: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    current = dict(receipt)
+    targets = [dict(target) for target in current.get("targets", []) if isinstance(target, dict)]
+    for target_index, target in enumerate(targets):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        target_status = str(target.get("status", "")).strip()
+        if target_status == "submitting":
+            current = persist_ingress_target_patch(
+                current,
+                target_index,
+                {"status": "delivery_unknown", "reason": "missing_async_correlation"},
+            )
+            targets = [dict(item) for item in current.get("targets", []) if isinstance(item, dict)]
+            continue
+        if target_status == "pending":
+            session_name = str(target.get("session_name", "")).strip()
+            envelope = str((delivery_envelopes or {}).get(session_name, ""))
+            idempotency_key = str(target.get("idempotency_key", "")).strip()
+            intent = str(target.get("intent", "default")).strip() or "default"
+            if not session_name or not envelope:
+                current = persist_ingress_target_patch(
+                    current,
+                    target_index,
+                    {"status": "delivery_unknown", "reason": "delivery_payload_not_retained"},
+                )
+                targets = [dict(item) for item in current.get("targets", []) if isinstance(item, dict)]
+                continue
+            current = persist_ingress_target_patch(current, target_index, {"status": "submitting"})
+
+            def record_async_acceptance(accepted: dict[str, Any], index: int = target_index) -> None:
+                nonlocal current
+                current = persist_ingress_target_patch(
+                    current,
+                    index,
+                    {
+                        "status": "awaiting_result",
+                        "request_id": str(accepted.get("request_id", "")).strip(),
+                        "event_cursor": str(accepted.get("event_cursor", "")).strip(),
+                        "intent": str(accepted.get("intent", intent)).strip() or intent,
+                        "response": accepted.get("response") if isinstance(accepted.get("response"), dict) else {},
+                    },
+                )
+
+            def record_async_terminal(evidence: dict[str, Any], index: int = target_index) -> None:
+                nonlocal current
+                status = "delivered" if str(evidence.get("status", "")).strip() == "succeeded" else "failed"
+                current = persist_ingress_target_patch(
+                    current,
+                    index,
+                    {"status": status, "terminal_evidence": evidence},
+                )
+
+            try:
+                response = common.deliver_session_message(
+                    session_name,
+                    envelope,
+                    idempotency_key=idempotency_key,
+                    intent=intent,
+                    cancel_event=cancel_event,
+                    on_async_accepted=record_async_acceptance,
+                    on_async_terminal=record_async_terminal,
+                )
+            except common.GCAPIRequestCancelled as exc:
+                target_now = current["targets"][target_index]
+                status = "awaiting_result" if str(target_now.get("request_id", "")).strip() else "delivery_unknown"
+                current = persist_ingress_target_patch(
+                    current,
+                    target_index,
+                    {"status": status, "last_wait_error": str(exc)},
+                )
+                break
+            except common.GCAPIResultUnknown as exc:
+                target_now = current["targets"][target_index]
+                status = "awaiting_result" if str(target_now.get("request_id", "")).strip() else "delivery_unknown"
+                current = persist_ingress_target_patch(
+                    current,
+                    target_index,
+                    {"status": status, "last_wait_error": str(exc)},
+                )
+            except common.GCAPIRequestFailed as exc:
+                current = persist_ingress_target_patch(
+                    current,
+                    target_index,
+                    {
+                        "status": "failed",
+                        "error": str(exc),
+                        "terminal_evidence": {"status": "failed", "payload": exc.payload},
+                    },
+                )
+            except common.GCAPIError as exc:
+                current = persist_ingress_target_patch(
+                    current,
+                    target_index,
+                    {"status": "failed", "error": str(exc)},
+                )
+            else:
+                if str(current["targets"][target_index].get("status", "")).strip() != "delivered":
+                    current = persist_ingress_target_patch(
+                        current,
+                        target_index,
+                        {
+                            "status": "delivered",
+                            "response": response,
+                            "terminal_evidence": {
+                                "status": "succeeded",
+                                "source": "http",
+                                "payload": response,
+                            },
+                        },
+                    )
+            targets = [dict(item) for item in current.get("targets", []) if isinstance(item, dict)]
+            continue
+        if target_status != "awaiting_result":
+            continue
+        request_id = str(target.get("request_id", "")).strip()
+        event_cursor = str(target.get("event_cursor", "")).strip()
+        if not request_id or not event_cursor:
+            current = persist_ingress_target_patch(
+                current,
+                target_index,
+                {
+                    "status": "delivery_unknown",
+                    "reason": "missing_async_correlation",
+                },
+            )
+            continue
+        intent = str(target.get("intent", "default")).strip() or "default"
+        try:
+            terminal_payload = common.resume_session_message_delivery(
+                request_id,
+                event_cursor,
+                intent=intent,
+                timeout=common.GC_API_ASYNC_RESULT_TIMEOUT_SECONDS,
+                cancel_event=cancel_event,
+            )
+        except common.GCAPIRequestCancelled as exc:
+            current = persist_ingress_target_patch(
+                current,
+                target_index,
+                {"status": "awaiting_result", "last_wait_error": str(exc)},
+            )
+            break
+        except common.GCAPIResultUnknown as exc:
+            current = persist_ingress_target_patch(
+                current,
+                target_index,
+                {"status": "awaiting_result", "last_wait_error": str(exc)},
+            )
+        except common.GCAPIRequestFailed as exc:
+            current = persist_ingress_target_patch(
+                current,
+                target_index,
+                {
+                    "status": "failed",
+                    "error": str(exc),
+                    "terminal_evidence": {"status": "failed", "payload": exc.payload},
+                },
+            )
+        except common.GCAPIError as exc:
+            current = persist_ingress_target_patch(
+                current,
+                target_index,
+                {"status": "failed", "error": str(exc)},
+            )
+        else:
+            current = persist_ingress_target_patch(
+                current,
+                target_index,
+                {
+                    "status": "delivered",
+                    "terminal_evidence": {"status": "succeeded", "payload": terminal_payload},
+                },
+            )
+        targets = [dict(item) for item in current.get("targets", []) if isinstance(item, dict)]
+    return current
+
+
+def recover_pending_ingress_receipts(
+    *,
+    bot_user_id: str,
+    app_name: str = "",
+    cancel_event: threading.Event | None = None,
+) -> list[str]:
+    del bot_user_id
+    normalized_app_name = common.validate_app_name(app_name)
+    recovered: list[str] = []
+    for receipt in common.list_chat_ingress():
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        if str(receipt.get("app", "")).strip() != normalized_app_name:
+            continue
+        receipt_status = str(receipt.get("status", "")).strip()
+        needs_routing_state = (
+            ingress_delivery_protocol_version(receipt) == INGRESS_DELIVERY_PROTOCOL_VERSION
+            and receipt_status == "delivered"
+            and str(receipt.get("route_kind", "")).strip() == "room_launch_thread"
+            and not str(receipt.get("routing_state_applied_at", "")).strip()
+        )
+        if receipt_status != "pending" and not needs_routing_state:
+            continue
+        ingress_id = str(receipt.get("ingress_id", "")).strip()
+        if not ingress_id:
+            continue
+        process_lock = ingress_process_lock(ingress_id)
+        if not process_lock.acquire(blocking=False):
+            continue
+        try:
+            latest = common.load_chat_ingress(ingress_id) or receipt
+            latest_status = str(latest.get("status", "")).strip()
+            if latest_status == "delivered":
+                _, applied = apply_ingress_routing_state(latest)
+                if applied:
+                    recovered.append(ingress_id)
+                continue
+            if latest_status != "pending":
+                continue
+            protocol_version = ingress_delivery_protocol_version(latest)
+            targets = [dict(target) for target in latest.get("targets", []) if isinstance(target, dict)]
+            if protocol_version == INGRESS_DELIVERY_PROTOCOL_VERSION and any(
+                str(target.get("status", "")).strip() in {"pending", "submitting", "awaiting_result"}
+                for target in targets
+            ):
+                latest = resume_ingress_delivery(latest, cancel_event=cancel_event)
+                latest, _ = apply_ingress_routing_state(latest)
+            elif utc_age_seconds(str(latest.get("updated_at", "")).strip()) >= STALE_PROCESSING_RECEIPT_SECONDS:
+                for target in targets:
+                    if str(target.get("status", "")).strip() in {"delivered", "failed"}:
+                        continue
+                    target["status"] = "delivery_unknown"
+                    target["reason"] = "missing_async_correlation"
+                latest = {
+                    **latest,
+                    "targets": targets,
+                    "status": "delivery_unknown",
+                    "reason": "missing_async_correlation",
+                }
+                persist_ingress_receipt(latest)
+            else:
+                continue
+            recovered.append(ingress_id)
+        finally:
+            process_lock.release()
+    return recovered
+
+
 def save_rejected_ingress_receipt(
     message: dict[str, Any],
     bot_user_id: str,
@@ -983,6 +1317,7 @@ def process_room_launch_message(
     bot_user_id: str,
     ingress_id: str,
     message_debug: dict[str, Any] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     body = strip_bot_mentions(str(message.get("content", "")), bot_user_id)
     if not body:
@@ -1122,19 +1457,6 @@ def process_room_launch_message(
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
 
     target_selector = participant_delivery_selector(launch)
-    receipt = persist_ingress_receipt(
-        {
-            **base_receipt,
-            "binding_id": str(launcher.get("id", "")).strip(),
-            "status": "pending",
-            "delivery": "targeted",
-            "route_kind": "room_launch",
-            "launch_id": launch_id,
-            "mentioned_handles": mentioned_handles,
-            "qualified_handle": qualified_handle,
-            "targets": [{"session_name": target_selector, "status": "pending"}],
-        }
-    )
     envelope = build_room_launch_envelope(
         launcher=launcher,
         launch=launch,
@@ -1143,21 +1465,34 @@ def process_room_launch_message(
         mentioned_handles=mentioned_handles,
         ingress_id=ingress_id,
     )
-    try:
-        response = common.deliver_session_message(
-            target_selector,
-            envelope,
-            idempotency_key=f"ingress:{ingress_id}:target:{target_selector}",
-        )
-    except common.GCAPIError as exc:
-        receipt["status"] = "failed"
-        receipt["targets"] = [{"session_name": target_selector, "status": "failed", "error": str(exc)}]
-        receipt = persist_ingress_receipt(receipt)
-        return {"status": "failed", "ingress_id": ingress_id, "receipt": receipt}
-    receipt["status"] = "delivered"
-    receipt["targets"] = [{"session_name": target_selector, "status": "delivered", "response": response}]
-    receipt = persist_ingress_receipt(receipt)
-    return {"status": "delivered", "ingress_id": ingress_id, "receipt": receipt}
+    idempotency_key = f"ingress:{ingress_id}:target:{target_selector}"
+    receipt = persist_ingress_receipt(
+        {
+            **base_receipt,
+            "binding_id": str(launcher.get("id", "")).strip(),
+            "status": "pending",
+            "delivery_protocol_version": INGRESS_DELIVERY_PROTOCOL_VERSION,
+            "delivery": "targeted",
+            "route_kind": "room_launch",
+            "launch_id": launch_id,
+            "mentioned_handles": mentioned_handles,
+            "qualified_handle": qualified_handle,
+            "targets": [
+                {
+                    "session_name": target_selector,
+                    "status": "pending",
+                    "intent": "default",
+                    "idempotency_key": idempotency_key,
+                }
+            ],
+        }
+    )
+    receipt = resume_ingress_delivery(
+        receipt,
+        cancel_event=cancel_event,
+        delivery_envelopes={target_selector: envelope},
+    )
+    return {"status": receipt["status"], "ingress_id": ingress_id, "receipt": receipt}
 
 
 def process_room_launch_thread_message(
@@ -1169,6 +1504,7 @@ def process_room_launch_thread_message(
     bot_user_id: str,
     ingress_id: str,
     message_debug: dict[str, Any] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     refreshed_launch = common.touch_room_launch(str(launch.get("launch_id", "")).strip())
     if isinstance(refreshed_launch, dict):
@@ -1268,20 +1604,6 @@ def process_room_launch_thread_message(
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
     target_selector = participant_delivery_selector(target_participant)
 
-    receipt = persist_ingress_receipt(
-        {
-            **base_receipt,
-            "binding_id": str(launcher.get("id", "")).strip(),
-            "status": "pending",
-            "delivery": "targeted",
-            "route_kind": "room_launch_thread",
-            "launch_id": str(launch.get("launch_id", "")).strip(),
-            "routing_mode": routing_mode,
-            "mentioned_handles": mentioned_handles,
-            "qualified_handle": target_handle,
-            "targets": [{"session_name": target_selector, "status": "pending"}],
-        }
-    )
     envelope = build_room_launch_thread_envelope(
         launcher=launcher,
         launch=launch,
@@ -1293,30 +1615,43 @@ def process_room_launch_thread_message(
         routing_mode=routing_mode,
         reply_to_id=reply_to_id,
     )
-    try:
-        response = common.deliver_session_message(
-            target_selector,
-            envelope,
-            idempotency_key=f"ingress:{ingress_id}:target:{target_selector}",
-        )
-    except common.GCAPIError as exc:
-        receipt["status"] = "failed"
-        receipt["targets"] = [{"session_name": target_selector, "status": "failed", "error": str(exc)}]
-        receipt = persist_ingress_receipt(receipt)
-        return {"status": "failed", "ingress_id": ingress_id, "receipt": receipt}
-    updated_launch = common.set_room_launch_last_addressed(str(launch.get("launch_id", "")).strip(), target_handle)
-    if isinstance(updated_launch, dict):
-        launch = updated_launch
-    receipt["status"] = "delivered"
-    receipt["targets"] = [{"session_name": target_selector, "status": "delivered", "response": response}]
-    receipt = persist_ingress_receipt(receipt)
-    return {"status": "delivered", "ingress_id": ingress_id, "receipt": receipt}
+    idempotency_key = f"ingress:{ingress_id}:target:{target_selector}"
+    receipt = persist_ingress_receipt(
+        {
+            **base_receipt,
+            "binding_id": str(launcher.get("id", "")).strip(),
+            "status": "pending",
+            "delivery_protocol_version": INGRESS_DELIVERY_PROTOCOL_VERSION,
+            "delivery": "targeted",
+            "route_kind": "room_launch_thread",
+            "launch_id": str(launch.get("launch_id", "")).strip(),
+            "routing_mode": routing_mode,
+            "mentioned_handles": mentioned_handles,
+            "qualified_handle": target_handle,
+            "targets": [
+                {
+                    "session_name": target_selector,
+                    "status": "pending",
+                    "intent": "default",
+                    "idempotency_key": idempotency_key,
+                }
+            ],
+        }
+    )
+    receipt = resume_ingress_delivery(
+        receipt,
+        cancel_event=cancel_event,
+        delivery_envelopes={target_selector: envelope},
+    )
+    receipt, _ = apply_ingress_routing_state(receipt)
+    return {"status": receipt["status"], "ingress_id": ingress_id, "receipt": receipt}
 
 
 def process_inbound_message(
     message: dict[str, Any],
     bot_user_id: str,
     app_name: str = "",
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     normalized_app_name = common.validate_app_name(app_name)
     ingress_id = message_ingress_id(message, normalized_app_name)
@@ -1422,6 +1757,7 @@ def process_inbound_message(
             "body_preview": preview,
             "message_debug": dict(message_debug or {}),
             "status": "processing",
+            "delivery_protocol_version": INGRESS_DELIVERY_PROTOCOL_VERSION,
             "targets": [],
             "app": normalized_app_name,
         }
@@ -1582,6 +1918,7 @@ def process_inbound_message(
                 bot_user_id=bot_user_id,
                 ingress_id=ingress_id,
                 message_debug=message_debug,
+                cancel_event=cancel_event,
             )
         if launcher:
             return process_room_launch_message(
@@ -1591,6 +1928,7 @@ def process_inbound_message(
                 bot_user_id=bot_user_id,
                 ingress_id=ingress_id,
                 message_debug=message_debug,
+                cancel_event=cancel_event,
             )
         if not binding:
             receipt = persist_ingress_receipt(
@@ -1663,16 +2001,6 @@ def process_inbound_message(
             )
             return {"status": "skipped_no_targets", "ingress_id": ingress_id, "receipt": receipt}
 
-        receipt = persist_ingress_receipt(
-            {
-                **base_receipt,
-                "binding_id": str(binding.get("id", "")).strip(),
-                "status": "pending",
-                "mentioned_aliases": mentioned_aliases,
-                "delivery": delivery,
-                "targets": [{"session_name": target, "status": "pending"} for target in targets],
-            }
-        )
         envelope = build_human_envelope(
             binding=binding,
             message=message,
@@ -1682,40 +2010,30 @@ def process_inbound_message(
             delivery=delivery,
             ingress_id=ingress_id,
         )
-        updated_targets: list[dict[str, Any]] = []
-        failures = 0
-        for target in targets:
-            idempotency_key = f"ingress:{ingress_id}:target:{target}"
-            try:
-                response = common.deliver_session_message(
-                    target,
-                    envelope,
-                    idempotency_key=idempotency_key,
-                    intent="follow_up",
-                )
-                updated_targets.append(
+        receipt = persist_ingress_receipt(
+            {
+                **base_receipt,
+                "binding_id": str(binding.get("id", "")).strip(),
+                "status": "pending",
+                "delivery_protocol_version": INGRESS_DELIVERY_PROTOCOL_VERSION,
+                "mentioned_aliases": mentioned_aliases,
+                "delivery": delivery,
+                "targets": [
                     {
                         "session_name": target,
-                        "status": "delivered",
-                        "idempotency_key": idempotency_key,
-                        "response": response,
+                        "status": "pending",
+                        "intent": "follow_up",
+                        "idempotency_key": f"ingress:{ingress_id}:target:{target}",
                     }
-                )
-            except common.GCAPIError as exc:
-                failures += 1
-                updated_targets.append(
-                    {
-                        "session_name": target,
-                        "status": "failed",
-                        "idempotency_key": idempotency_key,
-                        "error": str(exc),
-                    }
-                )
-        receipt["targets"] = updated_targets
-        receipt["status"] = "delivered" if failures == 0 else ("partial_failed" if failures < len(targets) else "failed")
-        receipt["delivery"] = delivery
-        receipt["mentioned_aliases"] = mentioned_aliases
-        receipt = persist_ingress_receipt(receipt)
+                    for target in targets
+                ],
+            }
+        )
+        receipt = resume_ingress_delivery(
+            receipt,
+            cancel_event=cancel_event,
+            delivery_envelopes={target: envelope for target in targets},
+        )
         return {"status": receipt["status"], "ingress_id": ingress_id, "receipt": receipt}
     finally:
         process_lock.release()
@@ -1942,6 +2260,8 @@ class GatewayWorker:
         self._stop_lock = threading.Lock()
         self.message_queue: queue.Queue[tuple[dict[str, Any], str] | None] = queue.Queue(maxsize=GATEWAY_MAX_PENDING_MESSAGES)
         self.worker_threads: list[threading.Thread] = []
+        self._recovery_lock = threading.Lock()
+        self.recovery_thread: threading.Thread | None = None
         self._current_ws_lock = threading.Lock()
         self._current_ws: GatewayWebSocket | None = None
         consumer_count = GATEWAY_NAMED_WORKER_THREADS if self.app_name else GATEWAY_WORKER_THREADS
@@ -1949,7 +2269,7 @@ class GatewayWorker:
             worker_name = f"discord-gateway-worker-{index + 1}"
             if self.app_name:
                 worker_name = f"{worker_name}-{self.app_name}"
-            thread = threading.Thread(target=self.message_worker_loop, name=worker_name)
+            thread = threading.Thread(target=self.message_worker_loop, name=worker_name, daemon=True)
             thread.start()
             self.worker_threads.append(thread)
 
@@ -1967,6 +2287,34 @@ class GatewayWorker:
         self.stop_event.set()
         self.close_current_ws()
 
+    def start_pending_recovery(self, bot_user_id: str) -> None:
+        with self._recovery_lock:
+            if self.recovery_thread is not None:
+                return
+
+            def recovery_loop() -> None:
+                while not self.stop_event.is_set():
+                    try:
+                        recover_pending_ingress_receipts(
+                            bot_user_id=bot_user_id,
+                            app_name=self.app_name,
+                            cancel_event=self.stop_event,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        self.runtime_state.patch(
+                            last_recovery_error=str(exc),
+                            last_recovery_exception=traceback.format_exc(limit=20),
+                            last_recovery_at=common.utcnow(),
+                        )
+                    if self.stop_event.wait(PENDING_RECOVERY_INTERVAL_SECONDS):
+                        return
+
+            thread_name = "discord-gateway-pending-recovery"
+            if self.app_name:
+                thread_name = f"{thread_name}-{self.app_name}"
+            self.recovery_thread = threading.Thread(target=recovery_loop, name=thread_name, daemon=True)
+            self.recovery_thread.start()
+
     def stop(self) -> None:
         with self._stop_lock:
             if self._stopped:
@@ -1974,12 +2322,36 @@ class GatewayWorker:
             self._stopped = True
         self.runtime_state.patch(state="stopping", connected=False)
         self.request_stop()
+        while True:
+            try:
+                item = self.message_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if item is not WORKER_QUEUE_SENTINEL:
+                    message, bot_user_id = item
+                    self.reject_message_during_shutdown(message, bot_user_id)
+            finally:
+                self.message_queue.task_done()
         for _ in self.worker_threads:
-            self.message_queue.put(WORKER_QUEUE_SENTINEL)
-        self.message_queue.join()
+            self.message_queue.put_nowait(WORKER_QUEUE_SENTINEL)
+        deadline = time.monotonic() + GATEWAY_WORKER_STOP_TIMEOUT_SECONDS
         for thread in self.worker_threads:
-            thread.join()
-        self.runtime_state.patch(state="stopped", connected=False, message_queue_size=self.message_queue.qsize())
+            thread.join(timeout=max(deadline - time.monotonic(), 0.0))
+        if self.recovery_thread is not None:
+            self.recovery_thread.join(timeout=max(deadline - time.monotonic(), 0.0))
+        alive_threads = [thread.name for thread in self.worker_threads if thread.is_alive()]
+        if self.recovery_thread is not None and self.recovery_thread.is_alive():
+            alive_threads.append(self.recovery_thread.name)
+        state = "stop_timeout" if alive_threads else "stopped"
+        patch: dict[str, Any] = {
+            "state": state,
+            "connected": False,
+            "message_queue_size": self.message_queue.qsize(),
+        }
+        if alive_threads:
+            patch["last_error"] = f"timed out stopping worker threads: {', '.join(alive_threads)}"
+        self.runtime_state.patch(**patch)
 
     def current_bot_user_id(
         self,
@@ -2064,7 +2436,10 @@ class GatewayWorker:
                 if item is WORKER_QUEUE_SENTINEL:
                     return
                 message, bot_user_id = item
-                self.handle_gateway_message(message, bot_user_id)
+                if self.stop_event.is_set():
+                    self.reject_message_during_shutdown(message, bot_user_id)
+                else:
+                    self.handle_gateway_message(message, bot_user_id)
             finally:
                 self.message_queue.task_done()
                 self.runtime_state.patch(message_queue_size=self.message_queue.qsize())
@@ -2221,7 +2596,12 @@ class GatewayWorker:
             if isinstance(extmsg_result, dict):
                 outcome = extmsg_result
             else:
-                outcome = process_inbound_message(message, bot_user_id, self.app_name)
+                outcome = process_inbound_message(
+                    message,
+                    bot_user_id,
+                    self.app_name,
+                    cancel_event=self.stop_event,
+                )
             status = str(outcome.get("status", "")).strip()
             preview = summarize_body(str((outcome.get("receipt") or {}).get("body_preview", "")))
             if status == "duplicate":
@@ -2247,20 +2627,7 @@ class GatewayWorker:
 
     def dispatch_gateway_message(self, message: dict[str, Any], bot_user_id: str) -> None:
         if self.stop_event.is_set():
-            save_rejected_ingress_receipt(
-                message,
-                bot_user_id,
-                status="rejected_shutting_down",
-                reason="service_shutting_down",
-                app_name=self.app_name,
-            )
-            self.runtime_state.bump(
-                "dropped_messages",
-                last_message_status="shutting_down",
-                last_message_preview=ingress_preview(message, bot_user_id),
-                last_event_at=common.utcnow(),
-                message_queue_size=self.message_queue.qsize(),
-            )
+            self.reject_message_during_shutdown(message, bot_user_id)
             return
         try:
             self.message_queue.put_nowait((message, bot_user_id))
@@ -2285,6 +2652,22 @@ class GatewayWorker:
                 last_event_at=common.utcnow(),
                 message_queue_size=self.message_queue.qsize(),
             )
+
+    def reject_message_during_shutdown(self, message: dict[str, Any], bot_user_id: str) -> None:
+        save_rejected_ingress_receipt(
+            message,
+            bot_user_id,
+            status="rejected_shutting_down",
+            reason="service_shutting_down",
+            app_name=self.app_name,
+        )
+        self.runtime_state.bump(
+            "dropped_messages",
+            last_message_status="shutting_down",
+            last_message_preview=ingress_preview(message, bot_user_id),
+            last_event_at=common.utcnow(),
+            message_queue_size=self.message_queue.qsize(),
+        )
 
     def prune_runtime_data(self) -> None:
         common.prune_requests()
@@ -2331,6 +2714,7 @@ class GatewayWorker:
                         break
                     continue
 
+                self.start_pending_recovery(application_id)
                 can_resume = bool(resume_session_id and seq is not None)
                 connection_url = (
                     self.gateway_connect_url(resume_gateway_url)
