@@ -13,12 +13,13 @@ import re
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 INTERACTIONS_SERVICE_NAME = "discord-interactions"
 ADMIN_SERVICE_NAME = "discord-admin"
@@ -73,6 +74,24 @@ class DiscordAPIError(RuntimeError):
 
 class GCAPIError(RuntimeError):
     pass
+
+
+class GCAPITransportError(GCAPIError):
+    pass
+
+
+class GCAPIResultUnknown(GCAPIError):
+    pass
+
+
+class GCAPIRequestCancelled(GCAPIResultUnknown):
+    pass
+
+
+class GCAPIRequestFailed(GCAPIError):
+    def __init__(self, message: str, payload: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.payload = copy.deepcopy(payload)
 
 
 def utcnow() -> str:
@@ -1708,9 +1727,15 @@ def touch_room_launch(launch_id: str, *, activity_at: str = "") -> dict[str, Any
         return save_room_launch(body)
 
 
-def set_room_launch_last_addressed(launch_id: str, qualified_handle: str) -> dict[str, Any] | None:
+def set_room_launch_last_addressed(
+    launch_id: str,
+    qualified_handle: str,
+    *,
+    delivery_order: str = "",
+) -> dict[str, Any] | None:
     normalized_launch_id = str(launch_id).strip()
     normalized_handle = str(qualified_handle).strip()
+    normalized_delivery_order = str(delivery_order).strip()
     if not normalized_launch_id or not normalized_handle:
         return None
     with advisory_lock(room_launch_lock_path(normalized_launch_id)):
@@ -1719,8 +1744,15 @@ def set_room_launch_last_addressed(launch_id: str, qualified_handle: str) -> dic
             return None
         if normalized_handle not in room_launch_participants(current):
             return current
+        current_delivery_order = str(current.get("last_addressed_delivery_order", "")).strip()
+        if current_delivery_order and (
+            not normalized_delivery_order or normalized_delivery_order <= current_delivery_order
+        ):
+            return current
         body = copy.deepcopy(current)
         body["last_addressed_qualified_handle"] = normalized_handle
+        if normalized_delivery_order:
+            body["last_addressed_delivery_order"] = normalized_delivery_order
         return save_room_launch(body)
 
 
@@ -1994,6 +2026,17 @@ def list_recent_chat_ingress(limit: int = 20) -> list[dict[str, Any]]:
             entries.append(data)
     entries.sort(key=lambda item: item.get("created_at", ""), reverse=True)
     return entries[:limit]
+
+
+def list_chat_ingress() -> list[dict[str, Any]]:
+    ensure_layout()
+    entries: list[dict[str, Any]] = []
+    for path in pathlib.Path(chat_ingress_dir()).glob("*.json"):
+        data = read_json(str(path), allow_invalid=True)
+        if isinstance(data, dict):
+            entries.append(data)
+    entries.sort(key=lambda item: item.get("created_at", ""))
+    return entries
 
 
 def prune_chat_ingress() -> None:
@@ -2403,13 +2446,13 @@ def gc_api_url(path: str) -> str:
     return urllib.parse.urljoin(base_url.rstrip("/") + "/", normalized_path.lstrip("/"))
 
 
-def gc_api_request(
+def gc_api_request_with_status(
     method: str,
     path: str,
     payload: Any = None,
     headers: dict[str, str] | None = None,
     timeout: float = GC_API_REQUEST_TIMEOUT_SECONDS,
-) -> Any:
+) -> tuple[int, Any]:
     url = gc_api_url(path)
     body = None
     request_headers = {
@@ -2426,22 +2469,44 @@ def gc_api_request(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
+            status_code = getattr(response, "status", None)
+            if not isinstance(status_code, int):
+                getcode = getattr(response, "getcode", None)
+                candidate = getcode() if callable(getcode) else None
+                status_code = candidate if isinstance(candidate, int) else 200
     except urllib.error.HTTPError as exc:
         raw = exc.read()
         message = raw.decode("utf-8", errors="replace")
         raise GCAPIError(f"{method.upper()} {url} failed with {exc.code}: {message}") from exc
     except urllib.error.URLError as exc:
-        raise GCAPIError(f"{method.upper()} {url} failed: {exc}") from exc
+        raise GCAPITransportError(f"{method.upper()} {url} failed: {exc}") from exc
     except TimeoutError as exc:
-        raise GCAPIError(f"{method.upper()} {url} timed out") from exc
+        raise GCAPITransportError(f"{method.upper()} {url} timed out") from exc
     except OSError as exc:
-        raise GCAPIError(f"{method.upper()} {url} failed: {exc}") from exc
+        raise GCAPITransportError(f"{method.upper()} {url} failed: {exc}") from exc
     if not raw:
-        return {}
+        return status_code, {}
     try:
-        return json.loads(raw.decode("utf-8"))
+        return status_code, json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise GCAPIError(f"{method.upper()} {url} returned invalid JSON") from exc
+
+
+def gc_api_request(
+    method: str,
+    path: str,
+    payload: Any = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = GC_API_REQUEST_TIMEOUT_SECONDS,
+) -> Any:
+    _, response_payload = gc_api_request_with_status(
+        method,
+        path,
+        payload=payload,
+        headers=headers,
+        timeout=timeout,
+    )
+    return response_payload
 
 
 def wait_for_gc_request_result(
@@ -2451,6 +2516,7 @@ def wait_for_gc_request_result(
     success_type: str,
     failure_operation: str,
     timeout: float = GC_API_ASYNC_RESULT_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     normalized_request_id = str(request_id).strip()
     if not normalized_request_id:
@@ -2469,58 +2535,104 @@ def wait_for_gc_request_result(
     )
     data_lines: list[str] = []
     deadline = time.monotonic() + max(float(timeout), 0.0)
+    if cancel_event is not None and cancel_event.is_set():
+        raise GCAPIRequestCancelled(f"waiting for gc request {normalized_request_id} was cancelled")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            for raw_line in response:
-                if time.monotonic() >= deadline:
-                    raise GCAPIError(f"GET {url} timed out")
-                if isinstance(raw_line, bytes):
+            stream_done = threading.Event()
+            cancel_watcher: threading.Thread | None = None
+            if cancel_event is not None:
+                def close_stream_on_cancel() -> None:
+                    while not stream_done.wait(0.05):
+                        if cancel_event.is_set():
+                            close = getattr(response, "close", None)
+                            if callable(close):
+                                try:
+                                    close()
+                                except (OSError, ValueError):
+                                    pass
+                            return
+
+                cancel_watcher = threading.Thread(
+                    target=close_stream_on_cancel,
+                    name=f"gc-request-cancel-{normalized_request_id}",
+                    daemon=True,
+                )
+                cancel_watcher.start()
+            try:
+                for raw_line in response:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise GCAPIRequestCancelled(f"waiting for gc request {normalized_request_id} was cancelled")
+                    if time.monotonic() >= deadline:
+                        raise GCAPIResultUnknown(f"GET {url} timed out before request {normalized_request_id} completed")
+                    if isinstance(raw_line, bytes):
+                        try:
+                            line = raw_line.decode("utf-8")
+                        except UnicodeDecodeError as exc:
+                            raise GCAPIResultUnknown("gc event stream returned invalid UTF-8 before request completed") from exc
+                    else:
+                        line = str(raw_line)
+                    line = line.rstrip("\r\n")
+                    if line.startswith("data:"):
+                        data_lines.append(line.removeprefix("data:").lstrip())
+                        continue
+                    if line or not data_lines:
+                        continue
                     try:
-                        line = raw_line.decode("utf-8")
-                    except UnicodeDecodeError as exc:
-                        raise GCAPIError("gc event stream returned invalid UTF-8") from exc
-                else:
-                    line = str(raw_line)
-                line = line.rstrip("\r\n")
-                if line.startswith("data:"):
-                    data_lines.append(line.removeprefix("data:").lstrip())
-                    continue
-                if line or not data_lines:
-                    continue
-                try:
-                    envelope = json.loads("\n".join(data_lines))
-                except json.JSONDecodeError as exc:
-                    raise GCAPIError("gc event stream returned invalid JSON") from exc
-                finally:
-                    data_lines = []
-                if not isinstance(envelope, dict):
-                    continue
-                event_type = str(envelope.get("type", "")).strip()
-                payload = envelope.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-                if str(payload.get("request_id", "")).strip() != normalized_request_id:
-                    continue
-                if event_type == success_type:
-                    return payload
-                if event_type != GC_EVENT_REQUEST_FAILED:
-                    continue
-                if str(payload.get("operation", "")).strip() != failure_operation:
-                    continue
-                error_code = str(payload.get("error_code", "")).strip() or "request_failed"
-                error_message = str(payload.get("error_message", "")).strip() or "asynchronous request failed"
-                raise GCAPIError(f"{failure_operation} failed: {error_code}: {error_message}")
+                        envelope = json.loads("\n".join(data_lines))
+                    except json.JSONDecodeError as exc:
+                        raise GCAPIResultUnknown("gc event stream returned invalid JSON before request completed") from exc
+                    finally:
+                        data_lines = []
+                    if not isinstance(envelope, dict):
+                        continue
+                    event_type = str(envelope.get("type", "")).strip()
+                    payload = envelope.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    if str(payload.get("request_id", "")).strip() != normalized_request_id:
+                        continue
+                    if event_type == success_type:
+                        return payload
+                    if event_type != GC_EVENT_REQUEST_FAILED:
+                        continue
+                    if str(payload.get("operation", "")).strip() != failure_operation:
+                        continue
+                    error_code = str(payload.get("error_code", "")).strip() or "request_failed"
+                    error_message = str(payload.get("error_message", "")).strip() or "asynchronous request failed"
+                    raise GCAPIRequestFailed(
+                        f"{failure_operation} failed: {error_code}: {error_message}",
+                        payload,
+                    )
+            finally:
+                stream_done.set()
+                if cancel_watcher is not None:
+                    cancel_watcher.join(timeout=0.2)
     except urllib.error.HTTPError as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise GCAPIRequestCancelled(f"waiting for gc request {normalized_request_id} was cancelled") from exc
         raw = exc.read()
         message = raw.decode("utf-8", errors="replace")
-        raise GCAPIError(f"GET {url} failed with {exc.code}: {message}") from exc
+        raise GCAPIResultUnknown(f"GET {url} failed with {exc.code} before request completed: {message}") from exc
     except urllib.error.URLError as exc:
-        raise GCAPIError(f"GET {url} failed: {exc}") from exc
+        if cancel_event is not None and cancel_event.is_set():
+            raise GCAPIRequestCancelled(f"waiting for gc request {normalized_request_id} was cancelled") from exc
+        raise GCAPIResultUnknown(f"GET {url} failed before request completed: {exc}") from exc
     except TimeoutError as exc:
-        raise GCAPIError(f"GET {url} timed out") from exc
+        if cancel_event is not None and cancel_event.is_set():
+            raise GCAPIRequestCancelled(f"waiting for gc request {normalized_request_id} was cancelled") from exc
+        raise GCAPIResultUnknown(f"GET {url} timed out before request completed") from exc
     except OSError as exc:
-        raise GCAPIError(f"GET {url} failed: {exc}") from exc
-    raise GCAPIError(f"gc event stream closed before request {normalized_request_id} completed")
+        if cancel_event is not None and cancel_event.is_set():
+            raise GCAPIRequestCancelled(f"waiting for gc request {normalized_request_id} was cancelled") from exc
+        raise GCAPIResultUnknown(f"GET {url} failed before request completed: {exc}") from exc
+    except ValueError as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise GCAPIRequestCancelled(f"waiting for gc request {normalized_request_id} was cancelled") from exc
+        raise GCAPIResultUnknown(f"GET {url} closed before request completed: {exc}") from exc
+    if cancel_event is not None and cancel_event.is_set():
+        raise GCAPIRequestCancelled(f"waiting for gc request {normalized_request_id} was cancelled")
+    raise GCAPIResultUnknown(f"gc event stream closed before request {normalized_request_id} completed")
 
 
 def load_session_transcript_raw(session_selector: str, tail: int = 20) -> list[dict[str, Any]]:
@@ -4619,12 +4731,13 @@ def _peer_delivery_needs_attention(record: dict[str, Any]) -> bool:
         return False
     phase = str(peer_delivery.get("phase", "")).strip()
     status = str(peer_delivery.get("status", "")).strip()
-    if phase == "peer_fanout_partial_failure":
+    if phase in {"peer_fanout_in_progress", "peer_fanout_partial_failure"}:
         return True
     if status.startswith("failed_"):
         return True
     return any(
-        str(entry.get("status", "")).strip() in {"failed_retryable", "failed_permanent", "delivery_unknown"}
+        str(entry.get("status", "")).strip()
+        in {"pending", "in_progress", "awaiting_result", "failed_retryable", "failed_permanent", "delivery_unknown"}
         for entry in peer_delivery.get("targets", [])
         if isinstance(entry, dict)
     )
@@ -4643,7 +4756,7 @@ def _finalize_peer_delivery(record: dict[str, Any]) -> dict[str, Any]:
         if isinstance(entry, dict)
     }
     status = str(peer_delivery.get("status", "")).strip()
-    if {"pending", "in_progress"} & terminal_statuses:
+    if {"pending", "in_progress", "awaiting_result"} & terminal_statuses:
         peer_delivery["phase"] = "peer_fanout_in_progress"
     elif status.startswith("failed_"):
         peer_delivery["phase"] = "peer_fanout_partial_failure"
@@ -4688,11 +4801,59 @@ def _update_target_in_progress(
                 "idempotency_key": idempotency_key,
                 "attempt_count": attempt_count,
                 "attempted_at": utcnow(),
+                "request_id": "",
+                "event_cursor": "",
+                "response": {},
+                "terminal_evidence": {},
+                "reason": "",
             },
         )
         current["peer_delivery"] = peer_delivery
         current = _save_chat_publish_record(current)
         return current, attempt_count
+
+
+def _patch_peer_delivery_target(
+    *,
+    publish_id: str,
+    fallback_record: dict[str, Any],
+    session_name: str,
+    patch: dict[str, Any],
+    expected_request_id: str = "",
+) -> dict[str, Any]:
+    with advisory_lock(_safe_lock_name("chat-publish", publish_id)):
+        current = load_chat_publish(publish_id) or copy.deepcopy(fallback_record)
+        peer_delivery = _peer_delivery_payload(current)
+        target_entry = next(
+            (item for item in peer_delivery.get("targets", []) if str(item.get("session_name", "")).strip() == session_name),
+            None,
+        )
+        if expected_request_id and str((target_entry or {}).get("request_id", "")).strip() != expected_request_id:
+            return current
+        _update_peer_target(peer_delivery, session_name, patch)
+        current["peer_delivery"] = peer_delivery
+        return _save_chat_publish_record(current)
+
+
+def _record_peer_async_acceptance(
+    *,
+    publish_id: str,
+    fallback_record: dict[str, Any],
+    session_name: str,
+    accepted: dict[str, Any],
+) -> dict[str, Any]:
+    return _patch_peer_delivery_target(
+        publish_id=publish_id,
+        fallback_record=fallback_record,
+        session_name=session_name,
+        patch={
+            "status": "awaiting_result",
+            "request_id": str(accepted.get("request_id", "")).strip(),
+            "event_cursor": str(accepted.get("event_cursor", "")).strip(),
+            "intent": str(accepted.get("intent", "default")).strip() or "default",
+            "response": accepted.get("response") if isinstance(accepted.get("response"), dict) else {},
+        },
+    )
 
 
 def _update_target_delivery_result(
@@ -4959,13 +5120,61 @@ def _apply_peer_fanout(
             idempotency_key=idempotency_key,
             launch=launch_record,
         )
+
+        def record_async_acceptance(accepted: dict[str, Any], session_name: str = target_key) -> None:
+            nonlocal current
+            current = _record_peer_async_acceptance(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=session_name,
+                accepted=accepted,
+            )
+
+        def record_async_terminal(evidence: dict[str, Any], session_name: str = target_key) -> None:
+            nonlocal current
+            request_id = str(
+                next(
+                    (
+                        item.get("request_id", "")
+                        for item in _peer_delivery_payload(current).get("targets", [])
+                        if str(item.get("session_name", "")).strip() == session_name
+                    ),
+                    "",
+                )
+            ).strip()
+            terminal_status = "delivered" if str(evidence.get("status", "")).strip() == "succeeded" else "failed_retryable"
+            current = _patch_peer_delivery_target(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=session_name,
+                expected_request_id=request_id,
+                patch={"status": terminal_status, "terminal_evidence": evidence},
+            )
+
         try:
             response = deliver_session_message(
                 delivery_selector,
                 envelope,
                 idempotency_key=idempotency_key,
                 timeout=PEER_DELIVERY_TIMEOUT_SECONDS,
+                async_timeout=PEER_DELIVERY_TIMEOUT_SECONDS,
+                on_async_accepted=record_async_acceptance,
+                on_async_terminal=record_async_terminal,
             )
+        except GCAPIResultUnknown as exc:
+            peer_delivery = _peer_delivery_payload(current)
+            target_entry = next(
+                (item for item in peer_delivery.get("targets", []) if str(item.get("session_name", "")).strip() == target_key),
+                {},
+            )
+            target_status = "awaiting_result" if str(target_entry.get("request_id", "")).strip() else "delivery_unknown"
+            current = _patch_peer_delivery_target(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=target_key,
+                patch={"status": target_status, "reason": str(exc)},
+            )
+            continue
         except GCAPIError as exc:
             current = _update_target_delivery_result(
                 publish_id=publish_id,
@@ -5008,6 +5217,7 @@ def retry_peer_fanout(
     if launch_id:
         launch_record = load_room_launch(launch_id)
     retry_targets: list[tuple[str, str, str, str, list[str], str, str, str]] = []
+    resume_targets: list[tuple[str, str, str, str]] = []
     with advisory_lock(_safe_lock_name("chat-publish", publish_id)):
         current = load_chat_publish(publish_id) or record
         current, changed = _promote_stale_in_progress_targets(current)
@@ -5034,7 +5244,17 @@ def retry_peer_fanout(
                     target_selector = resolved_name
             if selected and session_name not in selected:
                 continue
-            if str(entry.get("status", "")).strip() not in eligible:
+            entry_status = str(entry.get("status", "")).strip()
+            request_id = str(entry.get("request_id", "")).strip()
+            event_cursor = str(entry.get("event_cursor", "")).strip()
+            intent = str(entry.get("intent", "default")).strip() or "default"
+            if entry_status == "awaiting_result" or (
+                include_unknown and entry_status == "delivery_unknown" and request_id and event_cursor
+            ):
+                if request_id and event_cursor:
+                    resume_targets.append((session_name, request_id, event_cursor, intent))
+                continue
+            if entry_status not in eligible:
                 continue
             idempotency_key = str(entry.get("idempotency_key", "")).strip()
             if not idempotency_key:
@@ -5051,6 +5271,11 @@ def retry_peer_fanout(
                     "idempotency_key": idempotency_key,
                     "delivery_selector": target_selector,
                     "attempts": attempts,
+                    "request_id": "",
+                    "event_cursor": "",
+                    "response": {},
+                    "terminal_evidence": {},
+                    "reason": "",
                 },
             )
             retry_targets.append(
@@ -5068,6 +5293,55 @@ def retry_peer_fanout(
         current["peer_delivery"] = peer_delivery
         current = _save_chat_publish_record(current)
 
+    for session_name, request_id, event_cursor, intent in resume_targets:
+        try:
+            terminal_payload = resume_session_message_delivery(
+                request_id,
+                event_cursor,
+                intent=intent,
+                timeout=PEER_DELIVERY_TIMEOUT_SECONDS,
+            )
+        except GCAPIResultUnknown as exc:
+            current = _patch_peer_delivery_target(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=session_name,
+                expected_request_id=request_id,
+                patch={"status": "awaiting_result", "reason": str(exc)},
+            )
+        except GCAPIRequestFailed as exc:
+            current = _patch_peer_delivery_target(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=session_name,
+                expected_request_id=request_id,
+                patch={
+                    "status": "failed_retryable",
+                    "reason": str(exc),
+                    "terminal_evidence": {"status": "failed", "payload": exc.payload},
+                },
+            )
+        except GCAPIError as exc:
+            current = _patch_peer_delivery_target(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=session_name,
+                expected_request_id=request_id,
+                patch={"status": "failed_retryable", "reason": str(exc)},
+            )
+        else:
+            current = _patch_peer_delivery_target(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=session_name,
+                expected_request_id=request_id,
+                patch={
+                    "status": "delivered",
+                    "delivered_at": utcnow(),
+                    "terminal_evidence": {"status": "succeeded", "payload": terminal_payload},
+                },
+            )
+
     for session_name, target_selector, idempotency_key, delivery, mentioned_session_names, root_ingress_receipt_id, source_session_name, source_session_id in retry_targets:
         envelope = _build_peer_envelope(
             binding=binding,
@@ -5081,13 +5355,61 @@ def retry_peer_fanout(
             idempotency_key=idempotency_key,
             launch=launch_record,
         )
+
+        def record_retry_async_acceptance(accepted: dict[str, Any], retry_session_name: str = session_name) -> None:
+            nonlocal current
+            current = _record_peer_async_acceptance(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=retry_session_name,
+                accepted=accepted,
+            )
+
+        def record_retry_async_terminal(evidence: dict[str, Any], retry_session_name: str = session_name) -> None:
+            nonlocal current
+            peer_delivery = _peer_delivery_payload(current)
+            target_entry = next(
+                (
+                    item
+                    for item in peer_delivery.get("targets", [])
+                    if str(item.get("session_name", "")).strip() == retry_session_name
+                ),
+                {},
+            )
+            request_id = str(target_entry.get("request_id", "")).strip()
+            terminal_status = "delivered" if str(evidence.get("status", "")).strip() == "succeeded" else "failed_retryable"
+            current = _patch_peer_delivery_target(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=retry_session_name,
+                expected_request_id=request_id,
+                patch={"status": terminal_status, "terminal_evidence": evidence},
+            )
+
         try:
             response = deliver_session_message(
                 target_selector,
                 envelope,
                 idempotency_key=idempotency_key,
                 timeout=PEER_DELIVERY_TIMEOUT_SECONDS,
+                async_timeout=PEER_DELIVERY_TIMEOUT_SECONDS,
+                on_async_accepted=record_retry_async_acceptance,
+                on_async_terminal=record_retry_async_terminal,
             )
+        except GCAPIResultUnknown as exc:
+            peer_delivery = _peer_delivery_payload(current)
+            target_entry = next(
+                (item for item in peer_delivery.get("targets", []) if str(item.get("session_name", "")).strip() == session_name),
+                {},
+            )
+            target_status = "awaiting_result" if str(target_entry.get("request_id", "")).strip() else "delivery_unknown"
+            current = _patch_peer_delivery_target(
+                publish_id=publish_id,
+                fallback_record=current,
+                session_name=session_name,
+                patch={"status": target_status, "reason": str(exc)},
+            )
+            continue
         except GCAPIError as exc:
             current = _update_target_delivery_result(
                 publish_id=publish_id,
@@ -5243,6 +5565,31 @@ def publish_binding_message(
     return {"binding": binding, "record": record, "response": response}
 
 
+def resume_session_message_delivery(
+    request_id: str,
+    event_cursor: str,
+    *,
+    intent: str = "default",
+    timeout: float = GC_API_ASYNC_RESULT_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    normalized_intent = str(intent or "default").strip() or "default"
+    if normalized_intent == "default":
+        success_type = GC_EVENT_SESSION_MESSAGE_SUCCEEDED
+        failure_operation = GC_OPERATION_SESSION_MESSAGE
+    else:
+        success_type = GC_EVENT_SESSION_SUBMIT_SUCCEEDED
+        failure_operation = GC_OPERATION_SESSION_SUBMIT
+    return wait_for_gc_request_result(
+        request_id,
+        event_cursor=event_cursor,
+        success_type=success_type,
+        failure_operation=failure_operation,
+        timeout=timeout,
+        cancel_event=cancel_event,
+    )
+
+
 def deliver_session_message(
     session_name: str,
     message: str,
@@ -5250,7 +5597,13 @@ def deliver_session_message(
     timeout: float = GC_API_REQUEST_TIMEOUT_SECONDS,
     *,
     intent: str = "default",
+    async_timeout: float = GC_API_ASYNC_RESULT_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
+    on_async_accepted: Callable[[dict[str, Any]], None] | None = None,
+    on_async_terminal: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    if cancel_event is not None and cancel_event.is_set():
+        raise GCAPIRequestCancelled("session delivery was cancelled before submission")
     headers: dict[str, str] = {}
     key = str(idempotency_key).strip()
     if key:
@@ -5261,30 +5614,49 @@ def deliver_session_message(
     if normalized_intent != "default":
         path = f"/v0/session/{urllib.parse.quote(str(session_name).strip(), safe='')}/submit"
         payload_body["intent"] = normalized_intent
-    payload = gc_api_request(
-        "POST",
-        path,
-        payload=payload_body,
-        headers=headers,
-        timeout=timeout,
-    )
-    if not isinstance(payload, dict):
-        return {}
-    request_id = str(payload.get("request_id", "")).strip()
-    if request_id:
-        if normalized_intent == "default":
-            success_type = GC_EVENT_SESSION_MESSAGE_SUCCEEDED
-            failure_operation = GC_OPERATION_SESSION_MESSAGE
-        else:
-            success_type = GC_EVENT_SESSION_SUBMIT_SUCCEEDED
-            failure_operation = GC_OPERATION_SESSION_SUBMIT
-        wait_for_gc_request_result(
-            request_id,
-            event_cursor=str(payload.get("event_cursor", "")),
-            success_type=success_type,
-            failure_operation=failure_operation,
-            timeout=GC_API_ASYNC_RESULT_TIMEOUT_SECONDS,
+    try:
+        status_code, payload = gc_api_request_with_status(
+            "POST",
+            path,
+            payload=payload_body,
+            headers=headers,
+            timeout=timeout,
         )
+    except GCAPITransportError as exc:
+        raise GCAPIResultUnknown(f"session delivery outcome is unknown: {exc}") from exc
+    if not isinstance(payload, dict):
+        if status_code == 202:
+            raise GCAPIResultUnknown("gc async HTTP 202 response requires request_id and event_cursor")
+        return {}
+    if status_code != 202:
+        return payload
+    request_id = str(payload.get("request_id", "")).strip()
+    event_cursor = str(payload.get("event_cursor", "")).strip()
+    if not request_id or not event_cursor:
+        raise GCAPIResultUnknown("gc async HTTP 202 response requires request_id and event_cursor")
+    accepted_request = {
+        "http_status": status_code,
+        "request_id": request_id,
+        "event_cursor": event_cursor,
+        "intent": normalized_intent,
+        "response": payload,
+    }
+    if on_async_accepted is not None:
+        on_async_accepted(accepted_request)
+    try:
+        terminal_payload = resume_session_message_delivery(
+            request_id,
+            event_cursor=event_cursor,
+            intent=normalized_intent,
+            timeout=async_timeout,
+            cancel_event=cancel_event,
+        )
+    except GCAPIRequestFailed as exc:
+        if on_async_terminal is not None:
+            on_async_terminal({"status": "failed", "payload": exc.payload})
+        raise
+    if on_async_terminal is not None:
+        on_async_terminal({"status": "succeeded", "payload": terminal_payload})
     return payload
 
 

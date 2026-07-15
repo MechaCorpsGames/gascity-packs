@@ -672,6 +672,30 @@ class DiscordChatScriptTests(unittest.TestCase):
         payload = common.json.loads(stdout.getvalue())
         self.assertEqual(payload["peer_delivery"]["status"], "delivered")
 
+    def test_retry_peer_fanout_script_returns_nonzero_while_async_result_is_awaiting(self) -> None:
+        record = {
+            "publish_id": "discord-publish-awaiting",
+            "peer_delivery": {
+                "phase": "peer_fanout_in_progress",
+                "status": "",
+                "targets": [
+                    {
+                        "session_name": "corp--priya",
+                        "status": "awaiting_result",
+                        "request_id": "req-peer",
+                        "event_cursor": "91",
+                    }
+                ],
+            },
+        }
+
+        with mock.patch.object(common, "retry_peer_fanout", return_value=record):
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = retry_peer_fanout_script.main(["discord-publish-awaiting"])
+
+        self.assertEqual(code, 2)
+
     def test_retry_peer_fanout_script_accepts_launch_room_binding(self) -> None:
         common.set_room_launcher(common.load_config(), "1", "22")
         common.save_chat_publish(
