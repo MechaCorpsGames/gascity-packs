@@ -7729,6 +7729,15 @@ description = "Override sink that writes the base triage report contract."
       "gc.ralph_step_id": "review.build-basic-review-loop",
       "code_review.simplicity_verdict": "approve"
     }
+  },
+  {
+    "id": "apply",
+    "metadata": {
+      "gc.root_bead_id": "root",
+      "gc.attempt": "1",
+      "gc.ralph_step_id": "review.build-basic-review-loop",
+      "code_review.verdict": "done"
+    }
   }
 ]"""
 
@@ -7737,6 +7746,36 @@ description = "Override sink that writes the base triage report contract."
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Implementation review needs another iteration", result.stdout)
         self.assertIn("test_evidence=iterate", result.stdout)
+
+    def test_implementation_review_check_ignores_unrelated_same_attempt_done(self) -> None:
+        show_json = """[
+  {
+    "id": "loop",
+    "metadata": {
+      "gc.root_bead_id": "root",
+      "gc.step_id": "review.build-basic-review-loop"
+    }
+  }
+]"""
+        list_json = """[
+  {
+    "id": "unrelated-apply",
+    "metadata": {
+      "gc.root_bead_id": "different-root",
+      "gc.attempt": "1",
+      "gc.ralph_step_id": "review.build-basic-review-loop",
+      "code_review.verdict": "done"
+    }
+  }
+]"""
+
+        result = self._run_implementation_review_check(
+            show_json=show_json,
+            list_json=list_json,
+        )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("missing verdict", result.stdout)
 
     @staticmethod
     def _valid_requirements_artifact() -> str:

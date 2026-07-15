@@ -245,59 +245,7 @@ approve() {
 
 MATCHES="$(gc bd list --all --metadata-field "gc.root_bead_id=$PARENT_ROOT" --json --limit=0 2>/dev/null || printf '[]')"
 
-VERDICT="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
-  [
-    .[]
-    | select((.metadata["gc.attempt"] // "") == $attempt)
-    | select((.metadata["code_review.verdict"] // "") != "")
-    | .metadata["code_review.verdict"]
-  ] | last // ""
-' 2>/dev/null)"
-
-REPORT="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
-  [
-    .[]
-    | select((.metadata["gc.attempt"] // "") == $attempt)
-    | select((.metadata["code_review.report_path"] // "") != "")
-    | .metadata["code_review.report_path"]
-  ] | last // ""
-' 2>/dev/null)"
-
-REVIEW_MODE="$(metadata_value "$ROOT_JSON" "gc.var.review_mode")"
-if [ -z "$REVIEW_MODE" ]; then
-  REVIEW_MODE="$(metadata_value "$PARENT_JSON" "gc.var.review_mode")"
-fi
-if [ "$REVIEW_MODE" = "report" ]; then
-  REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.build.code_review_report_path")"
-  if [ -z "$REPORT_MODE_PATH" ]; then
-    REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.build.review_report_path")"
-  fi
-  if [ -z "$REPORT_MODE_PATH" ]; then
-    REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.var.report_path")"
-  fi
-  if [ -z "$REPORT_MODE_PATH" ]; then
-    REPORT_MODE_PATH="$(printf '%s\n' "$MATCHES" | jq -r --arg attempt "$ATTEMPT" '
-      [
-        .[]
-        | select((.metadata["gc.attempt"] // "") == $attempt)
-        | (
-            .metadata["code_review.review_report_path"] //
-            .metadata["code_review.report_path"] //
-            .metadata["code_review.output_path"] //
-            ""
-          )
-        | select(. != "")
-      ] | last // ""
-    ' 2>/dev/null)"
-  fi
-  if [ -n "$REPORT_MODE_PATH" ]; then
-    approve "Implementation review report mode satisfied: $REPORT_MODE_PATH"
-  fi
-  echo "Implementation review report mode needs a review report path"
-  exit 1
-fi
-
-LANE_STATUS="$(printf '%s\n' "$MATCHES" | jq -r \
+if ! CURRENT_MATCHES="$(printf '%s\n' "$MATCHES" | jq -c \
   --arg root "$PARENT_ROOT" \
   --arg attempt "$ATTEMPT" \
   --arg scope "$SCOPE_REF" \
@@ -322,12 +270,75 @@ LANE_STATUS="$(printf '%s\n' "$MATCHES" | jq -r \
           true
         end
       );
+  [.[] | current_loop] | sort_by([.updated_at // "", .id // ""])
+')"; then
+  echo "review check: current-attempt review metadata is malformed" >&2
+  exit 1
+fi
+
+VERDICT="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r '
+  [
+    .[] | select((.metadata["code_review.verdict"] // "") != "")
+  ]
+  | sort_by([.updated_at // "", .id // ""])
+  | [
+    .[]
+    | select((.metadata["code_review.verdict"] // "") != "")
+    | .metadata["code_review.verdict"]
+  ] | last // ""
+' 2>/dev/null)"
+
+REPORT="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r '
+  [
+    .[] | select((.metadata["code_review.report_path"] // "") != "")
+  ]
+  | sort_by([.updated_at // "", .id // ""])
+  | [
+    .[]
+    | select((.metadata["code_review.report_path"] // "") != "")
+    | .metadata["code_review.report_path"]
+  ] | last // ""
+' 2>/dev/null)"
+
+REVIEW_MODE="$(metadata_value "$ROOT_JSON" "gc.var.review_mode")"
+if [ -z "$REVIEW_MODE" ]; then
+  REVIEW_MODE="$(metadata_value "$PARENT_JSON" "gc.var.review_mode")"
+fi
+if [ "$REVIEW_MODE" = "report" ]; then
+  REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.build.code_review_report_path")"
+  if [ -z "$REPORT_MODE_PATH" ]; then
+    REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.build.review_report_path")"
+  fi
+  if [ -z "$REPORT_MODE_PATH" ]; then
+    REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.var.report_path")"
+  fi
+  if [ -z "$REPORT_MODE_PATH" ]; then
+    REPORT_MODE_PATH="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r '
+      [
+        .[]
+        | (
+            .metadata["code_review.review_report_path"] //
+            .metadata["code_review.report_path"] //
+            .metadata["code_review.output_path"] //
+            ""
+          )
+        | select(. != "")
+      ] | last // ""
+    ' 2>/dev/null)"
+  fi
+  if [ -n "$REPORT_MODE_PATH" ]; then
+    approve "Implementation review report mode satisfied: $REPORT_MODE_PATH"
+  fi
+  echo "Implementation review report mode needs a review report path"
+  exit 1
+fi
+
+LANE_STATUS="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r '
   def approved($value):
     (($value // "") | ascii_downcase) as $v
-    | ($v == "approve" or $v == "approved" or $v == "pass" or $v == "done");
+    | ($v == "approve" or $v == "approved" or $v == "pass");
   [
     .[]
-    | current_loop
     | .metadata
     | {
         acceptance: (."code_review.acceptance_verdict" // ""),
@@ -350,6 +361,11 @@ LANE_STATUS="$(printf '%s\n' "$MATCHES" | jq -r \
       ""
     end
 ' 2>/dev/null)"
+
+if [ -n "$LANE_STATUS" ] && [ "$LANE_STATUS" != "approved" ]; then
+  echo "Implementation review needs another iteration: $LANE_STATUS"
+  exit 1
+fi
 
 if [ "$VERDICT" != "done" ]; then
   case "$VERDICT" in
