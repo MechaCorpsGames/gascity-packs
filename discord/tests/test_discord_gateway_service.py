@@ -2812,6 +2812,113 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             gateway_service.HTTPStatus.NO_CONTENT,
         )
 
+    def test_reconnecting_named_worker_does_not_stop_ready_default_worker(self) -> None:
+        config = common.import_app_config(
+            common.load_config(),
+            {"application_id": "111"},
+            bot_token="default-test-token",
+        )
+        config = common.import_app_config(
+            config,
+            {"application_id": "222"},
+            app_name="ollie",
+            bot_token="ollie-test-token",
+        )
+
+        with mock.patch.object(gateway_service, "GATEWAY_WORKER_THREADS", 0), mock.patch.object(
+            gateway_service,
+            "GATEWAY_NAMED_WORKER_THREADS",
+            0,
+        ), mock.patch.object(gateway_service, "GATEWAY_IDENTIFY_STAGGER_SECONDS", 0):
+            workers = gateway_service.build_gateway_workers(config)
+        workers_by_app = {worker.app_name: worker for worker in workers}
+        default_worker = workers_by_app[""]
+        named_worker = workers_by_app["ollie"]
+
+        ready_frames = iter(
+            [
+                {"op": 10, "d": {"heartbeat_interval": 60_000}},
+                {
+                    "op": 0,
+                    "t": "READY",
+                    "s": 1,
+                    "d": {"user": {"id": "111"}, "session_id": "default-session"},
+                },
+            ]
+        )
+        ready_closed = threading.Event()
+
+        def receive_ready_frame(timeout: float | None = None) -> dict[str, object]:
+            del timeout
+            try:
+                return next(ready_frames)
+            except StopIteration:
+                ready_closed.wait()
+                raise gateway_service.WebSocketClosed("websocket closed")
+
+        ready_websocket = mock.Mock()
+        ready_websocket.recv_event.side_effect = receive_ready_frame
+        ready_websocket.close.side_effect = ready_closed.set
+
+        named_attempts = 0
+        named_retried = threading.Event()
+
+        def fail_named_gateway_url(_bot_token: str = "") -> str:
+            nonlocal named_attempts
+            named_attempts += 1
+            if named_attempts >= 2:
+                named_retried.set()
+            raise RuntimeError("named gateway unavailable")
+
+        top_level_threads = [
+            threading.Thread(target=default_worker.run_forever, name="discord-gateway-test-default"),
+            threading.Thread(target=named_worker.run_forever, name="discord-gateway-test-ollie"),
+        ]
+        with mock.patch.object(default_worker, "gateway_url", return_value="wss://ready.example"), mock.patch.object(
+            named_worker,
+            "gateway_url",
+            side_effect=fail_named_gateway_url,
+        ), mock.patch.object(default_worker, "prune_runtime_data"), mock.patch.object(
+            gateway_service,
+            "GatewayWebSocket",
+            return_value=ready_websocket,
+        ), mock.patch.object(gateway_service, "RECONNECT_BASE_DELAY_SECONDS", 0.01), mock.patch.object(
+            gateway_service,
+            "RECONNECT_MAX_DELAY_SECONDS",
+            0.01,
+        ), mock.patch.object(gateway_service.random, "uniform", return_value=1.0):
+            try:
+                for thread in top_level_threads:
+                    thread.start()
+
+                self.assertTrue(named_retried.wait(2.0), "named gateway did not retry")
+                deadline = time.monotonic() + 2.0
+                while True:
+                    default_state = default_worker.runtime_state.snapshot()
+                    named_state = named_worker.runtime_state.snapshot()
+                    if default_state["state"] == "ready" and named_state["state"] == "reconnecting":
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail(f"gateway states did not converge: default={default_state}, named={named_state}")
+                    time.sleep(0.01)
+
+                self.assertTrue(top_level_threads[0].is_alive())
+                self.assertTrue(top_level_threads[1].is_alive())
+                self.assertFalse(default_worker.stop_event.is_set())
+                self.assertFalse(named_worker.stop_event.is_set())
+                self.assertTrue(default_state["connected"])
+                self.assertIn("named gateway unavailable", named_state["last_error"])
+            finally:
+                for worker in workers:
+                    worker.request_stop()
+                for thread in top_level_threads:
+                    if thread.ident is not None:
+                        thread.join(timeout=2.0)
+                for worker in workers:
+                    worker.stop()
+
+        self.assertTrue(all(not thread.is_alive() for thread in top_level_threads))
+
     def test_aggregate_health_fails_when_all_configured_apps_are_stale(self) -> None:
         states = {
             "default": {"state": "reconnecting", "last_ready_epoch": 1},
