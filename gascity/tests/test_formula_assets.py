@@ -3694,6 +3694,91 @@ class FormulaAssetTests(unittest.TestCase):
                 malformed_root_after_review.stderr,
             )
 
+    def test_separate_session_adapters_persist_exact_source_anchor_proof_before_closure(
+        self,
+    ) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        adapter_prompts = {
+            "gascity": "do-work/implement.md",
+            "superpowers": "superpowers-development/record-item-result.md",
+            "compound-engineering": "compound-work/implement.md",
+            "bmad": "bmad-story-development/apply-story-findings.md",
+        }
+        # Keep the supported adapters aligned with the existing gstack-work
+        # source-anchor proof contract.
+        producer_contract = (
+            "source anchor bead itself",
+            "gc bd update <source-anchor-id>",
+            "gc.implementation.worktree_path",
+            "gc.implementation.commit",
+            "gc.implementation.summary_path",
+            "git rev-parse HEAD",
+            "Read the source anchor bead back",
+            "same worktree",
+            "worktree's `HEAD`",
+            "inside that worktree",
+        )
+
+        for pack_name, prompt_path in adapter_prompts.items():
+            workflow_root = (
+                packs_root / "gascity" / "assets" / "workflows"
+                if pack_name == "gascity"
+                else packs_root / pack_name / "assets" / "workflows"
+            )
+            producer = (workflow_root / prompt_path).read_text(encoding="utf-8")
+
+            missing_producer_contract = [
+                fragment for fragment in producer_contract if fragment not in producer
+            ]
+            with self.subTest(pack=pack_name, prompt=prompt_path):
+                self.assertEqual(missing_producer_contract, [])
+
+    def test_separate_session_adapter_summaries_hash_every_exact_member_artifact(
+        self,
+    ) -> None:
+        gascity_root = pathlib.Path(__file__).resolve().parents[1]
+        packs_root = gascity_root.parent
+        build_formulas = {
+            "superpowers": "superpowers-build",
+            "compound-engineering": "compound-build",
+            "bmad": "bmad-build",
+        }
+        # These are the concrete per-member trace requirements already used by
+        # gstack-build's canonical implementation summary.
+        summary_contract = (
+            "every exact member",
+            "gc.implementation.summary_path",
+            "current absolute recorded per-item",
+            "`sha256` digest of its current bytes",
+        )
+
+        for pack_name, formula_name in build_formulas.items():
+            formula_dirs = [
+                gascity_root / "formulas",
+                packs_root / pack_name / "formulas",
+            ]
+            resolved = resolve_formula_from_dirs(formula_dirs, formula_name)
+            summarize = next(
+                step
+                for step in resolved["steps"]
+                if step["id"] == "summarize-implementation"
+            )
+            description_file = summarize["description_file"]
+            summary_path = next(
+                (formula_dir / description_file).resolve()
+                for formula_dir in reversed(formula_dirs)
+                if (formula_dir / description_file).resolve().is_file()
+            )
+            summary = summary_path.read_text(encoding="utf-8")
+            missing_contract = [
+                fragment for fragment in summary_contract if fragment not in summary
+            ]
+            with self.subTest(
+                pack=pack_name,
+                prompt=summary_path.relative_to(packs_root),
+            ):
+                self.assertEqual(missing_contract, [])
+
     def test_gstack_implementation_prompts_preserve_worktree_and_summary_contract(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
         workflow_root = packs_root / "gstack" / "assets" / "workflows"

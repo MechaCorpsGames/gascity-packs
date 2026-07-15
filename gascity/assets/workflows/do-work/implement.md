@@ -42,7 +42,10 @@ and the final proof command, with the observed pass/fail result.
 
 Write the summary as a `gc.build.implementation-summary.v1` artifact and record
 its absolute path on the workflow root bead as `gc.implementation.summary_path`
-before closing.
+before closing. If no path is recorded, use
+`<WORKTREE>/implementation-summary.md`; if a path is already recorded, resolve
+it and require it to be inside the authoritative worktree. Never use a
+launcher, attempt-local, or sibling worktree summary as this member's proof.
 Include a Markdown coverage table. The validator only recognizes a table with
 an `ID` column and a `Status` column. Use this shape:
 
@@ -75,3 +78,19 @@ Trace front matter must use the validator shape exactly:
   Markdown coverage table.
 
 Artifact validation: this step is gated by `.gc/scripts/checks/build-artifact-valid.sh`, which validates the summary recorded at `gc.implementation.summary_path` (fallbacks `gc.build.implementation_summary_path`, then `gc.var.summary_path`) against schema `gc.build.implementation-summary.v1`. Before closing this step, read the launcher rig root from the workflow root bead's `gc.work_dir`, then run the same validator locally from that rig root with `GC_BEAD_ID=<claimed-step-id> .gc/scripts/checks/build-artifact-valid.sh`; fix every reported validation error before setting `gc.outcome=pass`. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the summary in place instead of rewriting it. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the summary.
+
+After the focused product commit and final proof pass, read the full commit
+from `WORKTREE` with `git rev-parse HEAD`. Persist the proof tuple on the source anchor bead itself in one update:
+
+```bash
+gc bd update <source-anchor-id> \
+  --set-metadata "gc.implementation.worktree_path=$WORKTREE" \
+  --set-metadata "gc.implementation.commit=<full-HEAD-from-WORKTREE>" \
+  --set-metadata "gc.implementation.summary_path=<absolute-summary-inside-WORKTREE>"
+```
+
+Read the source anchor bead back. Require `work_dir` and
+`gc.implementation.worktree_path` to resolve to the same worktree, the recorded
+commit to equal that worktree's `HEAD`, and the recorded summary to exist
+inside that worktree. Do not close this implementation step with pass until
+the exact tuple has been read back successfully.

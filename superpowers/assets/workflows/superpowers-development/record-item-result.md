@@ -9,4 +9,24 @@ Create a focused commit for this task when the verification evidence is clean
 and the repository state is ready. Use the approved plan's commit guidance when
 it gives an exact message; otherwise use a concise message scoped to the task.
 
+Before recording success, resolve the exact source anchor again and read its
+absolute `work_dir` as `WORKTREE`. The per-item implementation summary must be
+at the current absolute `gc.implementation.summary_path` inside that worktree;
+do not use a launcher or attempt-local artifact as the member summary. From the
+same worktree, read the focused commit with `git rev-parse HEAD`.
+
+Persist the proof tuple on the source anchor bead itself in one update:
+
+```bash
+gc bd update <source-anchor-id> \
+  --set-metadata "gc.implementation.worktree_path=$WORKTREE" \
+  --set-metadata "gc.implementation.commit=<full-HEAD-from-WORKTREE>" \
+  --set-metadata "gc.implementation.summary_path=<absolute-summary-inside-WORKTREE>"
+```
+
+Read the source anchor bead back. Require `work_dir` and
+`gc.implementation.worktree_path` to resolve to the same worktree, the recorded
+commit to equal that worktree's `HEAD`, and the recorded summary to exist
+inside that worktree before the later close-source-anchor step may close it.
+
 Do not invoke provider-native subagents or upstream plugin runtime commands.

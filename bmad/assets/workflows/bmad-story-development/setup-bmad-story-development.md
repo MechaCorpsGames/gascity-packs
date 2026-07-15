@@ -63,12 +63,15 @@ that directory and record each on the workflow root before child lanes run:
 Select the canonical summary path from workflow root metadata
 `gc.implementation.summary_path` (fallbacks
 `gc.build.implementation_summary_path`, then `gc.var.summary_path`). Resolve
-every selected non-empty summary path to an absolute path against the launcher
-rig root when it is relative. If all keys are empty, derive
-`<story-artifact-root>/implementation-summary.md`. On retries, read any existing
+every selected non-empty summary path to an absolute path against `WORKTREE`
+when it is relative, and require the result to be contained by `WORKTREE`. If
+all keys are empty, derive `<WORKTREE>/implementation-summary.md`. The story
+artifact root remains the home for context and review reports, but it is not an
+authoritative implementation worktree and must not contain the per-item
+implementation summary. On retries, read any existing
 summary path from the inner workflow root, current producing child, recorded
 implementation control bead, and actual source anchor; normalize relative
-values against the launcher rig root and require exact equality for every
+values against `WORKTREE` and require exact equality for every
 non-empty value.
 
 Always record the selected absolute path as `gc.implementation.summary_path`

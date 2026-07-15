@@ -28,6 +28,16 @@ read the requirements, decomposition, review context, and verification evidence
 before writing the canonical root summary. The canonical summary must cover all
 accepted requirement IDs that the build finalized.
 
+Resolve every exact member of the implementation convoy independently of the
+drain's claimed result, and require the drain manifest to account for that same
+set exactly once. For every exact member, read its current absolute recorded per-item
+`gc.implementation.summary_path` from the source anchor; require it to exist
+inside that member's authoritative worktree. Compute the `sha256` digest of its current bytes
+immediately before writing the canonical summary. Add one
+and only one `trace.upstream` entry with that exact absolute path and
+`hash: sha256:<current-digest>`. Never reuse a path or digest from another
+member, an earlier attempt, an artifact report, or a repository-wide search.
+
 Write the artifact as Markdown with YAML front matter, not JSON. Use mapping objects for front matter; do not use scalar shortcuts such as
 `workflow: build-basic`. The top-level YAML shape must be:
 

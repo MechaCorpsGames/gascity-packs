@@ -28,17 +28,13 @@ Read its path from the inner workflow root bead metadata
 `gc.build.implementation_summary_path`, then `gc.var.summary_path`). If a path
 is already recorded, require and use that exact absolute path.
 
-If all summary path keys are blank, resolve the artifact root from the inner
-workflow root metadata `gc.var.artifact_root` (fallback
-`gc.build.artifact_root`, then rendered `{{artifact_root}}`). Resolve the
-launcher rig root from that same workflow root bead's `gc.work_dir`; when it
-names an attempt worktree, walk to the nearest ancestor containing
-`.gc/scripts/checks/build-artifact-valid.sh`. Resolve a relative artifact root
-against that launcher rig root, derive the absolute path
-`<artifact-root>/task-<source-anchor-id>-summary.md`, and record it on the inner
-workflow root bead as `gc.implementation.summary_path` before writing. Always
-record the final absolute path on the workflow root bead, implement step, and
-source anchor. In particular, never interpret `{{artifact_root}}` relative to the implementation worktree.
+If all summary path keys are blank, derive the absolute summary path as
+`<WORKTREE>/implementation-summary.md`. If a summary path is already recorded,
+resolve it and require it to be inside `WORKTREE`; never accept a launcher or
+attempt-local artifact as the per-item summary. The launcher artifact root
+still owns aggregate build artifacts; never interpret `{{artifact_root}}` relative to the implementation worktree.
+Record the final absolute path on the
+workflow root bead, implement step, and source anchor before writing.
 
 The artifact's first line must be `---`. Use nested mappings with this shape:
 
@@ -114,5 +110,22 @@ GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-artifact-v
 Fix every validation error in the exact recorded summary before setting
 `gc.outcome=pass`. Leave the source anchor open for the close-source-anchor
 step. Do not invoke provider-native subagents.
+
+After the final product verification and focused commit, read the full commit
+from the authoritative worktree with `git rev-parse HEAD`. Persist the exact
+proof tuple on the source anchor bead itself in one update:
+
+```bash
+gc bd update <source-anchor-id> \
+  --set-metadata "gc.implementation.worktree_path=$WORKTREE" \
+  --set-metadata "gc.implementation.commit=<full-HEAD-from-WORKTREE>" \
+  --set-metadata "gc.implementation.summary_path=<absolute-summary-inside-WORKTREE>"
+```
+
+Read the source anchor bead back. Require its `work_dir` and recorded worktree
+path to resolve to the same worktree, its commit to equal that worktree's
+`HEAD` (the recorded commit must equal the worktree's `HEAD`), and its summary
+to exist inside that worktree. Do not report pass until
+all three checks succeed.
 
 Artifact validation: this step is gated by `.gc/scripts/checks/build-artifact-valid.sh`, which validates the summary recorded at `gc.implementation.summary_path` (fallbacks `gc.build.implementation_summary_path`, then `gc.var.summary_path`) against schema `gc.build.implementation-summary.v1`. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the summary in place instead of rewriting it. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the summary.

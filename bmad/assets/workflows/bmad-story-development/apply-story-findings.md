@@ -55,6 +55,25 @@ Fix every summary validation error before reporting a successful fix pass. On
 repair attempts, read `gc.attempt_log` from the dependent validation control
 bead and repair the same summary in place.
 
+After the final product verification, create the focused product commit when
+this iteration changed code or tests, then read the authoritative commit with
+`git rev-parse HEAD` from `WORKTREE`. The implementation summary is proof for
+that commit and must remain at its current absolute path inside that worktree.
+Persist the proof tuple on the source anchor bead itself in one update:
+
+```bash
+gc bd update <source-anchor-id> \
+  --set-metadata "gc.implementation.worktree_path=$WORKTREE" \
+  --set-metadata "gc.implementation.commit=<full-HEAD-from-WORKTREE>" \
+  --set-metadata "gc.implementation.summary_path=<absolute-summary-inside-WORKTREE>"
+```
+
+Read the source anchor bead back. Require `work_dir` and
+`gc.implementation.worktree_path` to resolve to the same worktree, the recorded
+commit to equal that worktree's `HEAD`, and the recorded summary to exist
+inside that worktree. A clean no-op review must preserve and revalidate the
+same tuple; never infer a commit from another worktree or `git log --all`.
+
 If there are no required findings, close with `gc.outcome=pass`,
 `bmad_story.verdict=done`, and
 `bmad_story.report_path=<fix summary path>`. Also set
