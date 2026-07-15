@@ -559,7 +559,7 @@ def verify(
     expected_artifacts: list[Path],
     *,
     enforce_recorded_snapshots: bool = True,
-) -> tuple[str, str]:
+) -> tuple[str, str, list[dict[str, str]]]:
     root = one_bead(root_id)
     launcher_work_dir = required_absolute_path(root, "gc.work_dir", label="workflow root")
     launcher_top = git_top_level(launcher_work_dir, label="launcher")
@@ -762,6 +762,7 @@ def verify(
         label="canonical implementation summary",
     )
 
+    snapshot_members.sort(key=lambda item: item["id"])
     current_snapshot = implementation_snapshot(snapshot_members)
     root_snapshot = metadata(root, "gc.build.implementation_snapshot")
     if enforce_recorded_snapshots and (
@@ -783,7 +784,7 @@ def verify(
             "review input snapshot mismatch: "
             f"root={root_review_input or '<missing>'} current={current_review_input}"
         )
-    return current_snapshot, current_review_input
+    return current_snapshot, current_review_input, snapshot_members
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -812,7 +813,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     try:
-        snapshot, review_input = verify(
+        snapshot, review_input, members = verify(
             args.root_id,
             args.expected_snapshot,
             args.expected_summary,
@@ -827,6 +828,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "implementation_snapshot": snapshot,
+                "members": members,
                 "ok": True,
                 "review_input_snapshot": review_input,
             },

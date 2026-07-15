@@ -39,6 +39,15 @@ Hash those UTF-8 bytes and record the result on the workflow root as
 `gc.build.review_input_snapshot=sha256:<digest>`. Do not place that combined
 digest inside the context itself (that creates a self-hash cycle).
 
+Do not trust a model-computed digest. After the draft context and root paths
+exist, run the installed helper from the launcher Git root:
+`python3 "<launcher-root>/.gc/scripts/verify_implementation_provenance.py" --emit-current --root-id "<workflow-root-id>" --expected-summary "<canonical-summary>" --validator "<launcher-root>/.gc/scripts/validate_build_artifact.py"`.
+Use its exact sorted `members` and `implementation_snapshot` in the context,
+rewrite the context once, then run the command again. Publish only that second
+`implementation_snapshot` and `review_input_snapshot`. Read the root back and
+rerun the helper without `--emit-current`, adding
+`--expected-snapshot <implementation_snapshot>`; any failure blocks closure.
+
 This starter factory intentionally uses only three review lanes so new users can
 see fanout/fanin without a large reviewer roster.
 

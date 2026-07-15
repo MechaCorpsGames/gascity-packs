@@ -502,12 +502,17 @@ if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
   TEST_EVIDENCE_STEP="$REVIEW_PREFIX.test-evidence-review"
   SIMPLICITY_STEP="$REVIEW_PREFIX.simplicity-review"
   SYNTHESIS_STEP="$REVIEW_PREFIX.synthesize-review"
-  APPLY_STEP="$REVIEW_PREFIX.apply-review-findings"
+  if [ "$REVIEW_MODE" = "report" ]; then
+    APPLY_STEP="$REVIEW_PREFIX.report-review-findings"
+  else
+    APPLY_STEP="$REVIEW_PREFIX.apply-review-findings"
+  fi
 
   if ! STRICT_REVIEW_STATUS="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r \
     --arg attempt "$ATTEMPT" \
     --arg snapshot "$CURRENT_IMPLEMENTATION_SNAPSHOT" \
     --arg review_input "$CURRENT_REVIEW_INPUT_SNAPSHOT" \
+    --arg review_mode "$REVIEW_MODE" \
     --arg acceptance_step "$ACCEPTANCE_STEP" \
     --arg test_step "$TEST_EVIDENCE_STEP" \
     --arg simplicity_step "$SIMPLICITY_STEP" \
@@ -530,7 +535,13 @@ if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
       (($rows[0].metadata["code_review.review_input_snapshot"] // "") == $review_input);
     def lane_ok($rows; $verdict_key):
       base_ok($rows) and
-      (($rows[0].metadata[$verdict_key] // "") == "approve") and
+      (
+        (($rows[0].metadata[$verdict_key] // "") == "approve") or
+        (
+          $review_mode == "report" and
+          (($rows[0].metadata[$verdict_key] // "") == "iterate")
+        )
+      ) and
       nonempty($rows[0].metadata["code_review.output_path"] // "");
     rows_for($acceptance_step) as $acceptance
     | rows_for($test_step) as $test_evidence
@@ -545,7 +556,8 @@ if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
         nonempty($synthesis[0].metadata["code_review.synthesis_path"] // "") and
         nonempty($synthesis[0].metadata["code_review.output_path"] // "") and
         base_ok($apply) and
-        (($apply[0].metadata["code_review.verdict"] // "") == "done") and
+        (($apply[0].metadata["code_review.verdict"] // "") ==
+          (if $review_mode == "report" then "reported" else "done" end)) and
         nonempty($apply[0].metadata["code_review.report_path"] // "") and
         nonempty($apply[0].metadata["code_review.output_path"] // "")
       ) then
@@ -606,6 +618,9 @@ if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
   validate_review_evidence_path \
     "$(review_evidence_path "$CURRENT_MATCHES" "$APPLY_STEP" "code_review.output_path")" \
     "review apply output" "$ARTIFACT_ROOT" "apply-review-findings-report.md"
+  if [ "$REVIEW_MODE" = "report" ]; then
+    approve "Implementation review report recorded"
+  fi
   approve "Implementation review approved"
 fi
 

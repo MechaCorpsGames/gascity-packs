@@ -1852,6 +1852,7 @@ class FormulaAssetTests(unittest.TestCase):
             review_step["expand_vars"],
             {
                 "implementation_target": "{{implementation_target}}",
+                "review_mode": "{{review_mode}}",
             },
         )
         self.assertEqual(review_step["needs"], ["summarize-implementation"])
@@ -1898,6 +1899,166 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(step="decompose", fragment=fragment):
                 self.assertIn(fragment, decompose_description)
 
+    def test_build_basic_propagates_review_mode_to_review_expansion(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        build = load_formula(root, "build-basic")
+        review = load_formula(root, "build-basic-review")
+
+        self.assertIn("review_mode", review.get("vars", {}))
+        review_step = next(step for step in build["steps"] if step["id"] == "review")
+        self.assertEqual(review_step["expand_vars"].get("review_mode"), "{{review_mode}}")
+
+    def test_build_basic_review_refreshes_context_before_every_review_lane(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        review = load_formula(root, "build-basic-review")
+        loop = next(
+            template
+            for template in review["template"]
+            if template["id"] == "{target}.build-basic-review-loop"
+        )
+        children = {child["id"]: child for child in loop["children"]}
+        refresh_ids = [child_id for child_id in children if "refresh" in child_id]
+
+        self.assertEqual(
+            len(refresh_ids),
+            1,
+            "the Ralph loop must refresh authoritative review inputs once per iteration",
+        )
+        refresh_id = refresh_ids[0]
+        for lane_id in (
+            "{target}.acceptance-review",
+            "{target}.test-evidence-review",
+            "{target}.simplicity-review",
+        ):
+            with self.subTest(lane=lane_id):
+                self.assertIn(refresh_id, children[lane_id].get("needs", []))
+
+    def test_build_basic_review_mutating_apply_lane_is_disabled_in_report_mode(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        review = load_formula(root, "build-basic-review")
+        loop = next(
+            template
+            for template in review["template"]
+            if template["id"] == "{target}.build-basic-review-loop"
+        )
+        apply_findings = next(
+            child
+            for child in loop["children"]
+            if child["id"] == "{target}.apply-review-findings"
+        )
+
+        self.assertEqual(apply_findings.get("condition"), "{{review_mode}} != report")
+
+    def test_build_basic_review_report_lane_cannot_mutate_implementation(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        review = load_formula(root, "build-basic-review")
+        loop = next(
+            template
+            for template in review["template"]
+            if template["id"] == "{target}.build-basic-review-loop"
+        )
+        report_children = [
+            child
+            for child in loop["children"]
+            if child.get("condition") == "{{review_mode}} == report"
+        ]
+
+        self.assertEqual(
+            len(report_children),
+            1,
+            "report mode needs one distinct non-mutating terminal child",
+        )
+        report_child = report_children[0]
+        self.assertNotEqual(report_child["id"], "{target}.apply-review-findings")
+        self.assertNotIn(
+            report_child["metadata"]["gc.run_target"],
+            {
+                "{implementation_target}",
+                "{{implementation_target}}",
+                review["vars"]["implementation_target"]["default"],
+            },
+        )
+
+        prompt = " ".join(node_description(root, report_child).lower().split())
+        for command in (
+            "git add",
+            "git commit",
+            'gc bd update "<implementation-member-id>"',
+            "gc bd update '<implementation-member-id>'",
+            'gc bd update "<workflow-root-id>"',
+            "gc bd update '<workflow-root-id>'",
+        ):
+            with self.subTest(command=command):
+                self.assertNotIn(command, prompt)
+
+    def test_build_basic_review_refresh_preserves_same_session_commit_history(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        prompt = (
+            root
+            / "assets"
+            / "workflows"
+            / "build-basic-review"
+            / "{target}.refresh-review-context.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(prompt.split())
+
+        separate_rule = (
+            "For `separate`, require every member commit to equal its "
+            "authoritative worktree `HEAD`."
+        )
+        same_session_rule = (
+            "For `same-session`, require one shared worktree, each recorded commit "
+            "to be an ancestor of terminal `HEAD`, and at least one member to equal "
+            "terminal `HEAD`; preserve earlier ancestor-member commits."
+        )
+        emit_current = normalized.index("--emit-current")
+        self.assertIn("gc.var.drain_policy", normalized)
+        for rule in (separate_rule, same_session_rule):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, normalized)
+                self.assertLess(normalized.index(rule), emit_current)
+        self.assertNotIn(
+            "Require every member's `gc.implementation.commit` to equal its "
+            "authoritative worktree `HEAD`",
+            normalized,
+        )
+
+    def test_build_basic_report_mode_preserves_semantic_review_status(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        review_finalizer = (
+            root
+            / "assets"
+            / "workflows"
+            / "build-basic-review"
+            / "{target}.md"
+        ).read_text(encoding="utf-8")
+        build_finalizer = (
+            root / "assets" / "workflows" / "build-basic" / "finalize.md"
+        ).read_text(encoding="utf-8")
+
+        for fragment in (
+            "report mode",
+            "status: changes_required",
+            "even when findings require changes",
+        ):
+            with self.subTest(prompt="review", fragment=fragment):
+                self.assertIn(fragment, review_finalizer)
+        for fragment in (
+            "report mode",
+            "validated review",
+            "status: changes_required",
+            "status: blocked",
+            "gc.build.finalize_status=failed",
+            "gc.build.finalize_outcome=failure",
+            "gc.restart.entrypoint=build-from-review",
+            "gc.restart.review_report_path=<canonical review report path>",
+            "gc.blocked_reason=code_review_changes_required",
+            "gc.failure_class=review_iteration_needed",
+            "gc.outcome=fail",
+        ):
+            with self.subTest(prompt="finalize", fragment=fragment):
+                self.assertIn(fragment, build_finalizer)
+
     def test_build_basic_v2_uses_approachable_factory_techniques(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         review = load_formula(root, "build-basic-review")
@@ -1917,11 +2078,13 @@ class FormulaAssetTests(unittest.TestCase):
         self.assertEqual(
             [child["id"] for child in loop["children"]],
             [
+                "{target}.refresh-review-context",
                 "{target}.acceptance-review",
                 "{target}.test-evidence-review",
                 "{target}.simplicity-review",
                 "{target}.synthesize-review",
                 "{target}.apply-review-findings",
+                "{target}.report-review-findings",
             ],
         )
         for target in (
@@ -1938,8 +2101,13 @@ class FormulaAssetTests(unittest.TestCase):
                         if child.get("metadata", {}).get("gc.run_target")
                     ],
                 )
+        apply_child = next(
+            child
+            for child in loop["children"]
+            if child["id"] == "{target}.apply-review-findings"
+        )
         self.assertEqual(
-            loop["children"][-1]["metadata"]["gc.continuation_group"],
+            apply_child["metadata"]["gc.continuation_group"],
             "build-basic-review-fixes",
         )
 
@@ -1958,7 +2126,7 @@ class FormulaAssetTests(unittest.TestCase):
             "source anchor/worktree",
             "launcher rig root may remain unchanged",
             "not to the launcher rig root",
-            "normalized `gc.build.review.v1` artifact with `status: approved`",
+            "normalized `gc.build.review.v1` Markdown artifact",
             "Do not invoke provider-native subagents",
         ):
             with self.subTest(fragment=fragment):
@@ -2197,6 +2365,7 @@ class FormulaAssetTests(unittest.TestCase):
             "{target}.simplicity-review.md": "simplicity-review-report.md",
             "{target}.synthesize-review.md": "starter-review-synthesis.md",
             "{target}.apply-review-findings.md": "apply-review-findings-report.md",
+            "{target}.report-review-findings.md": "apply-review-findings-report.md",
         }
         for filename, output_name in expected_outputs.items():
             prompt = (workflow_root / filename).read_text(encoding="utf-8")
@@ -2269,6 +2438,17 @@ class FormulaAssetTests(unittest.TestCase):
         self.assertIn("<apply-report>", prompt)
         self.assertLessEqual(len(prompt.encode("utf-8")), 3840)
 
+    def test_build_basic_review_finalizer_has_expansion_headroom(self) -> None:
+        prompt = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "assets"
+            / "workflows"
+            / "build-basic-review"
+            / "{target}.md"
+        ).read_bytes()
+
+        self.assertLessEqual(len(prompt), 3840)
+
     def test_build_basic_required_review_fixes_reconcile_authoritative_provenance(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         apply_findings = (
@@ -2340,6 +2520,39 @@ class FormulaAssetTests(unittest.TestCase):
             "the same Ralph iteration must publish refreshed implementation and "
             "review-input snapshots on the workflow root",
         )
+        member_metadata_published = normalized.index(
+            'gc bd update "<implementation-member-id>"'
+        )
+        ordered_actions = [
+            normalized.index(
+                "Rewrite and validate that member summary at "
+                "`gc.implementation.summary_path`"
+            ),
+            normalized.index("commit all tracked source-worktree bytes"),
+            normalized.index("capture terminal full `HEAD`"),
+            member_metadata_published,
+            normalized.index(
+                "gc.build.implementation_summary_path",
+                member_metadata_published,
+            ),
+            normalized.index("--emit-current"),
+            normalized.index('gc bd update "<workflow-root-id>"'),
+            normalized.index("Make no later source edit or commit"),
+        ]
+        self.assertEqual(ordered_actions, sorted(ordered_actions))
+        self.assertIn("including that member summary", normalized)
+        member_commands = re.findall(
+            r'`(gc bd update "<implementation-member-id>"[^`]+)`',
+            normalized,
+        )
+        self.assertEqual(len(member_commands), 1)
+        for assignment in (
+            "gc.implementation.commit=<current full HEAD>",
+            "gc.verified_commit=<current full HEAD>",
+            "gc.implementation.summary_path=<current absolute member summary>",
+        ):
+            with self.subTest(member_assignment=assignment):
+                self.assertIn(assignment, member_commands[0])
         for fragment in (
             "gc.implementation.summary_path",
             "gc.build.implementation_summary_path",
@@ -2444,14 +2657,18 @@ class FormulaAssetTests(unittest.TestCase):
 
         for fragment in (
             "Trace the exact canonical implementation summary once",
-            "Trace the approved review artifact once",
+            "Trace the validated review artifact once",
             "freshly computed `sha256:<digest>`",
-            "`implementation_snapshot: <exact approved snapshot>`",
-            "`review_input_snapshot: <exact approved review-input snapshot>`",
-            "`reviewed_attempt: <exact approved positive loop attempt>`",
+            "`implementation_snapshot: <exact review snapshot>`",
+            "`review_input_snapshot: <exact review-input snapshot>`",
+            "`reviewed_attempt: <exact positive reviewed attempt>`",
+            "must exactly equal the validated",
+            "review artifact and the still-closed lane/synthesis/selected-terminal group",
         ):
             with self.subTest(artifact="final-report", fragment=fragment):
                 self.assertIn(fragment, final_report)
+        self.assertNotIn("approved review artifact", final_report)
+        self.assertNotIn("lane/synthesis/apply group", final_report)
 
     def test_build_artifact_prompts_use_set_metadata_for_paths(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
@@ -9090,6 +9307,31 @@ description = "Override sink that writes the base triage report contract."
                 rows,
                 parent_json=parent_payload(current_snapshot, report_mode=True),
             )
+            report_rows = json.loads(current_lanes)
+            report_row = report_rows[-1]
+            report_row["id"] = "report"
+            report_row["metadata"]["gc.step_id"] = "review.report-review-findings"
+            report_row["metadata"]["code_review.verdict"] = "reported"
+            report_mode_with_report_child = run_contract_case(
+                report_rows,
+                parent_json=parent_payload(current_snapshot, report_mode=True),
+            )
+            report_rows_with_findings = json.loads(json.dumps(report_rows))
+            report_rows_with_findings[1]["metadata"][
+                "code_review.test_evidence_verdict"
+            ] = "iterate"
+            report_mode_with_findings = run_contract_case(
+                report_rows_with_findings,
+                parent_json=parent_payload(current_snapshot, report_mode=True),
+            )
+            invalid_report_rows = json.loads(json.dumps(report_rows))
+            invalid_report_rows[1]["metadata"][
+                "code_review.test_evidence_verdict"
+            ] = "reported"
+            strict_results["report mode invalid lane verdict"] = run_contract_case(
+                invalid_report_rows,
+                parent_json=parent_payload(current_snapshot, report_mode=True),
+            )
 
             for verdict in ("approved", "pass"):
                 strict_results[f"apply verdict {verdict}"] = run_contract_case(
@@ -9132,6 +9374,17 @@ description = "Override sink that writes the base triage report contract."
             "implementation provenance",
             changed_during_final_approval.stderr,
         )
+        self.assertEqual(
+            report_mode_with_report_child.returncode,
+            0,
+            report_mode_with_report_child.stdout + report_mode_with_report_child.stderr,
+        )
+        self.assertEqual(
+            report_mode_with_findings.returncode,
+            0,
+            report_mode_with_findings.stdout + report_mode_with_findings.stderr,
+        )
+        self.assertIn("report recorded", report_mode_with_findings.stdout.lower())
         for case, result in strict_results.items():
             with self.subTest(case=case, stdout=result.stdout, stderr=result.stderr):
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -9931,6 +10184,44 @@ description = "Override sink that writes the base triage report contract."
             changes_required_review = run_artifact(
                 "review-step", review_control, root_metadata()
             )
+            report_rows_with_findings = json.loads(review_rows)
+            report_terminal_with_findings = next(
+                row for row in report_rows_with_findings if row["id"] == "apply"
+            )
+            report_terminal_with_findings["id"] = "report"
+            report_terminal_with_findings["metadata"]["gc.step_id"] = (
+                "review.report-review-findings"
+            )
+            report_terminal_with_findings["metadata"]["code_review.verdict"] = (
+                "reported"
+            )
+            report_rows_without_findings = json.loads(
+                json.dumps(report_rows_with_findings)
+            )
+            next(
+                row
+                for row in report_rows_with_findings
+                if row["id"] == "test-evidence"
+            )["metadata"]["code_review.test_evidence_verdict"] = "iterate"
+            changes_required_report_review = run_artifact(
+                "review-step",
+                review_control,
+                root_metadata(**{"gc.var.review_mode": "report"}),
+                rows_payload=json.dumps(report_rows_with_findings),
+            )
+            changes_required_report_without_findings = run_artifact(
+                "review-step",
+                review_control,
+                root_metadata(**{"gc.var.review_mode": "report"}),
+                rows_payload=json.dumps(report_rows_without_findings),
+            )
+            review.write_bytes(valid_review_bytes)
+            approved_report_with_findings = run_artifact(
+                "review-step",
+                review_control,
+                root_metadata(**{"gc.var.review_mode": "report"}),
+                rows_payload=json.dumps(report_rows_with_findings),
+            )
             review.write_bytes(valid_review_bytes)
             stale_rows = json.loads(review_rows)
             next(row for row in stale_rows if row["id"] == "apply")["metadata"][
@@ -9971,6 +10262,21 @@ description = "Override sink that writes the base triage report contract."
             valid_review = run_artifact(
                 "review-step", review_control, root_metadata()
             )
+            report_rows = json.loads(review_rows)
+            report_terminal = next(
+                row for row in report_rows if row["id"] == "apply"
+            )
+            report_terminal["id"] = "report"
+            report_terminal["metadata"]["gc.step_id"] = (
+                "review.report-review-findings"
+            )
+            report_terminal["metadata"]["code_review.verdict"] = "reported"
+            valid_report_review = run_artifact(
+                "review-step",
+                review_control,
+                root_metadata(**{"gc.var.review_mode": "report"}),
+                rows_payload=json.dumps(report_rows),
+            )
 
             original_context = review_context.read_bytes()
             review_context.write_bytes(original_context + b"\nRewritten after approval.\n")
@@ -10002,6 +10308,7 @@ description = "Override sink that writes the base triage report contract."
                 recorded_snapshot: str,
                 recorded_review_input: str = review_input_snapshot,
                 review_path: pathlib.Path | None = None,
+                status: str = "approved",
             ) -> str:
                 traced_review = review_path or review
                 review_trace = (
@@ -10017,7 +10324,7 @@ description = "Override sink that writes the base triage report contract."
                     "workflow: {id: root, formula: build-basic}\n"
                     "methodology: {pack: gascity, name: build-basic}\n"
                     "producer: {formula: build-basic, stage: finalize, attempt: 1}\n"
-                    "status: approved\n"
+                    f"status: {status}\n"
                     f"implementation_snapshot: {recorded_snapshot}\n"
                     f"review_input_snapshot: {recorded_review_input}\n"
                     "reviewed_attempt: 1\n"
@@ -10088,6 +10395,61 @@ description = "Override sink that writes the base triage report contract."
                 "final-step", final_control, final_root
             )
 
+            review.write_text(
+                review_text(summary, include_snapshot=True, approved=False),
+                encoding="utf-8",
+            )
+            final_report.write_text(
+                final_text(include_review=True, recorded_snapshot=snapshot),
+                encoding="utf-8",
+            )
+            changes_required_report_final = run_artifact(
+                "final-step",
+                final_control,
+                root_metadata(
+                    **{
+                        "gc.build.final_report_path": str(final_report),
+                        "gc.var.review_mode": "report",
+                    }
+                ),
+                rows_payload=json.dumps(report_rows_with_findings),
+            )
+            final_report.write_text(
+                final_text(
+                    include_review=True,
+                    recorded_snapshot=snapshot,
+                    status="blocked",
+                ),
+                encoding="utf-8",
+            )
+            valid_blocked_report_final = run_artifact(
+                "final-step",
+                final_control,
+                root_metadata(
+                    **{
+                        "gc.build.final_report_path": str(final_report),
+                        "gc.var.review_mode": "report",
+                    }
+                ),
+                rows_payload=json.dumps(report_rows_with_findings),
+            )
+            review.write_bytes(valid_review_bytes)
+            final_report.write_text(
+                final_text(
+                    include_review=True,
+                    recorded_snapshot=snapshot,
+                    status="blocked",
+                ),
+                encoding="utf-8",
+            )
+            blocked_final_over_approved_review = run_artifact(
+                "final-step", final_control, final_root
+            )
+            final_report.write_text(
+                final_text(include_review=True, recorded_snapshot=snapshot),
+                encoding="utf-8",
+            )
+
             outside_final_report = root / "outside-factory-run.md"
             outside_final_report.write_text(
                 final_text(include_review=True, recorded_snapshot=snapshot),
@@ -10142,11 +10504,18 @@ description = "Override sink that writes the base triage report contract."
             ("dot-dot review summary trace", dot_dot_review_summary),
             ("wrong review identity", wrong_review_identity),
             ("changes-required review", changes_required_review),
+            (
+                "changes-required report without findings",
+                changes_required_report_without_findings,
+            ),
+            ("approved report with findings", approved_report_with_findings),
             ("stale closed review rows", stale_closed_rows),
             ("stale earlier review attempt", stale_earlier_attempt),
             ("post-loop input rewrite", post_loop_rewrite),
             ("missing review convoy", missing_review_convoy),
             ("missing final review", missing_final_review),
+            ("approved final over changes-required report", changes_required_report_final),
+            ("blocked final over approved review", blocked_final_over_approved_review),
             ("stale final snapshot", stale_final_snapshot),
             ("stale final review input", stale_final_review_input),
             ("final report outside artifact root", final_outside_artifact_root),
@@ -10165,7 +10534,13 @@ description = "Override sink that writes the base triage report contract."
             changed_during_validation.stdout + changed_during_validation.stderr,
         )
         self.assertIn("file changed during validation", changed_during_validation.stderr)
-        for result in (valid_review, valid_final):
+        for result in (
+            valid_review,
+            valid_report_review,
+            changes_required_report_review,
+            valid_final,
+            valid_blocked_report_final,
+        ):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_build_artifact_check_passes_valid_recorded_artifact(self) -> None:

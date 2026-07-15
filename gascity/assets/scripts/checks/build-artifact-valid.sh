@@ -211,8 +211,9 @@ require_implementation_provenance() {
   expected_reviewed_attempt="$4"
   artifact_kind="$5"
   workflow_root_id="$6"
-  shift 6
-  python3 - "$artifact_path" "$expected_snapshot" "$expected_review_input" "$expected_reviewed_attempt" "$artifact_kind" "$workflow_root_id" "$@" <<'PY'
+  expected_status="$7"
+  shift 7
+  python3 - "$artifact_path" "$expected_snapshot" "$expected_review_input" "$expected_reviewed_attempt" "$artifact_kind" "$workflow_root_id" "$expected_status" "$@" <<'PY'
 import hashlib
 import re
 import sys
@@ -226,7 +227,8 @@ expected_review_input = sys.argv[3]
 expected_reviewed_attempt = sys.argv[4]
 artifact_kind = sys.argv[5]
 workflow_root_id = sys.argv[6]
-required_paths = [Path(value).resolve(strict=True) for value in sys.argv[7:]]
+expected_status = sys.argv[7]
+required_paths = [Path(value).resolve(strict=True) for value in sys.argv[8:]]
 text = artifact_path.read_text(encoding="utf-8", errors="replace")
 match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
 if not match:
@@ -265,7 +267,7 @@ def mapping(value):
 identity_matches = (
     isinstance(front_matter, dict)
     and front_matter.get("schema") == contract["schema"]
-    and front_matter.get("status") == "approved"
+    and front_matter.get("status") == expected_status
     and all(mapping(front_matter.get("workflow")).get(key) == value for key, value in contract["workflow"].items())
     and all(mapping(front_matter.get("methodology")).get(key) == value for key, value in contract["methodology"].items())
     and all(mapping(front_matter.get("producer")).get(key) == value for key, value in contract["producer"].items())
@@ -327,12 +329,23 @@ if not isinstance(upstream, list):
         file=sys.stderr,
     )
     raise SystemExit(1)
+has_blocked_coverage = (
+    isinstance(coverage, list)
+    and any(
+        isinstance(entry, dict) and entry.get("status") == "blocked"
+        for entry in coverage
+    )
+)
 if artifact_kind == "review" and (
     not isinstance(coverage, list)
-    or any(isinstance(entry, dict) and entry.get("status") == "blocked" for entry in coverage)
+    or (front_matter.get("status") == "approved" and has_blocked_coverage)
+    or (
+        front_matter.get("status") == "changes_required"
+        and not has_blocked_coverage
+    )
 ):
     print(
-        f"build-artifact-check: implementation provenance approved review has blocked or malformed coverage: {artifact_path}",
+        f"build-artifact-check: implementation provenance review status/coverage mismatch: {artifact_path}",
         file=sys.stderr,
     )
     raise SystemExit(1)
@@ -381,6 +394,8 @@ require_review_attempt_provenance() {
   reviewed_attempt="$2"
   expected_snapshot="$3"
   expected_review_input="$4"
+  review_status="$5"
+  review_mode="$(metadata_value "$ROOT_JSON" "gc.var.review_mode")"
   rows="$(gc bd list --all --metadata-field \
     "gc.root_bead_id=$workflow_root_id" --json --limit=0 2>/dev/null)" || \
     fail "implementation provenance could not list review rows for $workflow_root_id"
@@ -388,7 +403,9 @@ require_review_attempt_provenance() {
     --arg root "$workflow_root_id" \
     --arg attempt "$reviewed_attempt" \
     --arg snapshot "$expected_snapshot" \
-    --arg review_input "$expected_review_input" '
+    --arg review_input "$expected_review_input" \
+    --arg review_status "$review_status" \
+    --arg review_mode "$review_mode" '
     def rows_for($step):
       [.[] | select(
         (.metadata["gc.root_bead_id"] // "") == $root and
@@ -416,21 +433,52 @@ require_review_attempt_provenance() {
       (($rows[0].metadata["code_review.reviewed_attempt"] // "") == $attempt) and
       (($rows[0].metadata["code_review.implementation_snapshot"] // "") == $snapshot) and
       (($rows[0].metadata["code_review.review_input_snapshot"] // "") == $review_input);
+    def lane_verdict_ok($rows; $key):
+      (($rows[0].metadata[$key] // "") == "approve") or
+      (
+        $review_mode == "report" and
+        (($rows[0].metadata[$key] // "") == "iterate")
+      );
     latest_attempt_ok and (
       rows_for("review.acceptance-review") as $acceptance
       | rows_for("review.test-evidence-review") as $tests
       | rows_for("review.simplicity-review") as $simplicity
       | rows_for("review.synthesize-review") as $synthesis
-      | rows_for("review.apply-review-findings") as $apply
+      | rows_for(
+          if $review_mode == "report"
+          then "review.report-review-findings"
+          else "review.apply-review-findings"
+          end
+        ) as $terminal
       | base_ok($acceptance)
-      and (($acceptance[0].metadata["code_review.acceptance_verdict"] // "") == "approve")
+      and lane_verdict_ok($acceptance; "code_review.acceptance_verdict")
       and base_ok($tests)
-      and (($tests[0].metadata["code_review.test_evidence_verdict"] // "") == "approve")
+      and lane_verdict_ok($tests; "code_review.test_evidence_verdict")
       and base_ok($simplicity)
-      and (($simplicity[0].metadata["code_review.simplicity_verdict"] // "") == "approve")
+      and lane_verdict_ok($simplicity; "code_review.simplicity_verdict")
       and base_ok($synthesis)
-      and base_ok($apply)
-      and (($apply[0].metadata["code_review.verdict"] // "") == "done")
+      and base_ok($terminal)
+      and (($terminal[0].metadata["code_review.verdict"] // "") ==
+        (if $review_mode == "report" then "reported" else "done" end))
+      and (
+        if $review_mode == "report" then
+          (
+            $review_status == "approved" and
+            (($acceptance[0].metadata["code_review.acceptance_verdict"] // "") == "approve") and
+            (($tests[0].metadata["code_review.test_evidence_verdict"] // "") == "approve") and
+            (($simplicity[0].metadata["code_review.simplicity_verdict"] // "") == "approve")
+          ) or (
+            $review_status == "changes_required" and
+            (
+              (($acceptance[0].metadata["code_review.acceptance_verdict"] // "") == "iterate") or
+              (($tests[0].metadata["code_review.test_evidence_verdict"] // "") == "iterate") or
+              (($simplicity[0].metadata["code_review.simplicity_verdict"] // "") == "iterate")
+            )
+          )
+        else
+          $review_status == "approved"
+        end
+      )
     )
   ' >/dev/null 2>&1; then
     fail "implementation provenance exact review attempt is incomplete or stale: root=$workflow_root_id attempt=$reviewed_attempt"
@@ -512,6 +560,7 @@ if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
   WORKFLOW_ROOT_ID="${ROOT_ID:-$BEAD_ID}"
   IMPLEMENTATION_SNAPSHOT="$(metadata_value "$ROOT_JSON" "gc.build.implementation_snapshot")"
   REVIEW_INPUT_SNAPSHOT="$(metadata_value "$ROOT_JSON" "gc.build.review_input_snapshot")"
+  REVIEW_MODE="$(metadata_value "$ROOT_JSON" "gc.var.review_mode")"
   IMPLEMENTATION_SUMMARY_RAW="$(metadata_value "$ROOT_JSON" "gc.build.implementation_summary_path")"
   REVIEW_CONTEXT_RAW="$(metadata_value "$ROOT_JSON" "gc.build.code_review_context_path")"
   [ -n "$IMPLEMENTATION_SNAPSHOT" ] || fail "implementation provenance gc.build.implementation_snapshot is missing"
@@ -553,12 +602,15 @@ if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
   if [ "$ARTIFACT_KIND" = "review" ]; then
     REVIEWED_ATTEMPT="$(front_matter_value "$ARTIFACT_PATH" reviewed_attempt)" || \
       fail "implementation provenance review artifact reviewed_attempt is unreadable"
+    REVIEW_STATUS="$(front_matter_value "$ARTIFACT_PATH" status)" || \
+      fail "implementation provenance review artifact status is unreadable"
     require_review_attempt_provenance \
       "$WORKFLOW_ROOT_ID" "$REVIEWED_ATTEMPT" \
-      "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT"
+      "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT" "$REVIEW_STATUS"
     require_implementation_provenance \
       "$ARTIFACT_PATH" "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT" \
       "$REVIEWED_ATTEMPT" review "$WORKFLOW_ROOT_ID" \
+      "$REVIEW_STATUS" \
       "$IMPLEMENTATION_SUMMARY_PATH" "$REVIEW_CONTEXT_PATH" || exit 1
   else
     REVIEW_VALIDATOR_UPSTREAM_ARGS=("${BASE_VALIDATOR_UPSTREAM_ARGS[@]}")
@@ -574,16 +626,25 @@ if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
     fi
     REVIEWED_ATTEMPT="$(front_matter_value "$REVIEW_REPORT_PATH" reviewed_attempt)" || \
       fail "implementation provenance approved review reviewed_attempt is unreadable"
+    REVIEW_STATUS="$(front_matter_value "$REVIEW_REPORT_PATH" status)" || \
+      fail "implementation provenance review status is unreadable"
     require_review_attempt_provenance \
       "$WORKFLOW_ROOT_ID" "$REVIEWED_ATTEMPT" \
-      "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT"
+      "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT" "$REVIEW_STATUS"
+    case "$REVIEW_MODE:$REVIEW_STATUS" in
+      *:approved) EXPECTED_FINAL_STATUS="approved" ;;
+      report:changes_required) EXPECTED_FINAL_STATUS="blocked" ;;
+      *) fail "implementation provenance review status cannot finalize: mode=${REVIEW_MODE:-<missing>} status=${REVIEW_STATUS:-<missing>}" ;;
+    esac
     require_implementation_provenance \
       "$REVIEW_REPORT_PATH" "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT" \
       "$REVIEWED_ATTEMPT" review "$WORKFLOW_ROOT_ID" \
+      "$REVIEW_STATUS" \
       "$IMPLEMENTATION_SUMMARY_PATH" "$REVIEW_CONTEXT_PATH" || exit 1
     require_implementation_provenance \
       "$ARTIFACT_PATH" "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT" \
       "$REVIEWED_ATTEMPT" final-report "$WORKFLOW_ROOT_ID" \
+      "$EXPECTED_FINAL_STATUS" \
       "$IMPLEMENTATION_SUMMARY_PATH" "$REVIEW_REPORT_PATH" || exit 1
   fi
 fi

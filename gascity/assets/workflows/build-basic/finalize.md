@@ -11,6 +11,24 @@ report or attempt infrastructure repair. Record `gc.build.status=failed`,
 `gc.failure_class=upstream_validation`, and a concise `gc.blocked_reason` on the
 workflow root; set the claimed step to `gc.outcome=fail`, close it, and stop.
 
+Read the validated review artifact before finalizing. In report mode,
+`status: changes_required` is successful review delivery but not implementation
+approval. Write the configured final artifact using the schema and trace shape
+below with `status: blocked`, record both final-report paths, and run the
+installed artifact check. After it passes, atomically record these failure-only
+values on the workflow root: `gc.outcome=fail`, `gc.build.status=blocked`,
+`gc.build.finalize_status=failed`, `gc.build.finalize_outcome=failure`,
+`gc.build.repair_status=repairable`,
+`gc.restart.entrypoint=build-from-review`,
+`gc.restart.reason=review_changes_required`,
+`gc.restart.review_report_path=<canonical review report path>`,
+`gc.blocked_reason=code_review_changes_required`, and
+`gc.failure_class=review_iteration_needed`. Set the claimed finalize step to
+`gc.outcome=fail`, close it, and stop without running the success update below.
+Any other non-approved review status is invalid for this expansion; fail with a
+precise blocked reason and never invent approval. A validated review with
+remaining findings must never become a completed build.
+
 Treat installed validation code as immutable infrastructure. Never create,
 reconstruct, or modify `.gc/scripts`. If an installed validator or helper is
 missing, record `gc.failure_class=validation_infrastructure`, close with
@@ -40,8 +58,8 @@ Before writing `factory-run.md`, ensure the canonical implementation summary
 exists at the path recorded on the workflow root bead as
 `gc.build.implementation_summary_path`, normally `implementation-summary.md`.
 It must already be an approved `gc.build.implementation-summary.v1` artifact
-whose current bytes match the approved review trace. Treat the canonical summary
-and approved review as immutable inputs. If either is missing, invalid, or
+whose current bytes match the selected review trace. Treat the canonical summary
+and validated review as immutable inputs. If either is missing, invalid, or
 mismatched, fail this stage and record a healable restart at review. Never
 synthesize, mutate, replace, or repoint either artifact during finalization.
 
@@ -60,22 +78,23 @@ Use mapping objects for front matter; do not use scalar shortcuts such as
 - `workflow: {id: <workflow-root-id>, formula: build-basic}`
 - `methodology: {pack: gascity, name: build-basic}`
 - `producer: {formula: build-basic, stage: finalize, attempt: <positive integer>}`
-- `status: approved`; any other status fails finalization
-- `implementation_snapshot: <exact approved snapshot>`
-- `review_input_snapshot: <exact approved review-input snapshot>`
-- `reviewed_attempt: <exact approved positive loop attempt>`
+- `status: approved` for successful finalization; use `status: blocked` only for
+  the failure branch above
+- `implementation_snapshot: <exact review snapshot>`
+- `review_input_snapshot: <exact review-input snapshot>`
+- `reviewed_attempt: <exact positive reviewed attempt>`
 - `trace: {upstream: [...], coverage: [...]}`
 
 Trace the exact canonical implementation summary once at its absolute path with
-a freshly computed `sha256:<digest>`. Trace the approved review artifact once
+a freshly computed `sha256:<digest>`. Trace the validated review artifact once
 at its absolute path with its own freshly computed digest. The extra
-`implementation_snapshot: <exact approved snapshot>` must equal the root and
-approved review artifact snapshots; repeat it in Artifacts.
-The review-input snapshot and reviewed attempt must exactly equal the approved
-review artifact and the still-closed lane/synthesis/apply group. Recompute the
-live combined value from the immutable summary and review context before writing
-the final report. The approved review must still trace that context exactly
-once; finalization verifies it transitively and never repoints it.
+`implementation_snapshot: <exact review snapshot>` must equal the root and
+review artifact snapshots; repeat it in Artifacts.
+The review-input snapshot and reviewed attempt must exactly equal the validated
+review artifact and the still-closed lane/synthesis/selected-terminal group.
+Recompute the live combined value from the immutable summary and review context
+before writing the final report. The review must still trace that context
+exactly once; finalization verifies it transitively and never repoints it.
 
 Trace front matter must use the validator shape exactly:
 
