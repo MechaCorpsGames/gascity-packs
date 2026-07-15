@@ -1280,6 +1280,377 @@ def test_wait_for_workflow_pass_rejects_failed_nested_implementation_control(
         )
 
 
+def provider_log_snapshot(*entries: dict, path: str = "/tmp/provider-session.jsonl") -> str:
+    return json.dumps(
+        {
+            "schema_version": "1",
+            "transcript_path": path,
+            "entries": list(entries),
+        }
+    )
+
+
+def provider_assistant_entry(
+    text: str,
+    *,
+    uuid: str,
+    model: str = "<synthetic>",
+) -> dict:
+    content = [{"type": "text", "text": text}]
+    return {
+        "uuid": uuid,
+        "type": "assistant",
+        "role": "assistant",
+        "blocks": content,
+        "message": {"model": model, "role": "assistant", "content": content},
+    }
+
+
+def workflow_claim(session_identity: str, *, root: str = "fi-root") -> dict:
+    return {
+        "id": "fi-work",
+        "status": "in_progress",
+        "assignee": session_identity,
+        "metadata": {"gc.root_bead_id": root, "gc.kind": "ralph"},
+    }
+
+
+TERMINAL_TOOL_USE_ERROR = (
+    "API Error: 400 {\"error\":{\"message\":"
+    "\"tool_use block missing required 'name' field\"}}"
+)
+
+
+def exercise_terminal_provider_watchdog(
+    tmp_path,
+    monkeypatch,
+    *,
+    sessions: list[dict],
+    beads: list[dict],
+    logs: str,
+    timeout: float = 1,
+) -> tuple[gascity_pack_inference_gate.GateWorkspace, list[list[str]]]:
+    workspace = gate_workspace(tmp_path)
+    root = {"id": "fi-root", "status": "in_progress", "metadata": {}}
+    commands: list[list[str]] = []
+    clock = [0.0]
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "show_bead", lambda *args, **kwargs: root)
+    monkeypatch.setattr(gascity_pack_inference_gate, "list_beads", lambda *args, **kwargs: beads)
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "collect_diagnostics",
+        lambda *args, **kwargs: "diagnostics",
+    )
+    monkeypatch.setattr(gascity_pack_inference_gate.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        gascity_pack_inference_gate.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+
+    def run_checked(command, **kwargs):
+        argv = list(command)
+        commands.append(argv)
+        operation = argv[argv.index("session") + 1]
+        if operation == "list":
+            return json.dumps({"sessions": sessions})
+        if operation == "logs":
+            return logs
+        if operation == "reset":
+            return '{"status":"reset_requested"}\n'
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="timed out"):
+        gascity_pack_inference_gate.wait_for_workflow_pass(
+            "gc",
+            workspace,
+            "fi-root",
+            env={},
+            timeout=timeout,
+            poll_interval=1,
+        )
+    return workspace, commands
+
+
+def test_wait_for_workflow_pass_resets_terminal_provider_error_observation_once(
+    tmp_path, monkeypatch
+) -> None:
+    session_name = "gc__implementation-worker-gpig-2y5"
+    workspace, commands = exercise_terminal_provider_watchdog(
+        tmp_path,
+        monkeypatch,
+        sessions=[
+            {
+                "id": "gpig-2y5",
+                "session_name": session_name,
+                "state": "active",
+                "last_active": "2020-01-01T00:00:00Z",
+            }
+        ],
+        beads=[workflow_claim(session_name)],
+        logs=provider_log_snapshot(
+            provider_assistant_entry(TERMINAL_TOOL_USE_ERROR, uuid="provider-error-1")
+        ),
+        timeout=3,
+    )
+
+    reset_commands = [command for command in commands if "reset" in command]
+    assert reset_commands == [
+        [
+            "gc",
+            "--city",
+            str(workspace.city_dir),
+            "session",
+            "reset",
+            "gpig-2y5",
+            "--json",
+        ]
+    ]
+
+
+def test_wait_for_workflow_pass_leaves_benign_stale_active_session_untouched(
+    tmp_path, monkeypatch
+) -> None:
+    session_name = "gc__implementation-worker-gpig-benign"
+    _, commands = exercise_terminal_provider_watchdog(
+        tmp_path,
+        monkeypatch,
+        sessions=[
+            {
+                "id": "gpig-benign",
+                "session_name": session_name,
+                "state": "active",
+                "last_active": "2020-01-01T00:00:00Z",
+            }
+        ],
+        beads=[workflow_claim(session_name)],
+        logs=provider_log_snapshot(
+            provider_assistant_entry(TERMINAL_TOOL_USE_ERROR, uuid="old-provider-error"),
+            provider_assistant_entry(
+                "Implementation is still running normally.",
+                uuid="healthy-progress",
+                model="kimi-k2.5",
+            ),
+        ),
+    )
+
+    assert any("logs" in command and "gpig-benign" in command for command in commands)
+    assert not any("reset" in command for command in commands)
+
+
+def test_wait_for_workflow_pass_does_not_reset_terminal_error_without_workflow_claim(
+    tmp_path, monkeypatch
+) -> None:
+    _, commands = exercise_terminal_provider_watchdog(
+        tmp_path,
+        monkeypatch,
+        sessions=[
+            {
+                "id": "gpig-unrelated",
+                "session_name": "gc__implementation-worker-gpig-unrelated",
+                "state": "active",
+                "last_active": "2020-01-01T00:00:00Z",
+            }
+        ],
+        beads=[],
+        logs=provider_log_snapshot(
+            provider_assistant_entry(TERMINAL_TOOL_USE_ERROR, uuid="unrelated-error")
+        ),
+    )
+
+    assert not any("reset" in command for command in commands)
+
+
+@pytest.mark.parametrize("claim_case", ("shared-template", "stale-session-name"))
+def test_wait_for_workflow_pass_does_not_reset_for_sibling_session_claim(
+    tmp_path, monkeypatch, claim_case
+) -> None:
+    session = {
+        "id": "gpig-poisoned",
+        "session_name": "gc__implementation-worker-gpig-poisoned",
+        "template": "fixture/gc.implementation-worker",
+        "state": "active",
+        "last_active": "2020-01-01T00:00:00Z",
+    }
+    claim = workflow_claim(
+        "fixture/gc.implementation-worker"
+        if claim_case == "shared-template"
+        else "gc__implementation-worker-gpig-sibling"
+    )
+    if claim_case == "stale-session-name":
+        claim["metadata"]["gc.session_name"] = session["session_name"]
+
+    _, commands = exercise_terminal_provider_watchdog(
+        tmp_path,
+        monkeypatch,
+        sessions=[session],
+        beads=[claim],
+        logs=provider_log_snapshot(
+            provider_assistant_entry(TERMINAL_TOOL_USE_ERROR, uuid="poisoned-error")
+        ),
+    )
+
+    assert not any("reset" in command for command in commands)
+
+
+def test_terminal_provider_recovery_fails_when_fresh_reset_does_not_recover(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    commands: list[list[str]] = []
+
+    def run_checked(command, **kwargs):
+        argv = list(command)
+        commands.append(argv)
+        operation = argv[argv.index("session") + 1]
+        if operation == "list":
+            return json.dumps({"sessions": []})
+        if operation == "logs":
+            return provider_log_snapshot(
+                provider_assistant_entry(TERMINAL_TOOL_USE_ERROR, uuid="source-error"),
+                path="/tmp/source-provider-session.jsonl",
+            )
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+    resets = {
+        "gpig-2y5": gascity_pack_inference_gate.TerminalProviderReset(
+            requested_at=0.0,
+            source_transcript_path="/tmp/source-provider-session.jsonl",
+            claim_ids=("fi-work",),
+            session_identities=("gc__implementation-worker-gpig-2y5",),
+        )
+    }
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="gpig-2y5.*did not produce fresh provider progress.*state=missing",
+    ):
+        gascity_pack_inference_gate.recover_terminal_provider_sessions(
+            "gc",
+            workspace,
+            env={},
+            beads=[workflow_claim("gc__implementation-worker-gpig-2y5")],
+            root_id="fi-root",
+            resets=resets,
+            now=gascity_pack_inference_gate.TERMINAL_PROVIDER_RECOVERY_TIMEOUT,
+        )
+
+    assert not any("reset" in command for command in commands)
+
+
+def test_terminal_provider_recovery_accepts_fresh_provider_transcript(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = gate_workspace(tmp_path)
+
+    def run_checked(command, **kwargs):
+        operation = list(command)[list(command).index("session") + 1]
+        if operation == "list":
+            return json.dumps({"sessions": []})
+        if operation == "logs":
+            return provider_log_snapshot(
+                provider_assistant_entry(
+                    "I resumed the claimed implementation work.",
+                    uuid="fresh-progress",
+                    model="kimi-k2.5",
+                ),
+                path="/tmp/fresh-provider-session.jsonl",
+            )
+        raise AssertionError(f"unexpected command: {list(command)!r}")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+    reset = gascity_pack_inference_gate.TerminalProviderReset(
+        requested_at=0.0,
+        source_transcript_path="/tmp/source-provider-session.jsonl",
+        claim_ids=("fi-work",),
+        session_identities=("gc__implementation-worker-gpig-2y5",),
+    )
+
+    gascity_pack_inference_gate.recover_terminal_provider_sessions(
+        "gc",
+        workspace,
+        env={},
+        beads=[workflow_claim("gc__implementation-worker-gpig-2y5")],
+        root_id="fi-root",
+        resets={"gpig-2y5": reset},
+        now=gascity_pack_inference_gate.TERMINAL_PROVIDER_RECOVERY_TIMEOUT,
+    )
+
+    assert reset.recovery_evidence == (
+        "fresh provider transcript /tmp/fresh-provider-session.jsonl at fresh-progress"
+    )
+
+
+def test_terminal_provider_recovery_rejects_same_error_in_fresh_conversation(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = gate_workspace(tmp_path)
+
+    def run_checked(command, **kwargs):
+        operation = list(command)[list(command).index("session") + 1]
+        if operation == "list":
+            return json.dumps({"sessions": []})
+        if operation == "logs":
+            return provider_log_snapshot(
+                provider_assistant_entry(TERMINAL_TOOL_USE_ERROR, uuid="fresh-error"),
+                path="/tmp/fresh-provider-session.jsonl",
+            )
+        raise AssertionError(f"unexpected command: {list(command)!r}")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+    reset = gascity_pack_inference_gate.TerminalProviderReset(
+        requested_at=0.0,
+        source_transcript_path="/tmp/source-provider-session.jsonl",
+        claim_ids=("fi-work",),
+        session_identities=("gc__implementation-worker-gpig-2y5",),
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="gpig-2y5.*same terminal provider error.*fresh conversation",
+    ):
+        gascity_pack_inference_gate.recover_terminal_provider_sessions(
+            "gc",
+            workspace,
+            env={},
+            beads=[workflow_claim("gc__implementation-worker-gpig-2y5")],
+            root_id="fi-root",
+            resets={"gpig-2y5": reset},
+            now=1.0,
+        )
+
+
+def test_workflow_lineage_root_ids_includes_wired_drain_item_root() -> None:
+    drain = {
+        "id": "fi-drain",
+        "status": "open",
+        "metadata": {
+            "gc.kind": "drain",
+            "gc.root_bead_id": "fi-root",
+            "gc.drain_manifest.v1": json.dumps(
+                {
+                    "version": 1,
+                    "rows": [
+                        {
+                            "item_root_id": "fi-nested",
+                            "status": "wired",
+                        }
+                    ],
+                }
+            ),
+        },
+    }
+
+    assert gascity_pack_inference_gate.workflow_lineage_root_ids(
+        [drain, workflow_claim("worker", root="fi-nested")],
+        "fi-root",
+    ) == {"fi-root", "fi-nested"}
+
+
 def complete_nested_workflow_lineage() -> list[dict]:
     return [
         closed_bead("fi-root-finalize", root="fi-root", kind="workflow-finalize"),

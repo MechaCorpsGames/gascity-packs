@@ -810,6 +810,7 @@ class FormulaAssetTests(unittest.TestCase):
             "CLAIMED_BEAD_ID",
             "CLAIMED_ROOT_BEAD_ID",
             "CLAIMED_CONTINUATION_GROUP",
+            "never tool or function names",
             "gc runtime drain-ack",
             "An empty continuation group is a hard session boundary",
             "Never ask a human whether to proceed after a successful claim",

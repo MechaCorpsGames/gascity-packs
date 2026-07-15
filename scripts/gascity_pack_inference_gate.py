@@ -12,9 +12,11 @@ orchestration agents and runs a bounded review-leg workflow through polecat.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shlex
@@ -461,6 +463,15 @@ BUILD_BASIC_ARTIFACT_CONTRACTS = (
 DEFAULT_GATE = "all"
 DEFAULT_TIMEOUT = "75m"
 DEFAULT_POLL_INTERVAL = "5s"
+# Gas City's progress recycler intentionally excludes sessions with live claims.
+# Recover only the known non-resumable malformed-tool history, once and with proof.
+TERMINAL_PROVIDER_SCAN_INTERVAL = 30.0
+TERMINAL_PROVIDER_STALE_AFTER = 60.0
+TERMINAL_PROVIDER_RECOVERY_TIMEOUT = 300.0
+TERMINAL_PROVIDER_MAX_SESSION_CACHE_AGE = 60.0
+TERMINAL_PROVIDER_ERROR_SIGNATURES = (
+    "tool_use block missing required 'name' field",
+)
 BD_LIST_LIMIT = "1000"
 INHERITED_ENV_KEYS = (
     "PATH",
@@ -524,6 +535,23 @@ class PackSpec:
 
 class GateError(RuntimeError):
     pass
+
+
+@dataclass
+class TerminalProviderReset:
+    requested_at: float
+    source_transcript_path: str
+    claim_ids: tuple[str, ...]
+    session_identities: tuple[str, ...]
+    recovery_evidence: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderLogTip:
+    transcript_path: str
+    entry_id: str
+    synthetic: bool
+    terminal_error: bool
 
 
 def make_pack_specs() -> dict[str, PackSpec]:
@@ -1882,6 +1910,291 @@ def terminal_nonpassing_workflow_controls(
     )
 
 
+def session_rows(payload: Any) -> list[Mapping[str, Any]]:
+    if isinstance(payload, Mapping):
+        payload = payload.get("sessions")
+    if not isinstance(payload, list):
+        return []
+    return [session for session in payload if isinstance(session, Mapping)]
+
+
+def session_cache_age(payload: Any) -> float:
+    if not isinstance(payload, Mapping) or "_cache_age_s" not in payload:
+        return 0.0
+    try:
+        age = float(payload["_cache_age_s"])
+    except (TypeError, ValueError):
+        return math.inf
+    if not math.isfinite(age) or age < 0:
+        return math.inf
+    return age
+
+
+def provider_activity_age(last_active: str, *, now: datetime | None = None) -> float | None:
+    raw = last_active.strip()
+    if not raw:
+        return None
+    try:
+        observed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return max(0.0, (current - observed.astimezone(timezone.utc)).total_seconds())
+
+
+def provider_log_tip(output: str) -> ProviderLogTip | None:
+    payload = extract_json_payload(output)
+    if not isinstance(payload, Mapping):
+        return None
+    transcript_path = str(payload.get("transcript_path") or "").strip()
+    entries = payload.get("entries")
+    if not transcript_path or not isinstance(entries, list):
+        return None
+
+    latest: Mapping[str, Any] | None = None
+    for entry in reversed(entries):
+        if isinstance(entry, Mapping) and str(entry.get("type") or "").strip() == "assistant":
+            latest = entry
+            break
+    if latest is None:
+        return None
+
+    message = latest.get("message")
+    model = str(message.get("model") or "").strip() if isinstance(message, Mapping) else ""
+    serialized = json.dumps(latest, sort_keys=True, default=str).lower()
+    terminal_error = model == "<synthetic>" and any(
+        signature in serialized for signature in TERMINAL_PROVIDER_ERROR_SIGNATURES
+    )
+    entry_id = str(latest.get("uuid") or latest.get("timestamp") or "").strip()
+    if not entry_id:
+        entry_id = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return ProviderLogTip(
+        transcript_path=transcript_path,
+        entry_id=entry_id,
+        synthetic=model == "<synthetic>",
+        terminal_error=terminal_error,
+    )
+
+
+def workflow_lineage_root_ids(beads: Sequence[Mapping[str, Any]], root_id: str) -> set[str]:
+    roots = {root_id}
+    pending = [root_id]
+    while pending:
+        parent_id = pending.pop()
+        for bead in beads:
+            if (
+                metadata_value(bead, "gc.root_bead_id") != parent_id
+                or metadata_value(bead, "gc.kind") != "drain"
+            ):
+                continue
+            rows = drain_manifest_rows(bead)
+            if rows is None:
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                for key in ("item_root_id", "outcome_bead_id"):
+                    nested_id = str(row.get(key) or "").strip()
+                    if nested_id and nested_id not in roots:
+                        roots.add(nested_id)
+                        pending.append(nested_id)
+    return roots
+
+
+def session_assignment_identities(session: Mapping[str, Any]) -> tuple[str, ...]:
+    identities = tuple(
+        str(session.get(key) or "").strip()
+        for key in ("id", "session_id", "session_name")
+        if str(session.get(key) or "").strip()
+    )
+    return tuple(dedupe_strings(identities))
+
+
+def workflow_claims_for_identities(
+    beads: Sequence[Mapping[str, Any]],
+    workflow_roots: set[str],
+    identities: Sequence[str],
+) -> list[Mapping[str, Any]]:
+    expected = {identity.strip() for identity in identities if identity.strip()}
+    if not expected:
+        return []
+    claims: list[Mapping[str, Any]] = []
+    for bead in beads:
+        if str(bead.get("status") or "").strip() != "in_progress":
+            continue
+        if metadata_value(bead, "gc.root_bead_id") not in workflow_roots:
+            continue
+        assignee = str(bead.get("assignee") or "").strip()
+        session_name = metadata_value(bead, "gc.session_name").strip()
+        if assignee in expected or (not assignee and session_name in expected):
+            claims.append(bead)
+    return claims
+
+
+def run_gc_session(
+    gc_bin: str,
+    workspace: GateWorkspace,
+    *args: str,
+    env: Mapping[str, str],
+    log_output: bool = False,
+) -> str:
+    return run_checked(
+        [gc_bin, "--city", str(workspace.city_dir), "session", *args],
+        env=env,
+        timeout=parse_duration("30s"),
+        log_output=log_output,
+    )
+
+
+def session_log_tip(
+    gc_bin: str,
+    workspace: GateWorkspace,
+    session_id: str,
+    *,
+    env: Mapping[str, str],
+) -> ProviderLogTip | None:
+    try:
+        output = run_gc_session(
+            gc_bin, workspace, "logs", session_id, "--tail", "10", "--json", env=env
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return provider_log_tip(output)
+
+
+def reconcile_terminal_provider_resets(
+    gc_bin: str,
+    workspace: GateWorkspace,
+    *,
+    env: Mapping[str, str],
+    beads: Sequence[Mapping[str, Any]],
+    workflow_roots: set[str],
+    sessions_by_id: Mapping[str, Mapping[str, Any]],
+    resets: Mapping[str, TerminalProviderReset],
+    now: float,
+) -> None:
+    for session_id, reset in resets.items():
+        if reset.recovery_evidence:
+            continue
+        remaining_claims = workflow_claims_for_identities(
+            beads,
+            workflow_roots,
+            reset.session_identities,
+        )
+        remaining_ids = {str(bead.get("id") or "").strip() for bead in remaining_claims}
+        if not remaining_ids.intersection(reset.claim_ids):
+            reset.recovery_evidence = "claimed work completed or was released"
+            continue
+
+        tip = session_log_tip(gc_bin, workspace, session_id, env=env)
+        if tip and tip.transcript_path != reset.source_transcript_path:
+            if tip.terminal_error:
+                raise GateError(
+                    f"session {session_id} hit the same terminal provider error in its fresh conversation"
+                )
+            if not tip.synthetic:
+                reset.recovery_evidence = (
+                    f"fresh provider transcript {tip.transcript_path} at {tip.entry_id}"
+                )
+                continue
+
+        if now - reset.requested_at >= TERMINAL_PROVIDER_RECOVERY_TIMEOUT:
+            session_state = str((sessions_by_id.get(session_id) or {}).get("state") or "missing")
+            raise GateError(
+                f"session {session_id} did not produce fresh provider progress within "
+                f"{TERMINAL_PROVIDER_RECOVERY_TIMEOUT:.0f}s after reset; state={session_state}"
+            )
+
+
+def recover_terminal_provider_sessions(
+    gc_bin: str,
+    workspace: GateWorkspace,
+    *,
+    env: Mapping[str, str],
+    beads: Sequence[Mapping[str, Any]],
+    root_id: str,
+    resets: dict[str, TerminalProviderReset],
+    now: float,
+) -> None:
+    workflow_roots = workflow_lineage_root_ids(beads, root_id)
+    sessions: list[Mapping[str, Any]] = []
+    cache_age = math.inf
+    try:
+        output = run_gc_session(gc_bin, workspace, "list", "--state", "all", "--json", env=env)
+        payload = extract_json_payload(output)
+        sessions = session_rows(payload)
+        cache_age = session_cache_age(payload)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        print(f"terminal-provider watchdog could not list active sessions: {exc}", file=sys.stderr)
+
+    sessions_by_id = {
+        str(session.get("id") or "").strip(): session
+        for session in sessions
+        if str(session.get("id") or "").strip()
+    }
+    reconcile_terminal_provider_resets(
+        gc_bin,
+        workspace,
+        env=env,
+        beads=beads,
+        workflow_roots=workflow_roots,
+        sessions_by_id=sessions_by_id,
+        resets=resets,
+        now=now,
+    )
+
+    if cache_age > TERMINAL_PROVIDER_MAX_SESSION_CACHE_AGE:
+        print(
+            f"terminal-provider watchdog skipped new resets because session cache age is {cache_age:.1f}s",
+            file=sys.stderr,
+        )
+        return
+
+    for session in sessions:
+        session_id = str(session.get("id") or "").strip()
+        state = str(session.get("state") or "").strip().lower()
+        last_active = str(session.get("last_active") or "").strip()
+        if (
+            not session_id
+            or session_id in resets
+            or state not in {"active", "awake"}
+            or session.get("attached") is True
+        ):
+            continue
+
+        identities = session_assignment_identities(session)
+        claims = workflow_claims_for_identities(beads, workflow_roots, identities)
+        if not claims:
+            continue
+
+        age = provider_activity_age(last_active)
+        if age is None or age < TERMINAL_PROVIDER_STALE_AFTER:
+            continue
+
+        tip = session_log_tip(gc_bin, workspace, session_id, env=env)
+        if tip is None or not tip.terminal_error:
+            continue
+
+        try:
+            run_gc_session(
+                gc_bin, workspace, "reset", session_id, "--json", env=env, log_output=True
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise GateError(f"could not fresh-reset terminal provider session {session_id}: {exc}") from exc
+        resets[session_id] = TerminalProviderReset(
+            requested_at=now,
+            source_transcript_path=tip.transcript_path,
+            claim_ids=tuple(str(bead.get("id") or "").strip() for bead in claims),
+            session_identities=identities,
+        )
+        print(
+            f"terminal-provider watchdog: requested one fresh reset for session {session_id}",
+            flush=True,
+        )
+
+
 def wait_for_workflow_pass(
     gc_bin: str,
     workspace: GateWorkspace,
@@ -1893,6 +2206,8 @@ def wait_for_workflow_pass(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_bead: dict[str, Any] | None = None
+    terminal_provider_resets: dict[str, TerminalProviderReset] = {}
+    next_terminal_provider_scan = 0.0
     while time.monotonic() < deadline:
         last_bead = show_bead(gc_bin, workspace, root_id, env=env)
         status = str(last_bead.get("status") or "")
@@ -1937,12 +2252,36 @@ def wait_for_workflow_pass(
                             + collect_diagnostics(gc_bin, workspace, env=env)
                         )
                     return last_bead
+                now = time.monotonic()
+                if now >= next_terminal_provider_scan:
+                    recover_terminal_provider_sessions(
+                        gc_bin,
+                        workspace,
+                        env=env,
+                        beads=beads,
+                        root_id=root_id,
+                        resets=terminal_provider_resets,
+                        now=now,
+                    )
+                    next_terminal_provider_scan = now + TERMINAL_PROVIDER_SCAN_INTERVAL
                 time.sleep(poll_interval)
                 continue
             raise GateError(
                 f"workflow {root_id} closed with gc.outcome={outcome!r}, want 'pass'\n"
                 + collect_diagnostics(gc_bin, workspace, env=env)
             )
+        now = time.monotonic()
+        if now >= next_terminal_provider_scan:
+            recover_terminal_provider_sessions(
+                gc_bin,
+                workspace,
+                env=env,
+                beads=beads,
+                root_id=root_id,
+                resets=terminal_provider_resets,
+                now=now,
+            )
+            next_terminal_provider_scan = now + TERMINAL_PROVIDER_SCAN_INTERVAL
         time.sleep(poll_interval)
     raise GateError(
         f"timed out after {timeout:.0f}s waiting for workflow {root_id} and its finalizer to pass; "
