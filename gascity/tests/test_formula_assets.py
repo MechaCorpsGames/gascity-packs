@@ -2296,6 +2296,59 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, required_fix_contract)
 
+    def test_build_basic_review_fix_refreshes_authoritative_state_in_each_ralph_iteration(
+        self,
+    ) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        review = load_formula(root, "build-basic-review")
+        loop = next(
+            template
+            for template in review["template"]
+            if template["id"] == "{target}.build-basic-review-loop"
+        )
+        apply_findings = next(
+            child
+            for child in loop["children"]
+            if child["id"] == "{target}.apply-review-findings"
+        )
+        self.assertEqual(
+            apply_findings["description_file"],
+            "../assets/workflows/build-basic-review/{target}.apply-review-findings.md",
+        )
+
+        prompt = node_description(root, apply_findings)
+        normalized = " ".join(prompt.split())
+        member_update = re.search(
+            r"gc bd update [\"']?<implementation-member-id>[\"']?.{0,240}"
+            r"gc\.implementation\.commit=<current full (?:commit|HEAD)>",
+            normalized,
+        )
+        root_update = re.search(
+            r"gc bd update [\"']?<workflow-root-id>[\"']?.{0,320}"
+            r"gc\.build\.implementation_snapshot=<new snapshot>.{0,240}"
+            r"gc\.build\.review_input_snapshot=<new review-input snapshot>",
+            normalized,
+        )
+
+        self.assertIsNotNone(
+            member_update,
+            "a changed review pass must update the authoritative implementation "
+            "convoy member, not merely the claimed apply bead",
+        )
+        self.assertIsNotNone(
+            root_update,
+            "the same Ralph iteration must publish refreshed implementation and "
+            "review-input snapshots on the workflow root",
+        )
+        for fragment in (
+            "gc.implementation.summary_path",
+            "gc.build.implementation_summary_path",
+            "gc.build.code_review_context_path",
+            "before closing the current Ralph iteration",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, normalized)
+
     def test_build_basic_review_binds_approval_to_current_implementation_snapshot(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         workflow_root = root / "assets" / "workflows" / "build-basic-review"
