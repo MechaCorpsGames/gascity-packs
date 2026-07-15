@@ -22,6 +22,65 @@ metadata_value() {
   ' 2>/dev/null
 }
 
+git_top_level() {
+  local candidate top
+  candidate="$1"
+  top="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  (cd "$top" 2>/dev/null && pwd -P)
+}
+
+git_common_dir() {
+  local top raw path
+  top="$1"
+  raw="$(git -C "$top" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$raw" in
+    /*) path="$raw" ;;
+    *) path="$top/$raw" ;;
+  esac
+  (cd "$path" 2>/dev/null && pwd -P)
+}
+
+review_evidence_path() {
+  local matches step key
+  matches="$1"
+  step="$2"
+  key="$3"
+  printf '%s\n' "$matches" | jq -r --arg step "$step" --arg key "$key" '
+    [
+      .[]
+      | select(
+          (.metadata["gc.step_id"] // "") == $step and
+          (.metadata["gc.scope_role"] // "") == "member"
+        )
+    ][0].metadata[$key] // ""
+  ' 2>/dev/null
+}
+
+validate_review_evidence_path() {
+  local path label artifact_root canonical
+  path="$1"
+  label="$2"
+  artifact_root="$3"
+  case "$path" in
+    /*) ;;
+    *) implementation_provenance_fail "$label must be an absolute path: ${path:-<missing>}" ;;
+  esac
+  [ -f "$path" ] || implementation_provenance_fail "$label is not a regular file: $path"
+  [ ! -L "$path" ] || implementation_provenance_fail "$label must not be a symlink: $path"
+  canonical="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)/$(basename "$path")" || \
+    implementation_provenance_fail "$label does not resolve: $path"
+  case "$artifact_root" in
+    /) ;;
+    *)
+      case "$canonical" in
+        "$artifact_root"/*) ;;
+        *) implementation_provenance_fail \
+          "$label must be under the workflow artifact root: path=$canonical root=$artifact_root" ;;
+      esac
+      ;;
+  esac
+}
+
 ROOT_JSON="$(gc bd show "$ROOT_ID" --json 2>/dev/null || true)"
 PARENT_ROOT="$(metadata_value "$ROOT_JSON" "gc.root_bead_id")"
 if [ -z "$PARENT_ROOT" ]; then
@@ -42,6 +101,7 @@ if [ -z "$IMPLEMENTATION_PROVENANCE_REQUIRED" ]; then
 fi
 IMPLEMENTATION_PROVENANCE_VALIDATED=false
 CURRENT_IMPLEMENTATION_SNAPSHOT=""
+CURRENT_REVIEW_INPUT_SNAPSHOT=""
 
 validate_declared_artifact() {
   local schema path_keys script_dir artifact_check
@@ -72,18 +132,30 @@ implementation_provenance_fail() {
 }
 
 validate_implementation_provenance() {
+  local force="${1:-false}"
   local convoy_id convoy_json member_ids drain_policy member_id member_json
   local status outcome work_dir explicit_worktree canonical_worktree recorded_commit
   local resolved_commit head found_terminal_commit recorded_summary canonical_summary
   local root_summary candidate_worktree relative_path absolute_path allowed_path
-  local seen allowed shared_worktree shared_head snapshot_members
+  local seen allowed shared_worktree shared_head snapshot_members root_snapshot
+  local launcher_work_dir launcher_top launcher_common_dir member_top member_common_dir
   local -a member_worktrees=()
   local -a allowed_untracked_paths=()
 
   [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ] || return 0
-  [ "$IMPLEMENTATION_PROVENANCE_VALIDATED" = "false" ] || return 0
+  if [ "$IMPLEMENTATION_PROVENANCE_VALIDATED" != "false" ] && [ "$force" != "true" ]; then
+    return 0
+  fi
   command -v python3 >/dev/null 2>&1 || implementation_provenance_fail \
     "requires python3 to compute the implementation snapshot"
+
+  launcher_work_dir="$(metadata_value "$PARENT_JSON" "gc.work_dir")"
+  [ -n "$launcher_work_dir" ] || implementation_provenance_fail \
+    "requires gc.work_dir on workflow root $PARENT_ROOT"
+  launcher_top="$(git_top_level "$launcher_work_dir")" || implementation_provenance_fail \
+    "workflow root gc.work_dir is not inside a readable Git worktree: $launcher_work_dir"
+  launcher_common_dir="$(git_common_dir "$launcher_top")" || implementation_provenance_fail \
+    "workflow root Git common directory is unreadable: $launcher_top"
 
   convoy_id="$(metadata_value "$PARENT_JSON" "gc.build.implementation_convoy_id")"
   [ -n "$convoy_id" ] || implementation_provenance_fail \
@@ -125,9 +197,21 @@ validate_implementation_provenance() {
       "member $member_id is missing gc.implementation.worktree_path"
     canonical_worktree="$(cd "$work_dir" 2>/dev/null && pwd -P)" || implementation_provenance_fail \
       "member $member_id work_dir does not resolve: $work_dir"
+    member_top="$(git_top_level "$canonical_worktree")" || implementation_provenance_fail \
+      "member $member_id work_dir is not inside a readable Git worktree: $canonical_worktree"
+    if [ "$member_top" != "$canonical_worktree" ]; then
+      implementation_provenance_fail \
+        "member $member_id work_dir must equal its Git worktree root: recorded=$canonical_worktree top=$member_top"
+    fi
     if [ "$(cd "$explicit_worktree" 2>/dev/null && pwd -P || true)" != "$canonical_worktree" ]; then
       implementation_provenance_fail \
         "member $member_id work_dir and gc.implementation.worktree_path disagree"
+    fi
+    member_common_dir="$(git_common_dir "$member_top")" || implementation_provenance_fail \
+      "member $member_id Git common directory is unreadable: $member_top"
+    if [ "$member_common_dir" != "$launcher_common_dir" ]; then
+      implementation_provenance_fail \
+        "member $member_id Git common directory does not match launcher repository: member=$member_common_dir launcher=$launcher_common_dir"
     fi
 
     recorded_commit="$(metadata_value "$member_json" "gc.implementation.commit")"
@@ -172,25 +256,25 @@ validate_implementation_provenance() {
 
     member_worktrees+=("$canonical_worktree")
     recorded_summary="$(metadata_value "$member_json" "gc.implementation.summary_path")"
-    if [ -n "$recorded_summary" ]; then
-      case "$recorded_summary" in
-        /*) ;;
-        *) implementation_provenance_fail \
-          "member $member_id gc.implementation.summary_path must be absolute" ;;
-      esac
-      [ -f "$recorded_summary" ] || implementation_provenance_fail \
-        "member $member_id gc.implementation.summary_path is not a file: $recorded_summary"
-      [ ! -L "$recorded_summary" ] || implementation_provenance_fail \
-        "member $member_id gc.implementation.summary_path must not be a symlink: $recorded_summary"
-      canonical_summary="$(cd "$(dirname "$recorded_summary")" 2>/dev/null && pwd -P)/$(basename "$recorded_summary")" || \
-        implementation_provenance_fail \
-          "member $member_id gc.implementation.summary_path does not resolve: $recorded_summary"
-      case "$canonical_summary" in
-        "$canonical_worktree"/*) allowed_untracked_paths+=("$canonical_summary") ;;
-        *) implementation_provenance_fail \
-          "member $member_id gc.implementation.summary_path must be inside its authoritative worktree" ;;
-      esac
-    fi
+    [ -n "$recorded_summary" ] || implementation_provenance_fail \
+      "member $member_id is missing gc.implementation.summary_path"
+    case "$recorded_summary" in
+      /*) ;;
+      *) implementation_provenance_fail \
+        "member $member_id gc.implementation.summary_path must be absolute" ;;
+    esac
+    [ -f "$recorded_summary" ] || implementation_provenance_fail \
+      "member $member_id gc.implementation.summary_path is not a file: $recorded_summary"
+    [ ! -L "$recorded_summary" ] || implementation_provenance_fail \
+      "member $member_id gc.implementation.summary_path must not be a symlink: $recorded_summary"
+    canonical_summary="$(cd "$(dirname "$recorded_summary")" 2>/dev/null && pwd -P)/$(basename "$recorded_summary")" || \
+      implementation_provenance_fail \
+        "member $member_id gc.implementation.summary_path does not resolve: $recorded_summary"
+    case "$canonical_summary" in
+      "$canonical_worktree"/*) allowed_untracked_paths+=("$canonical_summary") ;;
+      *) implementation_provenance_fail \
+        "member $member_id gc.implementation.summary_path must be inside its authoritative worktree" ;;
+    esac
   done <<<"$member_ids"
 
   if [ "$drain_policy" = "same-session" ] && [ "$found_terminal_commit" != "true" ]; then
@@ -215,17 +299,27 @@ print("sha256:" + hashlib.sha256(payload).hexdigest())
     implementation_provenance_fail "could not compute the current implementation snapshot"
   fi
 
-  root_summary="$(metadata_value "$PARENT_JSON" "gc.build.implementation_summary_path")"
-  if [ -n "$root_summary" ] && [ -f "$root_summary" ] && [ ! -L "$root_summary" ]; then
-    canonical_summary="$(cd "$(dirname "$root_summary")" 2>/dev/null && pwd -P)/$(basename "$root_summary")" || \
-      implementation_provenance_fail \
-        "gc.build.implementation_summary_path does not resolve: $root_summary"
-    for candidate_worktree in "${member_worktrees[@]}"; do
-      case "$canonical_summary" in
-        "$candidate_worktree"/*) allowed_untracked_paths+=("$canonical_summary") ;;
-      esac
-    done
+  root_snapshot="$(metadata_value "$PARENT_JSON" "gc.build.implementation_snapshot")"
+  if [ "$root_snapshot" != "$CURRENT_IMPLEMENTATION_SNAPSHOT" ]; then
+    implementation_provenance_fail \
+      "workflow root gc.build.implementation_snapshot does not match current implementation: recorded=${root_snapshot:-<missing>} current=$CURRENT_IMPLEMENTATION_SNAPSHOT"
   fi
+
+  root_summary="$(metadata_value "$PARENT_JSON" "gc.build.implementation_summary_path")"
+  [ -n "$root_summary" ] || implementation_provenance_fail \
+    "workflow root is missing gc.build.implementation_summary_path"
+  [ -f "$root_summary" ] || implementation_provenance_fail \
+    "gc.build.implementation_summary_path is not a file: $root_summary"
+  [ ! -L "$root_summary" ] || implementation_provenance_fail \
+    "gc.build.implementation_summary_path must not be a symlink: $root_summary"
+  canonical_summary="$(cd "$(dirname "$root_summary")" 2>/dev/null && pwd -P)/$(basename "$root_summary")" || \
+    implementation_provenance_fail \
+      "gc.build.implementation_summary_path does not resolve: $root_summary"
+  for candidate_worktree in "${member_worktrees[@]}"; do
+    case "$canonical_summary" in
+      "$candidate_worktree"/*) allowed_untracked_paths+=("$canonical_summary") ;;
+    esac
+  done
 
   local -a checked_worktrees=()
   for candidate_worktree in "${member_worktrees[@]}"; do
@@ -239,13 +333,26 @@ print("sha256:" + hashlib.sha256(payload).hexdigest())
     [ "$seen" = "false" ] || continue
     checked_worktrees+=("$candidate_worktree")
 
+    while IFS= read -r -d '' absolute_path; do
+      relative_path="${absolute_path#"$candidate_worktree/"}"
+      if ! git -C "$candidate_worktree" ls-files --error-unmatch -- "$relative_path" >/dev/null 2>&1; then
+        implementation_provenance_fail \
+          "unexpected untracked worktree path in $candidate_worktree: $relative_path"
+        return 1
+      fi
+    done < <(find "$candidate_worktree" \
+      -path "$candidate_worktree/.git" -prune -o \
+      \( -type l -o -type p -o -type s -o -type b -o -type c \) -print0)
+
     while IFS= read -r -d '' relative_path; do
+      absolute_path="$candidate_worktree/$relative_path"
       case "$relative_path" in
-        .pytest_cache/*|*/.pytest_cache/*|__pycache__/*.py[co]|*/__pycache__/*.py[co])
-          continue
+        .pytest_cache/*|*/.pytest_cache/*)
+          if [ -f "$absolute_path" ] && [ ! -L "$absolute_path" ]; then
+            continue
+          fi
           ;;
       esac
-      absolute_path="$candidate_worktree/$relative_path"
       allowed=false
       for allowed_path in "${allowed_untracked_paths[@]}"; do
         if [ "$absolute_path" = "$allowed_path" ]; then
@@ -258,15 +365,48 @@ print("sha256:" + hashlib.sha256(payload).hexdigest())
           "unexpected untracked worktree path in $candidate_worktree: $relative_path"
         return 1
       fi
-    done < <(git -C "$candidate_worktree" ls-files --others --exclude-standard -z)
+    done < <(git -C "$candidate_worktree" ls-files --others -z)
   done
+
+  local script_dir validator provenance_verifier provenance_output
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  validator="$script_dir/../validate_build_artifact.py"
+  provenance_verifier="$script_dir/../verify_implementation_provenance.py"
+  [ -f "$validator" ] || implementation_provenance_fail \
+    "artifact validator is missing: $validator"
+  [ -f "$provenance_verifier" ] || implementation_provenance_fail \
+    "shared verifier is missing: $provenance_verifier"
+  if ! provenance_output="$(python3 "$provenance_verifier" \
+    --root-id "$PARENT_ROOT" \
+    --expected-snapshot "$CURRENT_IMPLEMENTATION_SNAPSHOT" \
+    --expected-summary "$root_summary" \
+    --validator "$validator" 2>&1)"; then
+    implementation_provenance_fail "shared verification failed: $provenance_output"
+  fi
+  CURRENT_REVIEW_INPUT_SNAPSHOT="$(printf '%s\n' "$provenance_output" | jq -r \
+    '.review_input_snapshot // ""' 2>/dev/null)"
+  case "$CURRENT_REVIEW_INPUT_SNAPSHOT" in
+    sha256:????????????????????????????????????????????????????????????????) ;;
+    *) implementation_provenance_fail \
+      "shared verifier returned an invalid review input snapshot" ;;
+  esac
   IMPLEMENTATION_PROVENANCE_VALIDATED=true
 }
 
 approve() {
   local message="$1"
+  local approved_snapshot="$CURRENT_IMPLEMENTATION_SNAPSHOT"
+  local approved_review_input="$CURRENT_REVIEW_INPUT_SNAPSHOT"
   validate_declared_artifact
-  validate_implementation_provenance
+  validate_implementation_provenance true
+  if [ -n "$approved_snapshot" ] && {
+    [ "$approved_snapshot" != "$CURRENT_IMPLEMENTATION_SNAPSHOT" ] ||
+      [ "$approved_review_input" != "$CURRENT_REVIEW_INPUT_SNAPSHOT" ];
+  }; then
+    implementation_provenance_fail \
+      "implementation changed during final approval; a fresh review iteration is required"
+    return 1
+  fi
   echo "$message"
   exit 0
 }
@@ -316,23 +456,11 @@ VERDICT="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r '
   ] | last // ""
 ' 2>/dev/null)"
 
-REPORT="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r '
-  [
-    .[] | select((.metadata["code_review.report_path"] // "") != "")
-  ]
-  | sort_by([.updated_at // "", .id // ""])
-  | [
-    .[]
-    | select((.metadata["code_review.report_path"] // "") != "")
-    | .metadata["code_review.report_path"]
-  ] | last // ""
-' 2>/dev/null)"
-
 REVIEW_MODE="$(metadata_value "$ROOT_JSON" "gc.var.review_mode")"
 if [ -z "$REVIEW_MODE" ]; then
   REVIEW_MODE="$(metadata_value "$PARENT_JSON" "gc.var.review_mode")"
 fi
-if [ "$REVIEW_MODE" = "report" ]; then
+if [ "$REVIEW_MODE" = "report" ] && [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" != "true" ]; then
   REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.build.code_review_report_path")"
   if [ -z "$REPORT_MODE_PATH" ]; then
     REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.build.review_report_path")"
@@ -362,6 +490,127 @@ if [ "$REVIEW_MODE" = "report" ]; then
 fi
 
 validate_implementation_provenance
+
+if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
+  case "$STEP_ID" in
+    *.build-basic-review-loop)
+      REVIEW_PREFIX="${STEP_ID%.build-basic-review-loop}"
+      ;;
+    *)
+      echo "Implementation review needs another iteration: provenance-required loop has unexpected gc.step_id=${STEP_ID:-<missing>}" >&2
+      exit 1
+      ;;
+  esac
+  ACCEPTANCE_STEP="$REVIEW_PREFIX.acceptance-review"
+  TEST_EVIDENCE_STEP="$REVIEW_PREFIX.test-evidence-review"
+  SIMPLICITY_STEP="$REVIEW_PREFIX.simplicity-review"
+  SYNTHESIS_STEP="$REVIEW_PREFIX.synthesize-review"
+  APPLY_STEP="$REVIEW_PREFIX.apply-review-findings"
+
+  if ! STRICT_REVIEW_STATUS="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r \
+    --arg attempt "$ATTEMPT" \
+    --arg snapshot "$CURRENT_IMPLEMENTATION_SNAPSHOT" \
+    --arg review_input "$CURRENT_REVIEW_INPUT_SNAPSHOT" \
+    --arg acceptance_step "$ACCEPTANCE_STEP" \
+    --arg test_step "$TEST_EVIDENCE_STEP" \
+    --arg simplicity_step "$SIMPLICITY_STEP" \
+    --arg synthesis_step "$SYNTHESIS_STEP" \
+    --arg apply_step "$APPLY_STEP" '
+    def rows_for($step):
+      [.[] | select(
+        (.metadata["gc.step_id"] // "") == $step and
+        (.metadata["gc.scope_role"] // "") == "member"
+      )];
+    def nonempty($value):
+      (($value | type) == "string" and ($value | length) > 0);
+    def base_ok($rows):
+      (($rows | length) == 1) and
+      (($rows[0].status // "") == "closed") and
+      (($rows[0].metadata["gc.outcome"] // "") == "pass") and
+      (($rows[0].metadata["gc.attempt"] // "") == $attempt) and
+      (($rows[0].metadata["code_review.reviewed_attempt"] // "") == $attempt) and
+      (($rows[0].metadata["code_review.implementation_snapshot"] // "") == $snapshot) and
+      (($rows[0].metadata["code_review.review_input_snapshot"] // "") == $review_input);
+    def lane_ok($rows; $verdict_key):
+      base_ok($rows) and
+      (($rows[0].metadata[$verdict_key] // "") == "approve") and
+      nonempty($rows[0].metadata["code_review.output_path"] // "");
+    rows_for($acceptance_step) as $acceptance
+    | rows_for($test_step) as $test_evidence
+    | rows_for($simplicity_step) as $simplicity
+    | rows_for($synthesis_step) as $synthesis
+    | rows_for($apply_step) as $apply
+    | if (
+        lane_ok($acceptance; "code_review.acceptance_verdict") and
+        lane_ok($test_evidence; "code_review.test_evidence_verdict") and
+        lane_ok($simplicity; "code_review.simplicity_verdict") and
+        base_ok($synthesis) and
+        nonempty($synthesis[0].metadata["code_review.synthesis_path"] // "") and
+        nonempty($synthesis[0].metadata["code_review.output_path"] // "") and
+        base_ok($apply) and
+        (($apply[0].metadata["code_review.verdict"] // "") == "done") and
+        nonempty($apply[0].metadata["code_review.report_path"] // "") and
+        nonempty($apply[0].metadata["code_review.output_path"] // "")
+      ) then
+        "approved"
+      else
+        "iterate: exact current-attempt build-basic evidence or implementation snapshot is incomplete or stale " +
+        "counts acceptance=\($acceptance|length) test_evidence=\($test_evidence|length) " +
+        "simplicity=\($simplicity|length) synthesis=\($synthesis|length) apply=\($apply|length)"
+      end
+  ')"; then
+    echo "Implementation review needs another iteration: strict build-basic review metadata is malformed" >&2
+    exit 1
+  fi
+  if [ "$STRICT_REVIEW_STATUS" != "approved" ]; then
+    echo "Implementation review needs another iteration: $STRICT_REVIEW_STATUS"
+    exit 1
+  fi
+  ARTIFACT_ROOT="$(metadata_value "$PARENT_JSON" "gc.build.artifact_root")"
+  if [ -z "$ARTIFACT_ROOT" ]; then
+    ARTIFACT_ROOT="$(metadata_value "$PARENT_JSON" "gc.var.artifact_root")"
+  fi
+  case "$ARTIFACT_ROOT" in
+    /*) ;;
+    *)
+      ARTIFACT_LAUNCHER_TOP="$(git_top_level \
+        "$(metadata_value "$PARENT_JSON" "gc.work_dir")")" || \
+        implementation_provenance_fail "cannot resolve launcher root for relative artifact root"
+      ARTIFACT_ROOT="$ARTIFACT_LAUNCHER_TOP/$ARTIFACT_ROOT"
+      ;;
+  esac
+  ARTIFACT_ROOT="$(cd "$ARTIFACT_ROOT" 2>/dev/null && pwd -P)" || \
+    implementation_provenance_fail "workflow artifact root does not resolve: $ARTIFACT_ROOT"
+  if [ -n "${ARTIFACT_LAUNCHER_TOP:-}" ]; then
+    case "$ARTIFACT_ROOT" in
+      "$ARTIFACT_LAUNCHER_TOP"|"$ARTIFACT_LAUNCHER_TOP"/*) ;;
+      *) implementation_provenance_fail "relative workflow artifact root escapes launcher worktree" ;;
+    esac
+  fi
+
+  validate_review_evidence_path \
+    "$(review_evidence_path "$CURRENT_MATCHES" "$ACCEPTANCE_STEP" "code_review.output_path")" \
+    "acceptance review output" "$ARTIFACT_ROOT"
+  validate_review_evidence_path \
+    "$(review_evidence_path "$CURRENT_MATCHES" "$TEST_EVIDENCE_STEP" "code_review.output_path")" \
+    "test evidence review output" "$ARTIFACT_ROOT"
+  validate_review_evidence_path \
+    "$(review_evidence_path "$CURRENT_MATCHES" "$SIMPLICITY_STEP" "code_review.output_path")" \
+    "simplicity review output" "$ARTIFACT_ROOT"
+  validate_review_evidence_path \
+    "$(review_evidence_path "$CURRENT_MATCHES" "$SYNTHESIS_STEP" "code_review.synthesis_path")" \
+    "review synthesis" "$ARTIFACT_ROOT"
+  validate_review_evidence_path \
+    "$(review_evidence_path "$CURRENT_MATCHES" "$SYNTHESIS_STEP" "code_review.output_path")" \
+    "review synthesis output" "$ARTIFACT_ROOT"
+  validate_review_evidence_path \
+    "$(review_evidence_path "$CURRENT_MATCHES" "$APPLY_STEP" "code_review.report_path")" \
+    "review apply report" "$ARTIFACT_ROOT"
+  validate_review_evidence_path \
+    "$(review_evidence_path "$CURRENT_MATCHES" "$APPLY_STEP" "code_review.output_path")" \
+    "review apply output" "$ARTIFACT_ROOT"
+  approve "Implementation review approved"
+fi
 
 LANE_STATUS="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r \
   --arg require_snapshot "$IMPLEMENTATION_PROVENANCE_REQUIRED" \

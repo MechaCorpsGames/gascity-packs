@@ -523,7 +523,7 @@ trace:
                 summary_complete, expected_schema="gc.build.implementation-summary.v1"
             )
 
-    def test_review_artifact_status_matches_blocking_coverage(self) -> None:
+    def test_review_status_coverage_is_an_opt_in_producer_policy(self) -> None:
         approved = self.valid_artifact("gc.build.review.v1")
         changes_without_blocker = approved.replace(
             "\nstatus: approved\n", "\nstatus: changes_required\n"
@@ -550,28 +550,44 @@ trace:
         for text in (changes_without_blocker, blocked_without_blocker):
             front_matter = build_artifact_validator.parse_front_matter(text)[1]
             with self.subTest(status=front_matter["status"]):
+                compatible = build_artifact_validator.validate_artifact_text(
+                    text, expected_schema="gc.build.review.v1"
+                )
+                self.assertEqual(compatible.front_matter["status"], front_matter["status"])
                 with self.assertRaisesRegex(
                     build_artifact_validator.ValidationError,
                     "requires at least one blocked coverage entry",
                 ):
                     build_artifact_validator.validate_artifact_text(
-                        text, expected_schema="gc.build.review.v1"
+                        text,
+                        expected_schema="gc.build.review.v1",
+                        enforce_review_status_coverage=True,
                     )
 
+        compatible_blocked = build_artifact_validator.validate_artifact_text(
+            approved_with_blocker, expected_schema="gc.build.review.v1"
+        )
+        self.assertEqual(compatible_blocked.front_matter["status"], "approved")
         with self.assertRaisesRegex(
             build_artifact_validator.ValidationError,
             "approved review must not include blocked coverage",
         ):
             build_artifact_validator.validate_artifact_text(
-                approved_with_blocker, expected_schema="gc.build.review.v1"
+                approved_with_blocker,
+                expected_schema="gc.build.review.v1",
+                enforce_review_status_coverage=True,
             )
 
         artifact = build_artifact_validator.validate_artifact_text(
-            changes_with_blocker, expected_schema="gc.build.review.v1"
+            changes_with_blocker,
+            expected_schema="gc.build.review.v1",
+            enforce_review_status_coverage=True,
         )
         self.assertEqual(artifact.front_matter["status"], "changes_required")
         no_id_artifact = build_artifact_validator.validate_artifact_text(
-            changes_without_source_ids, expected_schema="gc.build.review.v1"
+            changes_without_source_ids,
+            expected_schema="gc.build.review.v1",
+            enforce_review_status_coverage=True,
         )
         self.assertEqual(no_id_artifact.coverage, [])
 

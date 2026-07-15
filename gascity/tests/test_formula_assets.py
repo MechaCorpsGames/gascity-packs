@@ -2135,6 +2135,40 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(contract=contract):
                 self.assertRegex(normalized, pattern)
 
+    def test_build_basic_review_producers_record_absolute_evidence_paths(self) -> None:
+        workflow_root = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "assets"
+            / "workflows"
+            / "build-basic-review"
+        )
+        for filename in (
+            "{target}.acceptance-review.md",
+            "{target}.test-evidence-review.md",
+            "{target}.simplicity-review.md",
+            "{target}.synthesize-review.md",
+            "{target}.apply-review-findings.md",
+        ):
+            prompt = (workflow_root / filename).read_text(encoding="utf-8")
+            normalized = " ".join(prompt.split())
+            with self.subTest(prompt=filename):
+                self.assertIn(
+                    "canonical absolute path under the build artifact root",
+                    normalized,
+                )
+
+    def test_build_basic_apply_prompt_has_expansion_headroom(self) -> None:
+        prompt = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "assets"
+            / "workflows"
+            / "build-basic-review"
+            / "{target}.apply-review-findings.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("{{implementation_target}}", prompt)
+        self.assertLessEqual(len(prompt.encode("utf-8")), 3840)
+
     def test_build_basic_required_review_fixes_reconcile_authoritative_provenance(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         apply_findings = (
@@ -2186,6 +2220,10 @@ class FormulaAssetTests(unittest.TestCase):
             "member id",
             "commit",
             "sha256",
+            '[{"commit":"<canonical lowercase full SHA>","id":"<id>"}]',
+            "no trailing newline",
+            "gc.build.code_review_context_path",
+            "gc.build.review_input_snapshot",
         ):
             with self.subTest(prompt="setup", fragment=fragment):
                 self.assertIn(fragment, setup)
@@ -2196,9 +2234,15 @@ class FormulaAssetTests(unittest.TestCase):
                 self.assertIn("gc.build.implementation_snapshot", lane_text)
                 self.assertIn("code_review.implementation_snapshot", lane_text)
                 self.assertIn("exact current implementation snapshot", lane_text)
+                self.assertIn(
+                    "code_review.reviewed_attempt=<current gc.attempt>", lane_text
+                )
+                self.assertIn("code_review.review_input_snapshot", lane_text)
 
         for fragment in (
             "code_review.implementation_snapshot",
+            "code_review.reviewed_attempt=<current gc.attempt>",
+            "code_review.review_input_snapshot",
             "all three",
             "must match",
         ):
@@ -2208,13 +2252,53 @@ class FormulaAssetTests(unittest.TestCase):
         for fragment in (
             "recompute the current implementation snapshot",
             "code_review.implementation_snapshot",
+            "code_review.reviewed_attempt=<current gc.attempt>",
+            "code_review.review_input_snapshot",
             "must set `code_review.verdict=iterate`",
             "subsequent unchanged",
             "root-checkout observation cannot override",
+            "Unchanged/no-op `done` example",
+            "Changed/restored-bytes `iterate` example",
         ):
             with self.subTest(prompt="apply", fragment=fragment):
                 self.assertIn(fragment, apply_findings)
         self.assertNotIn("If the only reported issue is", apply_findings)
+
+    def test_build_basic_final_artifacts_preserve_implementation_provenance(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        review = (
+            root
+            / "assets"
+            / "workflows"
+            / "build-basic-review"
+            / "{target}.md"
+        ).read_text(encoding="utf-8")
+        final_report = (
+            root / "assets" / "workflows" / "build-basic" / "finalize.md"
+        ).read_text(encoding="utf-8")
+
+        for fragment in (
+            "Trace the exact canonical implementation summary once",
+            "absolute `gc.build.implementation_summary_path`",
+            "freshly computed `sha256:<digest>`",
+            "`implementation_snapshot: <exact current snapshot>`",
+            "`review_input_snapshot: <exact current review-input snapshot>`",
+            "`reviewed_attempt: <exact positive loop attempt>`",
+            "gc.build.code_review_context_path",
+        ):
+            with self.subTest(artifact="review", fragment=fragment):
+                self.assertIn(fragment, review)
+
+        for fragment in (
+            "Trace the exact canonical implementation summary once",
+            "Trace the approved review artifact once",
+            "freshly computed `sha256:<digest>`",
+            "`implementation_snapshot: <exact approved snapshot>`",
+            "`review_input_snapshot: <exact approved review-input snapshot>`",
+            "`reviewed_attempt: <exact approved positive loop attempt>`",
+        ):
+            with self.subTest(artifact="final-report", fragment=fragment):
+                self.assertIn(fragment, final_report)
 
     def test_build_artifact_prompts_use_set_metadata_for_paths(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
@@ -2230,7 +2314,6 @@ class FormulaAssetTests(unittest.TestCase):
             "assets/workflows/build-basic/decompose.md": ["gc.build.decomposition_path"],
             "assets/workflows/build-basic/review.md": ["gc.build.review_report_path"],
             "assets/workflows/build-basic/finalize.md": [
-                "gc.build.implementation_summary_path",
                 "gc.build.final_report_path",
                 "gc.build.factory_run_path",
             ],
@@ -3363,6 +3446,53 @@ class FormulaAssetTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    @staticmethod
+    def _write_build_basic_item_summary(
+        path: pathlib.Path,
+        member_id: str,
+        worktree: pathlib.Path,
+        commit: str,
+        *,
+        same_session: bool = False,
+    ) -> None:
+        producer = "do-work-item" if same_session else "do-work"
+        stage = "implement-item" if same_session else "implement"
+        tracked_paths = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", commit],
+            cwd=worktree,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.splitlines()
+        tracked = next(
+            (candidate for candidate in tracked_paths if not pathlib.Path(candidate).name.startswith(".")),
+            tracked_paths[0],
+        )
+        tracked_digest = hashlib.sha256((worktree / tracked).read_bytes()).hexdigest()
+        path.write_text(
+            "---\n"
+            "schema: gc.build.implementation-summary.v1\n"
+            f"workflow: {{id: {member_id}, formula: {producer}}}\n"
+            "methodology: {pack: gascity, name: build-basic}\n"
+            f"producer: {{formula: {producer}, stage: {stage}, attempt: 1}}\n"
+            "status: approved\n"
+            "trace:\n"
+            "  upstream:\n"
+            f"    - path: beads/{member_id}\n"
+            f"      hash: bead:{member_id}\n"
+            f"    - path: {json.dumps(tracked)}\n"
+            f"      hash: sha256:{tracked_digest}\n"
+            "  coverage: []\n"
+            "---\n\n"
+            "## Summary\n\nThe assigned build-basic work is complete.\n\n"
+            "## Intended Behavior\n\nThe requested behavior is implemented.\n\n"
+            f"## Changed Files\n\n{tracked}\n\n"
+            "## Verification\n\n"
+            f"Worktree: {worktree.resolve()}\n\nCommit: {commit}\n\nTests passed.\n\n"
+            "## Remaining Risks\n\nNone recorded.\n",
+            encoding="utf-8",
+        )
+
     def test_gstack_state_check_requires_every_launch_source_in_requirements_trace(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             requirements = pathlib.Path(td) / "requirements.md"
@@ -4384,6 +4514,48 @@ class FormulaAssetTests(unittest.TestCase):
             ]
             with self.subTest(pack=pack_name, prompt=prompt_path):
                 self.assertEqual(missing_producer_contract, [])
+
+    def test_same_session_adapter_persists_exact_source_anchor_proof_before_closure(
+        self,
+    ) -> None:
+        prompt = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "assets"
+            / "workflows"
+            / "do-work-item"
+            / "implement-item.md"
+        ).read_text(encoding="utf-8")
+        producer_contract = (
+            "source anchor bead itself",
+            "gc bd update <source-anchor-id>",
+            "gc.implementation.worktree_path",
+            "gc.implementation.commit",
+            "gc.implementation.summary_path",
+            "git rev-parse HEAD",
+            "Read the source anchor bead back",
+            "same worktree",
+            "worktree's `HEAD`",
+            "inside that worktree",
+        )
+
+        missing_producer_contract = [
+            fragment for fragment in producer_contract if fragment not in prompt
+        ]
+        self.assertEqual(missing_producer_contract, [])
+
+    def test_build_basic_provenance_producers_require_approved_summaries(self) -> None:
+        workflow_root = (
+            pathlib.Path(__file__).resolve().parents[1] / "assets" / "workflows"
+        )
+        for relative_path in (
+            "do-work/implement.md",
+            "do-work-item/implement-item.md",
+            "build-base/summarize-implementation.md",
+        ):
+            prompt = (workflow_root / relative_path).read_text(encoding="utf-8")
+            with self.subTest(prompt=relative_path):
+                self.assertIn("Use `status: approved` before closing", prompt)
+                self.assertNotIn("or another schema-allowed status", prompt)
 
     def test_separate_session_adapter_summaries_hash_every_exact_member_artifact(
         self,
@@ -6661,6 +6833,41 @@ description = "Override sink that writes the base triage report contract."
                 self.assertEqual(step["metadata"]["gc.build.artifact_schema"], schema)
                 self.assertEqual(step["metadata"]["gc.build.artifact_path_keys"], path_keys)
 
+    def test_review_status_coverage_policy_is_explicit_on_affected_producers(self) -> None:
+        gascity_root = pathlib.Path(__file__).resolve().parents[1]
+        build_basic_review = load_formula(gascity_root, "build-basic-review")
+        target = next(
+            node for node in build_basic_review["template"] if node["id"] == "{target}"
+        )
+        self.assertEqual(
+            target["metadata"]["gc.build.require_review_status_coverage"],
+            "true",
+        )
+
+        repo_root = gascity_root.parent
+        bmad = tomllib.loads(
+            (repo_root / "bmad/formulas/bmad-code-review-flow.formula.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        affected = {
+            "{target}.synthesize-bmad-review",
+            "{target}",
+        }
+        for node in bmad["template"]:
+            if node["id"] in affected:
+                with self.subTest(node=node["id"]):
+                    self.assertEqual(
+                        node["metadata"]["gc.build.require_review_status_coverage"],
+                        "true",
+                    )
+
+        script = (
+            gascity_root / "assets/scripts/checks/build-artifact-valid.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("gc.build.require_review_status_coverage", script)
+        self.assertIn("--enforce-review-status-coverage", script)
+
     def _run_build_requirements_source_check(
         self,
         *,
@@ -6942,11 +7149,33 @@ description = "Override sink that writes the base triage report contract."
                 self.assertIn("existing regular file", text)
                 self.assertIn("real build root", text)
 
+    def test_strict_artifact_gates_recheck_pinned_inputs_before_approval(self) -> None:
+        checks_root = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "assets"
+            / "scripts"
+            / "checks"
+        )
+        artifact_gate = (checks_root / "build-artifact-valid.sh").read_text(
+            encoding="utf-8"
+        )
+        review_gate = (
+            checks_root / "implementation-review-approved.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('pin_file "$ARTIFACT_PATH"', artifact_gate)
+        self.assertIn("verify_pinned_files", artifact_gate)
+        self.assertIn("file changed during validation", artifact_gate)
+        self.assertIn("validate_implementation_provenance true", review_gate)
+        self.assertIn("implementation changed during final approval", review_gate)
+
     def _run_build_artifact_check(
         self,
         beads_by_id: dict[str, str],
         bead_id: str,
         extra_env: dict[str, str] | None = None,
+        convoy_json: str = "{}",
+        list_json: str = "[]",
     ) -> subprocess.CompletedProcess:
         root = pathlib.Path(__file__).resolve().parents[1]
         script = root / "assets" / "scripts" / "checks" / "build-artifact-valid.sh"
@@ -6957,17 +7186,30 @@ description = "Override sink that writes the base triage report contract."
             bin_dir.mkdir()
             show_dir = tmp / "show"
             show_dir.mkdir()
+            convoy_path = tmp / "convoy.json"
+            convoy_path.write_text(convoy_json, encoding="utf-8")
+            list_path = tmp / "list.json"
+            list_path.write_text(list_json, encoding="utf-8")
             for bead, payload in beads_by_id.items():
                 (show_dir / f"{bead}.json").write_text(payload, encoding="utf-8")
             fake_gc = bin_dir / "gc"
             fake_gc.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
-                "while [ \"${1:-}\" != \"bd\" ]; do shift; done\n"
-                "shift\n"
-                "case \"$1\" in\n"
-                "  version) exit 0 ;;\n"
-                "  show) cat \"$BD_SHOW_DIR/$2.json\" ;;\n"
+                "command_name=''\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  case \"$1\" in bd|convoy) command_name=\"$1\"; shift; break ;; *) shift ;; esac\n"
+                "done\n"
+                "case \"$command_name:${1:-}\" in\n"
+                "  bd:version) exit 0 ;;\n"
+                "  bd:show) cat \"$BD_SHOW_DIR/$2.json\" ;;\n"
+                "  bd:list)\n"
+                "    if [ -n \"${GC_TEST_MUTATE_ON_LIST_PATH:-}\" ]; then\n"
+                "      printf '\\nmutated during validation\\n' >> \"$GC_TEST_MUTATE_ON_LIST_PATH\"\n"
+                "    fi\n"
+                "    cat \"$BD_LIST_JSON\"\n"
+                "    ;;\n"
+                "  convoy:status) cat \"$CONVOY_JSON\" ;;\n"
                 "  *) exit 2 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -6978,6 +7220,8 @@ description = "Override sink that writes the base triage report contract."
                 **os.environ,
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                 "BD_SHOW_DIR": str(show_dir),
+                "CONVOY_JSON": str(convoy_path),
+                "BD_LIST_JSON": str(list_path),
                 "GC_BEAD_ID": bead_id,
                 **(extra_env or {}),
             }
@@ -7011,6 +7255,8 @@ description = "Override sink that writes the base triage report contract."
             list_path = tmp / "list.json"
             member_show_dir = tmp / "member-show"
             member_show_dir.mkdir()
+            member_show_count = tmp / "member-show-count"
+            member_show_count.write_text("0\n", encoding="utf-8")
             convoy_path = tmp / "convoy.json"
             show_path.write_text(show_json, encoding="utf-8")
             parent_show_path.write_text(parent_show_json or show_json, encoding="utf-8")
@@ -7032,6 +7278,14 @@ description = "Override sink that writes the base triage report contract."
                 "    if [ \"${2:-}\" = \"root\" ]; then\n"
                 "      cat \"$BD_PARENT_SHOW_JSON\"\n"
                 "    elif [ -f \"$BD_MEMBER_SHOW_DIR/${2:-}.json\" ]; then\n"
+                "      if [ -n \"${GC_TEST_MUTATE_ON_MEMBER_SHOW_PATH:-}\" ]; then\n"
+                "        count=$(cat \"$BD_MEMBER_SHOW_COUNT\")\n"
+                "        count=$((count + 1))\n"
+                "        printf '%s\\n' \"$count\" > \"$BD_MEMBER_SHOW_COUNT\"\n"
+                "        if [ \"$count\" -eq \"${GC_TEST_MUTATE_ON_MEMBER_SHOW_NUMBER:-3}\" ]; then\n"
+                "          printf '\\nmutated during final approval\\n' >> \"$GC_TEST_MUTATE_ON_MEMBER_SHOW_PATH\"\n"
+                "        fi\n"
+                "      fi\n"
                 "      cat \"$BD_MEMBER_SHOW_DIR/${2:-}.json\"\n"
                 "    else\n"
                 "      cat \"$BD_SHOW_JSON\"\n"
@@ -7051,6 +7305,7 @@ description = "Override sink that writes the base triage report contract."
                 "BD_SHOW_JSON": str(show_path),
                 "BD_PARENT_SHOW_JSON": str(parent_show_path),
                 "BD_MEMBER_SHOW_DIR": str(member_show_dir),
+                "BD_MEMBER_SHOW_COUNT": str(member_show_count),
                 "BD_LIST_JSON": str(list_path),
                 "CONVOY_JSON": str(convoy_path),
                 "GC_BEAD_ID": "loop",
@@ -7077,40 +7332,230 @@ description = "Override sink that writes the base triage report contract."
         return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
     @staticmethod
+    def _review_input_snapshot(
+        implementation_snapshot: str,
+        summary: pathlib.Path,
+        context: pathlib.Path,
+    ) -> str:
+        payload = {
+            "context": {
+                "path": str(context.resolve(strict=True)),
+                "sha256": f"sha256:{hashlib.sha256(context.read_bytes()).hexdigest()}",
+            },
+            "implementation_snapshot": implementation_snapshot,
+            "summary": {
+                "path": str(summary.resolve(strict=True)),
+                "sha256": f"sha256:{hashlib.sha256(summary.read_bytes()).hexdigest()}",
+            },
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+    @classmethod
     def _build_basic_review_rows(
+        cls,
         snapshot: str,
         *,
+        evidence_root: pathlib.Path,
         acceptance: str = "approve",
         test_evidence: str = "approve",
         simplicity: str = "approve",
         apply: str = "done",
+        include_controls: bool = False,
     ) -> str:
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        review_input_snapshot = cls._review_input_snapshot(
+            snapshot,
+            evidence_root / "implementation-summary.md",
+            evidence_root / "review-context.md",
+        )
+
+        def evidence(name: str) -> str:
+            path = evidence_root / f"{name}.md"
+            path.write_text(f"# {name}\n", encoding="utf-8")
+            return str(path)
+
         common = {
             "gc.root_bead_id": "root",
             "gc.attempt": "1",
             "gc.ralph_step_id": "review.build-basic-review-loop",
             "gc.scope_ref": "review.build-basic-review-loop.iteration.1",
+            "gc.scope_role": "member",
+            "gc.outcome": "pass",
+            "code_review.reviewed_attempt": "1",
             "code_review.implementation_snapshot": snapshot,
+            "code_review.review_input_snapshot": review_input_snapshot,
         }
         rows = []
-        for row_id, key, verdict in (
-            ("acceptance", "code_review.acceptance_verdict", acceptance),
-            ("test-evidence", "code_review.test_evidence_verdict", test_evidence),
-            ("simplicity", "code_review.simplicity_verdict", simplicity),
+        for row_id, step_id, key, verdict in (
+            (
+                "acceptance",
+                "review.acceptance-review",
+                "code_review.acceptance_verdict",
+                acceptance,
+            ),
+            (
+                "test-evidence",
+                "review.test-evidence-review",
+                "code_review.test_evidence_verdict",
+                test_evidence,
+            ),
+            (
+                "simplicity",
+                "review.simplicity-review",
+                "code_review.simplicity_verdict",
+                simplicity,
+            ),
         ):
-            rows.append({"id": row_id, "metadata": {**common, key: verdict}})
+            rows.append(
+                {
+                    "id": row_id,
+                    "status": "closed",
+                    "metadata": {
+                        **common,
+                        "gc.step_id": step_id,
+                        key: verdict,
+                        "code_review.output_path": evidence(row_id),
+                    },
+                }
+            )
         rows.append(
             {
-                "id": "apply",
+                "id": "synthesis",
+                "status": "closed",
                 "metadata": {
                     **common,
-                    "code_review.verdict": apply,
+                    "gc.step_id": "review.synthesize-review",
+                    "code_review.synthesis_path": evidence("synthesis"),
+                    "code_review.output_path": str(evidence_root / "synthesis.md"),
                 },
             }
         )
+        rows.append(
+            {
+                "id": "apply",
+                "status": "closed",
+                "metadata": {
+                    **common,
+                    "gc.step_id": "review.apply-review-findings",
+                    "code_review.verdict": apply,
+                    "code_review.report_path": evidence("apply"),
+                    "code_review.output_path": str(evidence_root / "apply.md"),
+                },
+            }
+        )
+        if include_controls:
+            for row in list(rows):
+                rows.append(
+                    {
+                        "id": f"{row['id']}-control",
+                        "status": "closed",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": "1",
+                            "gc.ralph_step_id": "review.build-basic-review-loop",
+                            "gc.scope_ref": "review.build-basic-review-loop.iteration.1",
+                            "gc.scope_role": "control",
+                            "gc.control_for": row["id"],
+                            "gc.step_id": row["metadata"]["gc.step_id"],
+                            "gc.outcome": "pass",
+                        },
+                    }
+                )
         return json.dumps(rows)
 
-    def test_implementation_review_check_rejects_untracked_product_but_allows_evidence_and_caches(
+    def _write_review_provenance_summaries(
+        self,
+        artifact_root: pathlib.Path,
+        members: dict[str, tuple[pathlib.Path, str]],
+        *,
+        same_session: bool = False,
+    ) -> tuple[pathlib.Path, dict[str, pathlib.Path]]:
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        member_summaries: dict[str, pathlib.Path] = {}
+        records: list[tuple[str, pathlib.Path, str, pathlib.Path]] = []
+        for member_id, (worktree, commit) in members.items():
+            name = (
+                f"implementation-summary-{member_id}.md"
+                if same_session
+                else "implementation-summary.md"
+            )
+            summary = worktree / name
+            self._write_build_basic_item_summary(
+                summary,
+                member_id,
+                worktree,
+                commit,
+                same_session=same_session,
+            )
+            member_summaries[member_id] = summary
+            records.append((member_id, worktree, commit, summary))
+        canonical = artifact_root / "implementation-summary.md"
+        self._write_build_basic_canonical_summary(canonical, records)
+        context = artifact_root / "review-context.md"
+        context.write_text(
+            "# Build-basic review context\n\n"
+            f"Canonical implementation summary: {canonical.resolve()}\n",
+            encoding="utf-8",
+        )
+        return canonical, member_summaries
+
+    @classmethod
+    def _review_provenance_root_metadata(
+        cls,
+        implementation_snapshot: str,
+        canonical_summary: pathlib.Path,
+        *,
+        artifact_root: str | pathlib.Path | None = None,
+    ) -> dict[str, str]:
+        context = canonical_summary.parent / "review-context.md"
+        return {
+            "gc.build.implementation_snapshot": implementation_snapshot,
+            "gc.build.implementation_summary_path": str(canonical_summary),
+            "gc.build.code_review_context_path": str(context),
+            "gc.build.review_input_snapshot": cls._review_input_snapshot(
+                implementation_snapshot,
+                canonical_summary,
+                context,
+            ),
+            "gc.var.artifact_root": str(artifact_root or canonical_summary.parent),
+        }
+
+    @staticmethod
+    def _write_build_basic_canonical_summary(
+        path: pathlib.Path,
+        members: list[tuple[str, pathlib.Path, str, pathlib.Path]],
+    ) -> None:
+        upstream = "".join(
+            "    - path: "
+            f"{json.dumps(str(summary.resolve()))}\n"
+            "      hash: sha256:"
+            f"{hashlib.sha256(summary.read_bytes()).hexdigest()}\n"
+            for _, _, _, summary in members
+        )
+        path.write_text(
+            "---\n"
+            "schema: gc.build.implementation-summary.v1\n"
+            "workflow: {id: root, formula: build-basic}\n"
+            "methodology: {pack: gascity, name: build-basic}\n"
+            "producer: {formula: build-basic, stage: summarize-implementation, attempt: 1}\n"
+            "status: approved\n"
+            "trace:\n"
+            "  upstream:\n"
+            f"{upstream}"
+            "  coverage: []\n"
+            "---\n\n"
+            "## Summary\n\nAll implementation members completed.\n\n"
+            "## Intended Behavior\n\nThe requested behavior is implemented.\n\n"
+            "## Changed Files\n\nRecorded in member summaries.\n\n"
+            "## Verification\n\nAll proof commands passed.\n\n"
+            "## Remaining Risks\n\nNone recorded.\n",
+            encoding="utf-8",
+        )
+
+    def test_implementation_review_check_rejects_untracked_product_but_allows_evidence_and_pytest_cache(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -7124,7 +7569,10 @@ description = "Override sink that writes the base triage report contract."
                 check=True,
             )
             (worktree / "slugger.py").write_text("value = 'recorded'\n", encoding="utf-8")
-            subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+            (worktree / ".gitignore").write_text("ignored_feature.py\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "slugger.py", ".gitignore"], cwd=worktree, check=True
+            )
             subprocess.run(
                 ["git", "commit", "-q", "-m", "record implementation"],
                 cwd=worktree,
@@ -7137,15 +7585,21 @@ description = "Override sink that writes the base triage report contract."
                 text=True,
                 capture_output=True,
             ).stdout.strip()
+            snapshot = self._implementation_snapshot({"member": commit})
+            launcher_step = worktree / "review-step"
+            launcher_step.mkdir()
 
-            summary = worktree / "implementation-summary.md"
-            summary.write_text("# Exact recorded evidence\n", encoding="utf-8")
+            artifact_root = pathlib.Path(td) / "artifacts"
+            canonical_summary, member_summaries = self._write_review_provenance_summaries(
+                artifact_root,
+                {"member": (worktree, commit)},
+            )
+            summary = member_summaries["member"]
             pytest_cache = worktree / ".pytest_cache" / "v" / "cache"
             pytest_cache.mkdir(parents=True)
             (pytest_cache / "nodeids").write_text("[]\n", encoding="utf-8")
             pycache = worktree / "pkg" / "__pycache__"
             pycache.mkdir(parents=True)
-            (pycache / "module.cpython-312.pyc").write_bytes(b"cache")
 
             loop = json.dumps(
                 [{
@@ -7162,7 +7616,13 @@ description = "Override sink that writes the base triage report contract."
                     "id": "root",
                     "metadata": {
                         "gc.formula_name": "build-basic",
+                        "gc.work_dir": str(launcher_step),
                         "gc.build.implementation_convoy_id": "implementation",
+                        **self._review_provenance_root_metadata(
+                            snapshot,
+                            canonical_summary,
+                            artifact_root=artifact_root,
+                        ),
                     },
                 }]
             )
@@ -7186,7 +7646,9 @@ description = "Override sink that writes the base triage report contract."
                 }
             )
             lanes = self._build_basic_review_rows(
-                self._implementation_snapshot({"member": commit})
+                snapshot,
+                evidence_root=artifact_root,
+                include_controls=True,
             )
 
             clean = self._run_implementation_review_check(
@@ -7197,6 +7659,245 @@ description = "Override sink that writes the base triage report contract."
                 list_json=lanes,
             )
             self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+            def run_current_gate() -> subprocess.CompletedProcess:
+                return self._run_implementation_review_check(
+                    show_json=loop,
+                    parent_show_json=parent,
+                    member_show_json={"member": member},
+                    convoy_json=convoy,
+                    list_json=lanes,
+                )
+
+            member_summary_bytes = summary.read_bytes()
+            summary.write_text("enabled = True\n", encoding="utf-8")
+            malformed_member_summary = run_current_gate()
+            summary.write_bytes(member_summary_bytes)
+
+            summary.write_bytes(
+                member_summary_bytes.replace(
+                    b"hash: bead:member",
+                    b"hash: bead:other",
+                    1,
+                )
+            )
+            wrong_member_source = run_current_gate()
+            summary.write_bytes(member_summary_bytes)
+
+            summary.write_bytes(
+                member_summary_bytes.replace(b"status: approved", b"status: draft", 1)
+            )
+            unapproved_member_summary = run_current_gate()
+            summary.write_bytes(member_summary_bytes)
+
+            member_summary_link = worktree / "implementation-summary-link.md"
+            member_summary_link.symlink_to(summary)
+            linked_member = json.loads(member)
+            linked_member[0]["metadata"]["gc.implementation.summary_path"] = str(
+                member_summary_link
+            )
+            symlinked_member_summary = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": json.dumps(linked_member)},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+            member_summary_link.unlink()
+
+            tracked_product = worktree / "slugger.py"
+            recorded_product = tracked_product.read_bytes()
+
+            subprocess.run(
+                ["git", "update-index", "--assume-unchanged", "slugger.py"],
+                cwd=worktree,
+                check=True,
+            )
+            tracked_product.write_text("value = 'assume-hidden'\n", encoding="utf-8")
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "diff", "--quiet", "HEAD", "--", "slugger.py"],
+                    cwd=worktree,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            assume_unchanged = run_current_gate()
+            subprocess.run(
+                ["git", "update-index", "--no-assume-unchanged", "slugger.py"],
+                cwd=worktree,
+                check=True,
+            )
+            tracked_product.write_bytes(recorded_product)
+
+            subprocess.run(
+                ["git", "update-index", "--skip-worktree", "slugger.py"],
+                cwd=worktree,
+                check=True,
+            )
+            tracked_product.write_text("value = 'skip-hidden'\n", encoding="utf-8")
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "diff", "--quiet", "HEAD", "--", "slugger.py"],
+                    cwd=worktree,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            skip_worktree = run_current_gate()
+            subprocess.run(
+                ["git", "update-index", "--no-skip-worktree", "slugger.py"],
+                cwd=worktree,
+                check=True,
+            )
+            tracked_product.write_bytes(recorded_product)
+
+            subprocess.run(
+                ["git", "config", "core.fileMode", "false"], cwd=worktree, check=True
+            )
+            tracked_product.chmod(0o755)
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "diff", "--quiet", "HEAD", "--", "slugger.py"],
+                    cwd=worktree,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            hidden_file_mode = run_current_gate()
+            tracked_product.chmod(0o644)
+            subprocess.run(
+                ["git", "config", "--unset", "core.fileMode"], cwd=worktree, check=True
+            )
+
+            attributes = worktree / ".git" / "info" / "attributes"
+            attributes.write_text("slugger.py filter=review-clean\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    "git",
+                    "config",
+                    "filter.review-clean.clean",
+                    "sed \"s/.*/value = 'recorded'/\"",
+                ],
+                cwd=worktree,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "filter.review-clean.smudge", "cat"],
+                cwd=worktree,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "filter.review-clean.required", "true"],
+                cwd=worktree,
+                check=True,
+            )
+            tracked_product.write_text("value = 'filter-hidden'\n", encoding="utf-8")
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "diff", "--quiet", "HEAD", "--", "slugger.py"],
+                    cwd=worktree,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            hidden_by_filter = run_current_gate()
+            tracked_product.write_bytes(recorded_product)
+            attributes.unlink()
+            subprocess.run(
+                ["git", "config", "--remove-section", "filter.review-clean"],
+                cwd=worktree,
+                check=True,
+            )
+
+            tracked_product.write_text("value = 'staged-only drift'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+            tracked_product.write_bytes(recorded_product)
+            staged_index_drift = run_current_gate()
+            subprocess.run(
+                ["git", "reset", "-q", "HEAD", "--", "slugger.py"],
+                cwd=worktree,
+                check=True,
+            )
+
+            replacement = subprocess.run(
+                ["git", "commit-tree", f"{commit}^{{tree}}"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                input="replacement commit\n",
+                capture_output=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "replace", commit, replacement], cwd=worktree, check=True
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "diff", "--quiet", "HEAD"],
+                    cwd=worktree,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            replacement_ref = run_current_gate()
+            subprocess.run(
+                ["git", "replace", "-d", commit], cwd=worktree, check=True
+            )
+
+            ignored_product = worktree / "ignored_feature.py"
+            ignored_product.write_text("enabled = True\n", encoding="utf-8")
+            ignored = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+            ignored_product.unlink()
+
+            cache_file = pycache / "module.cpython-312.pyc"
+            cache_file.write_bytes(b"executable bytecode")
+            cache_bytecode = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+            cache_file.unlink()
+            external_cache = pathlib.Path(td) / "external-cache.pyc"
+            external_cache.write_bytes(b"external cache bytes")
+            cache_file.symlink_to(external_cache)
+            cache_symlink = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+            cache_file.unlink()
+
+            os.mkfifo(cache_file)
+            cache_fifo = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+            cache_file.unlink()
+
+            pytest_bytecode = pytest_cache / "evil.cpython-312.pyc"
+            pytest_bytecode.write_bytes(b"executable pytest cache bytecode")
+            pytest_bytecode.chmod(0o755)
+            pytest_cache_bytecode = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+            pytest_bytecode.unlink()
 
             product = worktree / "new_feature.py"
             product.write_text("enabled = True\n", encoding="utf-8")
@@ -7218,29 +7919,245 @@ description = "Override sink that writes the base triage report contract."
                 convoy_json=convoy,
                 list_json=lanes,
             )
+            near_miss.unlink()
 
-        for result in (unexpected_product, unexpected_backup):
+            locked = worktree / "locked"
+            locked.mkdir()
+            (locked / "unreviewed_product.py").write_text(
+                "enabled = True\n", encoding="utf-8"
+            )
+            locked.chmod(0)
+            try:
+                unreadable_directory = run_current_gate()
+            finally:
+                locked.chmod(0o700)
+
+        for result in (
+            ignored,
+            cache_bytecode,
+            cache_symlink,
+            cache_fifo,
+            pytest_cache_bytecode,
+            unexpected_product,
+            unexpected_backup,
+        ):
             with self.subTest(stderr=result.stderr):
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("unexpected untracked worktree path", result.stderr)
+
+        for result, fragments in (
+            (assume_unchanged, ("unsupported index flag", "tag=h")),
+            (skip_worktree, ("unsupported index flag", "tag=S")),
+            (hidden_file_mode, ("tracked file mode differs from commit",)),
+            (hidden_by_filter, ("tracked raw bytes differ from commit",)),
+            (staged_index_drift, ("Git index entry differs from commit",)),
+            (replacement_ref, ("Git replacement refs are not allowed",)),
+        ):
+            with self.subTest(stderr=result.stderr):
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                for fragment in fragments:
+                    self.assertIn(fragment, result.stderr)
+
+        self.assertNotEqual(
+            unreadable_directory.returncode,
+            0,
+            unreadable_directory.stdout + unreadable_directory.stderr,
+        )
+        self.assertIn("cannot inspect worktree path", unreadable_directory.stderr)
+
+        for result in (
+            malformed_member_summary,
+            wrong_member_source,
+            unapproved_member_summary,
+            symlinked_member_summary,
+        ):
+            with self.subTest(stderr=result.stderr):
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("implementation provenance", result.stderr)
+
+    def test_implementation_review_check_rejects_subdirectory_and_foreign_repository_provenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+
+            def init_repo(path: pathlib.Path, value: str) -> str:
+                path.mkdir()
+                subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+                subprocess.run(
+                    ["git", "config", "user.name", "Review Test"], cwd=path, check=True
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "review@example.invalid"],
+                    cwd=path,
+                    check=True,
+                )
+                (path / "slugger.py").write_text(f"value = {value!r}\n", encoding="utf-8")
+                subprocess.run(["git", "add", "slugger.py"], cwd=path, check=True)
+                subprocess.run(
+                    ["git", "commit", "-q", "-m", f"record {value}"],
+                    cwd=path,
+                    check=True,
+                )
+                return subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=path,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+
+            launcher = root / "launcher"
+            launcher_commit = init_repo(launcher, "launcher")
+            launcher_step = launcher / "review-step"
+            launcher_step.mkdir()
+            member_repo = root / "member"
+            member_commit = init_repo(member_repo, "foreign")
+
+            loop = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.step_id": "review.build-basic-review-loop",
+                        "gc.build.require_implementation_provenance": "true",
+                    },
+                }]
+            )
+            convoy = json.dumps(
+                {
+                    "convoy": {"id": "implementation", "status": "closed"},
+                    "children": [{"id": "member", "status": "closed"}],
+                }
+            )
+
+            def parent(
+                repo_step: pathlib.Path,
+                snapshot: str,
+                canonical_summary: pathlib.Path,
+            ) -> str:
+                return json.dumps(
+                    [{
+                        "id": "root",
+                        "metadata": {
+                            "gc.formula_name": "build-basic",
+                            "gc.work_dir": str(repo_step),
+                            "gc.build.implementation_convoy_id": "implementation",
+                            **self._review_provenance_root_metadata(
+                                snapshot,
+                                canonical_summary,
+                            ),
+                        },
+                    }]
+                )
+
+            def member(
+                work_dir: pathlib.Path,
+                commit: str,
+                summary: pathlib.Path,
+            ) -> str:
+                return json.dumps(
+                    [{
+                        "id": "member",
+                        "status": "closed",
+                        "metadata": {
+                            "gc.outcome": "pass",
+                            "work_dir": str(work_dir),
+                            "gc.implementation.worktree_path": str(work_dir),
+                            "gc.implementation.commit": commit,
+                            "gc.implementation.summary_path": str(summary),
+                        },
+                    }]
+                )
+
+            foreign_snapshot = self._implementation_snapshot({"member": member_commit})
+            foreign_canonical, foreign_summaries = self._write_review_provenance_summaries(
+                root / "foreign-artifacts",
+                {"member": (member_repo, member_commit)},
+            )
+            foreign = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent(
+                    launcher_step, foreign_snapshot, foreign_canonical
+                ),
+                member_show_json={
+                    "member": member(
+                        member_repo,
+                        member_commit,
+                        foreign_summaries["member"],
+                    )
+                },
+                convoy_json=convoy,
+                list_json=self._build_basic_review_rows(
+                    foreign_snapshot,
+                    evidence_root=foreign_canonical.parent,
+                ),
+            )
+
+            subdir = launcher / "src"
+            subdir.mkdir()
+            (launcher / "hidden-at-root.py").write_text("hidden = True\n", encoding="utf-8")
+            subdir_snapshot = self._implementation_snapshot({"member": launcher_commit})
+            subdir_canonical, subdir_summaries = self._write_review_provenance_summaries(
+                root / "subdir-artifacts",
+                {"member": (launcher, launcher_commit)},
+            )
+            subdirectory = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent(
+                    launcher_step, subdir_snapshot, subdir_canonical
+                ),
+                member_show_json={
+                    "member": member(
+                        subdir,
+                        launcher_commit,
+                        subdir_summaries["member"],
+                    )
+                },
+                convoy_json=convoy,
+                list_json=self._build_basic_review_rows(
+                    subdir_snapshot,
+                    evidence_root=subdir_canonical.parent,
+                ),
+            )
+
+        for case, result in (("foreign", foreign), ("subdirectory", subdirectory)):
+            with self.subTest(case=case, stderr=result.stderr):
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("implementation provenance", result.stderr)
 
     def test_implementation_review_check_rejects_distinct_same_session_worktrees(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td)
+            launcher = root / "launcher"
+            launcher.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=launcher, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Review Test"], cwd=launcher, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "review@example.invalid"],
+                cwd=launcher,
+                check=True,
+            )
+            (launcher / "base.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "base.txt"], cwd=launcher, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "base implementation"],
+                cwd=launcher,
+                check=True,
+            )
+            launcher_step = launcher / "review-step"
+            launcher_step.mkdir()
             commits: dict[str, str] = {}
-            members: dict[str, str] = {}
+            worktrees: dict[str, pathlib.Path] = {}
             for member_id in ("member-a", "member-b"):
                 worktree = root / member_id
-                worktree.mkdir()
-                subprocess.run(["git", "init", "-q", "-b", "main"], cwd=worktree, check=True)
                 subprocess.run(
-                    ["git", "config", "user.name", "Review Test"], cwd=worktree, check=True
-                )
-                subprocess.run(
-                    ["git", "config", "user.email", "review@example.invalid"],
-                    cwd=worktree,
+                    ["git", "worktree", "add", "-q", "--detach", str(worktree)],
+                    cwd=launcher,
                     check=True,
                 )
                 (worktree / "slugger.py").write_text(
@@ -7260,7 +8177,18 @@ description = "Override sink that writes the base triage report contract."
                     capture_output=True,
                 ).stdout.strip()
                 commits[member_id] = commit
-                members[member_id] = json.dumps(
+                worktrees[member_id] = worktree
+
+            canonical_summary, member_summaries = self._write_review_provenance_summaries(
+                root / "artifacts",
+                {
+                    member_id: (worktrees[member_id], commit)
+                    for member_id, commit in commits.items()
+                },
+                same_session=True,
+            )
+            members = {
+                member_id: json.dumps(
                     [{
                         "id": member_id,
                         "status": "closed",
@@ -7269,10 +8197,19 @@ description = "Override sink that writes the base triage report contract."
                             "work_dir": str(worktree),
                             "gc.implementation.worktree_path": str(worktree),
                             "gc.implementation.commit": commit,
+                            "gc.implementation.summary_path": str(
+                                member_summaries[member_id]
+                            ),
                         },
                     }]
                 )
+                for member_id, (worktree, commit) in {
+                    member_id: (worktrees[member_id], commit)
+                    for member_id, commit in commits.items()
+                }.items()
+            }
 
+            snapshot = self._implementation_snapshot(commits)
             loop = json.dumps(
                 [{
                     "id": "loop",
@@ -7288,7 +8225,12 @@ description = "Override sink that writes the base triage report contract."
                     "id": "root",
                     "metadata": {
                         "gc.formula_name": "build-basic",
+                        "gc.work_dir": str(launcher_step),
                         "gc.build.implementation_convoy_id": "implementation",
+                        **self._review_provenance_root_metadata(
+                            snapshot,
+                            canonical_summary,
+                        ),
                         "gc.var.drain_policy": "same-session",
                     },
                 }]
@@ -7308,7 +8250,8 @@ description = "Override sink that writes the base triage report contract."
                 member_show_json=members,
                 convoy_json=convoy,
                 list_json=self._build_basic_review_rows(
-                    self._implementation_snapshot(commits)
+                    snapshot,
+                    evidence_root=canonical_summary.parent,
                 ),
             )
 
@@ -7358,6 +8301,17 @@ description = "Override sink that writes the base triage report contract."
                 capture_output=True,
             ).stdout.strip()
             commits = {"member-a": first, "member-b": terminal}
+            snapshot = self._implementation_snapshot(commits)
+            launcher_step = worktree / "review-step"
+            launcher_step.mkdir()
+            canonical_summary, member_summaries = self._write_review_provenance_summaries(
+                pathlib.Path(td) / "artifacts",
+                {
+                    member_id: (worktree, commit)
+                    for member_id, commit in commits.items()
+                },
+                same_session=True,
+            )
             members = {
                 member_id: json.dumps(
                     [{
@@ -7368,6 +8322,9 @@ description = "Override sink that writes the base triage report contract."
                             "work_dir": str(worktree),
                             "gc.implementation.worktree_path": str(worktree),
                             "gc.implementation.commit": commit,
+                            "gc.implementation.summary_path": str(
+                                member_summaries[member_id]
+                            ),
                         },
                     }]
                 )
@@ -7388,7 +8345,12 @@ description = "Override sink that writes the base triage report contract."
                     "id": "root",
                     "metadata": {
                         "gc.formula_name": "build-basic",
+                        "gc.work_dir": str(launcher_step),
                         "gc.build.implementation_convoy_id": "implementation",
+                        **self._review_provenance_root_metadata(
+                            snapshot,
+                            canonical_summary,
+                        ),
                         "gc.var.drain_policy": "same-session",
                     },
                 }]
@@ -7409,12 +8371,34 @@ description = "Override sink that writes the base triage report contract."
                 member_show_json=members,
                 convoy_json=convoy,
                 list_json=self._build_basic_review_rows(
-                    self._implementation_snapshot(commits)
+                    snapshot,
+                    evidence_root=canonical_summary.parent,
+                ),
+            )
+            member_summaries["member-b"].unlink()
+            aliased_members = dict(members)
+            member_b = json.loads(aliased_members["member-b"])
+            member_b[0]["metadata"]["gc.implementation.summary_path"] = str(
+                member_summaries["member-a"]
+            )
+            aliased_members["member-b"] = json.dumps(member_b)
+            aliased_convoy = json.loads(convoy)
+            aliased_convoy["children"].reverse()
+            aliased = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json=aliased_members,
+                convoy_json=json.dumps(aliased_convoy),
+                list_json=self._build_basic_review_rows(
+                    snapshot,
+                    evidence_root=canonical_summary.parent,
                 ),
             )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Implementation review approved", result.stdout)
+        self.assertNotEqual(aliased.returncode, 0, aliased.stdout + aliased.stderr)
+        self.assertIn("summary aliases", aliased.stderr)
 
     def test_implementation_review_check_rejects_tracked_bytes_after_recorded_commit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -7436,6 +8420,13 @@ description = "Override sink that writes the base triage report contract."
                 text=True,
                 capture_output=True,
             ).stdout.strip()
+            snapshot = self._implementation_snapshot({"member": recorded_commit})
+            launcher_step = worktree / "review-step"
+            launcher_step.mkdir()
+            canonical_summary, member_summaries = self._write_review_provenance_summaries(
+                pathlib.Path(td) / "artifacts",
+                {"member": (worktree, recorded_commit)},
+            )
             loop = json.dumps(
                 [
                     {
@@ -7454,7 +8445,12 @@ description = "Override sink that writes the base triage report contract."
                         "id": "root",
                         "metadata": {
                             "gc.formula_name": "build-basic",
+                            "gc.work_dir": str(launcher_step),
                             "gc.build.implementation_convoy_id": "implementation",
+                            **self._review_provenance_root_metadata(
+                                snapshot,
+                                canonical_summary,
+                            ),
                         },
                     }
                 ]
@@ -7469,6 +8465,9 @@ description = "Override sink that writes the base triage report contract."
                             "work_dir": str(worktree),
                             "gc.implementation.worktree_path": str(worktree),
                             "gc.implementation.commit": recorded_commit,
+                            "gc.implementation.summary_path": str(
+                                member_summaries["member"]
+                            ),
                         },
                     }
                 ]
@@ -7480,7 +8479,8 @@ description = "Override sink that writes the base triage report contract."
                 }
             )
             lanes = self._build_basic_review_rows(
-                self._implementation_snapshot({"member": recorded_commit})
+                snapshot,
+                evidence_root=canonical_summary.parent,
             )
 
             clean = self._run_implementation_review_check(
@@ -7533,6 +8533,18 @@ description = "Override sink that writes the base triage report contract."
                 text=True,
                 capture_output=True,
             ).stdout.strip()
+            reviewed_snapshot = self._implementation_snapshot(
+                {"member": reviewed_commit}
+            )
+            launcher_step = worktree / "review-step"
+            launcher_step.mkdir()
+            artifact_root = pathlib.Path(td) / "artifacts"
+            canonical_summary, member_summaries = self._write_review_provenance_summaries(
+                artifact_root,
+                {"member": (worktree, reviewed_commit)},
+            )
+            preallocated_review = artifact_root / "preallocated-review.md"
+            preallocated_review.write_text("# Preallocated review\n", encoding="utf-8")
 
             loop = json.dumps(
                 [{
@@ -7544,15 +8556,39 @@ description = "Override sink that writes the base triage report contract."
                     },
                 }]
             )
-            parent = json.dumps(
-                [{
-                    "id": "root",
-                    "metadata": {
-                        "gc.formula_name": "build-basic",
-                        "gc.build.implementation_convoy_id": "implementation",
-                    },
-                }]
-            )
+            def parent_payload(
+                snapshot: str | None,
+                *,
+                report_mode: bool = False,
+                summary_path: pathlib.Path | None = None,
+                context_path: pathlib.Path | None = None,
+            ) -> str:
+                selected_summary = summary_path or canonical_summary
+                selected_context = context_path or artifact_root / "review-context.md"
+                review_snapshot = snapshot or reviewed_snapshot
+                metadata = {
+                    "gc.formula_name": "build-basic",
+                    "gc.work_dir": str(launcher_step),
+                    "gc.build.implementation_convoy_id": "implementation",
+                    "gc.build.implementation_summary_path": str(selected_summary),
+                    "gc.build.code_review_context_path": str(selected_context),
+                    "gc.build.review_input_snapshot": self._review_input_snapshot(
+                        review_snapshot,
+                        selected_summary,
+                        selected_context,
+                    ),
+                    "gc.var.artifact_root": str(artifact_root),
+                }
+                if snapshot is not None:
+                    metadata["gc.build.implementation_snapshot"] = snapshot
+                if report_mode:
+                    metadata.update(
+                        {
+                            "gc.var.review_mode": "report",
+                            "gc.build.review_report_path": str(preallocated_review),
+                        }
+                    )
+                return json.dumps([{"id": "root", "metadata": metadata}])
             convoy = json.dumps(
                 {
                     "convoy": {"id": "implementation", "status": "closed"},
@@ -7570,17 +8606,20 @@ description = "Override sink that writes the base triage report contract."
                             "work_dir": str(worktree),
                             "gc.implementation.worktree_path": str(worktree),
                             "gc.implementation.commit": commit,
+                            "gc.implementation.summary_path": str(
+                                member_summaries["member"]
+                            ),
                         },
                     }]
                 )
 
-            reviewed_snapshot = self._implementation_snapshot(
-                {"member": reviewed_commit}
+            reviewed_lanes = self._build_basic_review_rows(
+                reviewed_snapshot,
+                evidence_root=artifact_root,
             )
-            reviewed_lanes = self._build_basic_review_rows(reviewed_snapshot)
             reviewed = self._run_implementation_review_check(
                 show_json=loop,
-                parent_show_json=parent,
+                parent_show_json=parent_payload(reviewed_snapshot),
                 member_show_json={"member": member_payload(reviewed_commit)},
                 convoy_json=convoy,
                 list_json=reviewed_lanes,
@@ -7602,41 +8641,316 @@ description = "Override sink that writes the base triage report contract."
                 capture_output=True,
             ).stdout.strip()
             current_member = {"member": member_payload(current_commit)}
+            current_snapshot = self._implementation_snapshot(
+                {"member": current_commit}
+            )
+            canonical_summary, member_summaries = self._write_review_provenance_summaries(
+                artifact_root,
+                {"member": (worktree, current_commit)},
+            )
             stale = self._run_implementation_review_check(
                 show_json=loop,
-                parent_show_json=parent,
+                parent_show_json=parent_payload(current_snapshot),
                 member_show_json=current_member,
                 convoy_json=convoy,
                 list_json=reviewed_lanes,
             )
 
-            current_snapshot = self._implementation_snapshot(
-                {"member": current_commit}
+            current_lanes = self._build_basic_review_rows(
+                current_snapshot,
+                evidence_root=artifact_root,
             )
-            current_lanes = self._build_basic_review_rows(current_snapshot)
             fresh = self._run_implementation_review_check(
                 show_json=loop,
-                parent_show_json=parent,
+                parent_show_json=parent_payload(current_snapshot),
                 member_show_json=current_member,
                 convoy_json=convoy,
                 list_json=current_lanes,
             )
 
+            current_product_bytes = product.read_bytes()
+            changed_during_final_approval = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent_payload(current_snapshot),
+                member_show_json=current_member,
+                convoy_json=convoy,
+                list_json=current_lanes,
+                extra_env={"GC_TEST_MUTATE_ON_MEMBER_SHOW_PATH": str(product)},
+            )
+            product.write_bytes(current_product_bytes)
+
             missing_rows = json.loads(current_lanes)
             del missing_rows[0]["metadata"]["code_review.implementation_snapshot"]
             missing = self._run_implementation_review_check(
                 show_json=loop,
-                parent_show_json=parent,
+                parent_show_json=parent_payload(current_snapshot),
                 member_show_json=current_member,
                 convoy_json=convoy,
                 list_json=json.dumps(missing_rows),
             )
+
+            def run_contract_case(
+                rows: list[dict[str, object]],
+                *,
+                parent_json: str | None = None,
+            ) -> subprocess.CompletedProcess:
+                return self._run_implementation_review_check(
+                    show_json=loop,
+                    parent_show_json=parent_json or parent_payload(current_snapshot),
+                    member_show_json=current_member,
+                    convoy_json=convoy,
+                    list_json=json.dumps(rows),
+                )
+
+            strict_results: dict[str, subprocess.CompletedProcess] = {}
+
+            strict_results["missing root snapshot"] = run_contract_case(
+                json.loads(current_lanes), parent_json=parent_payload(None)
+            )
+            strict_results["stale root snapshot"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(reviewed_snapshot),
+            )
+
+            current_parent = parent_payload(current_snapshot)
+            canonical_bytes = canonical_summary.read_bytes()
+            canonical_summary.write_bytes(canonical_bytes + b"\nPost-review summary drift.\n")
+            strict_results["mutated canonical summary"] = run_contract_case(
+                json.loads(current_lanes), parent_json=current_parent
+            )
+            canonical_summary.write_bytes(canonical_bytes)
+
+            member_trace_link = artifact_root / "member-summary-trace-link.md"
+            member_trace_link.symlink_to(member_summaries["member"])
+            aliased_trace_bytes = canonical_bytes.replace(
+                str(member_summaries["member"]).encode("utf-8"),
+                str(member_trace_link).encode("utf-8"),
+                1,
+            )
+            self.assertNotEqual(aliased_trace_bytes, canonical_bytes)
+            canonical_summary.write_bytes(aliased_trace_bytes)
+            aliased_trace_parent = parent_payload(current_snapshot)
+            aliased_trace_input = json.loads(aliased_trace_parent)[0]["metadata"][
+                "gc.build.review_input_snapshot"
+            ]
+            aliased_trace_rows = json.loads(current_lanes)
+            for row in aliased_trace_rows:
+                row["metadata"]["code_review.review_input_snapshot"] = aliased_trace_input
+            strict_results["member summary trace path alias"] = run_contract_case(
+                aliased_trace_rows,
+                parent_json=aliased_trace_parent,
+            )
+            canonical_summary.write_bytes(canonical_bytes)
+
+            member_trace_alias_dir = member_summaries["member"].parent / "trace-alias"
+            member_trace_alias_dir.mkdir()
+            member_trace_dot_dot = (
+                member_trace_alias_dir / ".." / member_summaries["member"].name
+            )
+            dot_dot_trace_bytes = canonical_bytes.replace(
+                str(member_summaries["member"]).encode("utf-8"),
+                str(member_trace_dot_dot).encode("utf-8"),
+                1,
+            )
+            self.assertNotEqual(dot_dot_trace_bytes, canonical_bytes)
+            canonical_summary.write_bytes(dot_dot_trace_bytes)
+            dot_dot_trace_parent = parent_payload(current_snapshot)
+            dot_dot_trace_input = json.loads(dot_dot_trace_parent)[0]["metadata"][
+                "gc.build.review_input_snapshot"
+            ]
+            dot_dot_trace_rows = json.loads(current_lanes)
+            for row in dot_dot_trace_rows:
+                row["metadata"]["code_review.review_input_snapshot"] = (
+                    dot_dot_trace_input
+                )
+            strict_results["member summary trace dot-dot alias"] = run_contract_case(
+                dot_dot_trace_rows,
+                parent_json=dot_dot_trace_parent,
+            )
+            canonical_summary.write_bytes(canonical_bytes)
+
+            canonical_summary.write_text("not a build artifact\n", encoding="utf-8")
+            strict_results["malformed canonical summary"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(current_snapshot),
+            )
+            canonical_summary.write_bytes(canonical_bytes)
+
+            canonical_summary.write_bytes(
+                canonical_bytes.replace(
+                    b"workflow: {id: root, formula: build-basic}",
+                    b"workflow: {id: root, formula: other-build}",
+                    1,
+                )
+            )
+            strict_results["wrong canonical summary identity"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(current_snapshot),
+            )
+            canonical_summary.write_bytes(canonical_bytes)
+
+            canonical_summary.write_bytes(
+                canonical_bytes.replace(b"status: approved", b"status: draft", 1)
+            )
+            strict_results["unapproved canonical summary"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(current_snapshot),
+            )
+            canonical_summary.write_bytes(canonical_bytes)
+
+            review_context = artifact_root / "review-context.md"
+            context_bytes = review_context.read_bytes()
+            review_context.write_bytes(context_bytes + b"\nPost-review context drift.\n")
+            strict_results["mutated review context"] = run_contract_case(
+                json.loads(current_lanes), parent_json=current_parent
+            )
+            review_context.write_bytes(context_bytes)
+
+            summary_copy = artifact_root / "implementation-summary-copy.md"
+            summary_copy.write_bytes(canonical_bytes)
+            strict_results["same-byte summary repoint"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(
+                    current_snapshot,
+                    summary_path=summary_copy,
+                ),
+            )
+
+            context_copy = artifact_root / "review-context-copy.md"
+            context_copy.write_bytes(context_bytes)
+            strict_results["same-byte context repoint"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(
+                    current_snapshot,
+                    context_path=context_copy,
+                ),
+            )
+
+            summary_symlink = artifact_root / "implementation-summary-link.md"
+            summary_symlink.symlink_to(canonical_summary)
+            strict_results["canonical summary symlink"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(
+                    current_snapshot,
+                    summary_path=summary_symlink,
+                ),
+            )
+
+            context_symlink = artifact_root / "review-context-link.md"
+            context_symlink.symlink_to(review_context)
+            strict_results["review context symlink"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(
+                    current_snapshot,
+                    context_path=context_symlink,
+                ),
+            )
+
+            outside_context = pathlib.Path(td) / "outside-review-context.md"
+            outside_context.write_bytes(context_bytes)
+            strict_results["review context outside artifact root"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(
+                    current_snapshot,
+                    context_path=outside_context,
+                ),
+            )
+
+            strict_results["review context aliases summary"] = run_contract_case(
+                json.loads(current_lanes),
+                parent_json=parent_payload(
+                    current_snapshot,
+                    context_path=canonical_summary,
+                ),
+            )
+
+            rows = json.loads(current_lanes)
+            rows[0]["metadata"]["gc.step_id"] = "review.apply-review-findings"
+            strict_results["wrong lane step"] = run_contract_case(rows)
+
+            rows = json.loads(current_lanes)
+            rows[0]["metadata"]["code_review.reviewed_attempt"] = "0"
+            strict_results["stale reviewed attempt"] = run_contract_case(rows)
+
+            rows = json.loads(current_lanes)
+            rows[0]["metadata"]["code_review.acceptance_verdict"] = "iterate"
+            rows[-1]["metadata"]["code_review.acceptance_verdict"] = "approve"
+            strict_results["lane impersonation"] = run_contract_case(rows)
+
+            rows = json.loads(current_lanes)
+            duplicate_lane = json.loads(json.dumps(rows[0]))
+            duplicate_lane["id"] = "acceptance-duplicate"
+            rows.append(duplicate_lane)
+            strict_results["duplicate member lane"] = run_contract_case(rows)
+
+            rows = [row for row in json.loads(current_lanes) if row["id"] != "synthesis"]
+            strict_results["missing synthesis"] = run_contract_case(rows)
+
+            rows = json.loads(current_lanes)
+            rows[3]["metadata"]["code_review.implementation_snapshot"] = reviewed_snapshot
+            strict_results["stale synthesis snapshot"] = run_contract_case(rows)
+
+            rows = json.loads(current_lanes)
+            rows[3]["metadata"]["code_review.review_input_snapshot"] = (
+                json.loads(reviewed_lanes)[3]["metadata"]["code_review.review_input_snapshot"]
+            )
+            strict_results["stale synthesis review input"] = run_contract_case(rows)
+
+            rows = json.loads(current_lanes)
+            del rows[0]["metadata"]["code_review.output_path"]
+            strict_results["missing lane output"] = run_contract_case(rows)
+
+            rows = [row for row in json.loads(current_lanes) if row["id"] != "apply"]
+            strict_results["missing apply"] = run_contract_case(rows)
+            strict_results["report mode missing apply"] = run_contract_case(
+                rows,
+                parent_json=parent_payload(current_snapshot, report_mode=True),
+            )
+
+            for verdict in ("approved", "pass"):
+                strict_results[f"apply verdict {verdict}"] = run_contract_case(
+                    json.loads(
+                        self._build_basic_review_rows(
+                            current_snapshot,
+                            evidence_root=artifact_root,
+                            apply=verdict,
+                        )
+                    )
+                )
+
+            rows = json.loads(current_lanes)
+            rows[-1]["metadata"]["code_review.implementation_snapshot"] = reviewed_snapshot
+            strict_results["stale apply snapshot"] = run_contract_case(rows)
+
+            rows = json.loads(current_lanes)
+            rows[-1]["metadata"]["code_review.review_input_snapshot"] = (
+                json.loads(reviewed_lanes)[-1]["metadata"]["code_review.review_input_snapshot"]
+            )
+            strict_results["stale apply review input"] = run_contract_case(rows)
+
+            for key in ("code_review.report_path", "code_review.output_path"):
+                rows = json.loads(current_lanes)
+                del rows[-1]["metadata"][key]
+                strict_results[f"missing apply {key}"] = run_contract_case(rows)
 
         for result in (stale, missing):
             with self.subTest(stdout=result.stdout, stderr=result.stderr):
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("implementation snapshot", (result.stdout + result.stderr).lower())
         self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+        self.assertNotEqual(
+            changed_during_final_approval.returncode,
+            0,
+            changed_during_final_approval.stdout
+            + changed_during_final_approval.stderr,
+        )
+        self.assertIn(
+            "implementation provenance",
+            changed_during_final_approval.stderr,
+        )
+        for case, result in strict_results.items():
+            with self.subTest(case=case, stdout=result.stdout, stderr=result.stderr):
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_implementation_review_check_accepts_approved_build_basic_lanes(self) -> None:
         show_json = """[
@@ -8088,6 +9402,587 @@ description = "Override sink that writes the base triage report contract."
             "## Findings\n\nShell injection through subprocess shell=True.\n\n"
             "## Verification\n\nUse an argument vector with shell=False.\n"
         )
+
+    def test_build_artifact_check_binds_build_basic_review_and_final_report_provenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            launcher = root / "launcher"
+            launcher.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=launcher, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=launcher, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=launcher,
+                check=True,
+            )
+            (launcher / "base.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "base.txt"], cwd=launcher, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=launcher, check=True)
+            launcher_step = launcher / "finalize-step"
+            launcher_step.mkdir()
+
+            member_worktree = root / "member-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "-q", "--detach", str(member_worktree)],
+                cwd=launcher,
+                check=True,
+            )
+            product = member_worktree / "slugger.py"
+            product.write_text("value = 'approved'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=member_worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "implementation"],
+                cwd=member_worktree,
+                check=True,
+            )
+            member_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=member_worktree,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            snapshot = self._implementation_snapshot({"member": member_commit})
+
+            member_summary = member_worktree / "implementation-summary.md"
+            self._write_build_basic_item_summary(
+                member_summary,
+                "member",
+                member_worktree,
+                member_commit,
+            )
+            relative_artifact_root = pathlib.Path(".gc/inference-gate/build-basic")
+            artifact_root = launcher / relative_artifact_root
+            artifact_root.mkdir(parents=True)
+            summary = artifact_root / "implementation-summary.md"
+            self._write_build_basic_canonical_summary(
+                summary,
+                [("member", member_worktree, member_commit, member_summary)],
+            )
+            review_context = artifact_root / "review-context.md"
+            review_context.write_text(
+                "# Build-basic review context\n\nProduction-shaped fixture.\n",
+                encoding="utf-8",
+            )
+            review_input_snapshot = self._review_input_snapshot(
+                snapshot,
+                summary,
+                review_context,
+            )
+            review_rows = self._build_basic_review_rows(
+                snapshot,
+                evidence_root=artifact_root,
+                include_controls=True,
+            )
+            other_summary = artifact_root / "other-summary.md"
+            other_summary.write_text("unrelated summary\n", encoding="utf-8")
+
+            member = json.dumps(
+                [{
+                    "id": "member",
+                    "status": "closed",
+                    "metadata": {
+                        "gc.outcome": "pass",
+                        "work_dir": str(member_worktree),
+                        "gc.implementation.worktree_path": str(member_worktree),
+                        "gc.implementation.commit": member_commit,
+                        "gc.implementation.summary_path": str(member_summary),
+                    },
+                }]
+            )
+            convoy = json.dumps(
+                {
+                    "convoy": {"id": "implementation", "status": "closed"},
+                    "children": [{"id": "member", "status": "closed"}],
+                }
+            )
+
+            def review_text(
+                subject: pathlib.Path,
+                *,
+                include_snapshot: bool,
+                approved: bool = True,
+                canonical_identity: bool = True,
+                include_context: bool = True,
+                duplicate_context: bool = False,
+                context_path: pathlib.Path | None = None,
+                context_hash: str = "",
+                recorded_review_input: str = review_input_snapshot,
+                reviewed_attempt: str = "1",
+            ) -> str:
+                text = self._valid_review_artifact(subject)
+                if canonical_identity:
+                    text = text.replace("id: review-20260714-001", "id: root", 1)
+                    text = text.replace("formula: review", "formula: build-basic", 1)
+                    text = text.replace("name: review", "name: build-basic", 1)
+                    text = text.replace("formula: code-review-base", "formula: build-basic-review", 1)
+                    text = text.replace("stage: write-report", "stage: review", 1)
+                if approved:
+                    text = text.replace("status: changes_required", "status: approved", 1)
+                    text = text.replace(
+                        "      status: blocked\n"
+                        "      rationale: Shell injection remains unresolved.\n",
+                        "      status: covered\n",
+                        1,
+                    )
+                    text = text.replace("| SEC-001 | blocked |", "| SEC-001 | covered |", 1)
+                if include_snapshot:
+                    text = text.replace(
+                        "trace:\n",
+                        f"implementation_snapshot: {snapshot}\n"
+                        f"review_input_snapshot: {recorded_review_input}\n"
+                        f"reviewed_attempt: {reviewed_attempt}\n"
+                        "trace:\n",
+                        1,
+                    )
+                    if include_context:
+                        traced_context = context_path or review_context
+                        context_digest = context_hash or hashlib.sha256(
+                            traced_context.read_bytes()
+                        ).hexdigest()
+                        context_trace = (
+                            f"    - path: {json.dumps(str(traced_context))}\n"
+                            f"      hash: sha256:{context_digest}\n"
+                        )
+                        text = text.replace(
+                            "  coverage:\n",
+                            context_trace
+                            + (context_trace if duplicate_context else "")
+                            + "  coverage:\n",
+                            1,
+                        )
+                return text
+
+            review = artifact_root / "review.md"
+            review_control = json.dumps(
+                [{
+                    "id": "review-step",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.build.review_report_path",
+                        "gc.build.require_implementation_provenance": "true",
+                    },
+                }]
+            )
+
+            def root_metadata(
+                *,
+                include_convoy: bool = True,
+                **extra: str,
+            ) -> str:
+                metadata = {
+                    "gc.formula_name": "build-basic",
+                    "gc.work_dir": str(launcher_step),
+                    **self._review_provenance_root_metadata(
+                        snapshot,
+                        summary,
+                        artifact_root=relative_artifact_root,
+                    ),
+                    "gc.build.review_report_path": str(review),
+                    **extra,
+                }
+                if include_convoy:
+                    metadata["gc.build.implementation_convoy_id"] = "implementation"
+                return json.dumps([{"id": "root", "metadata": metadata}])
+
+            def run_artifact(
+                step_id: str,
+                control: str,
+                root_payload: str,
+                *,
+                convoy_payload: str = convoy,
+                rows_payload: str = review_rows,
+                extra_env: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess:
+                return self._run_build_artifact_check(
+                    {
+                        step_id: control,
+                        "root": root_payload,
+                        "member": member,
+                    },
+                    step_id,
+                    extra_env=extra_env,
+                    convoy_json=convoy_payload,
+                    list_json=rows_payload,
+                )
+
+            review.write_text(
+                review_text(summary, include_snapshot=False), encoding="utf-8"
+            )
+            missing_review_snapshot = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            review.write_text(
+                review_text(other_summary, include_snapshot=True), encoding="utf-8"
+            )
+            wrong_review_summary = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            review.write_text(
+                review_text(
+                    summary,
+                    include_snapshot=True,
+                    include_context=False,
+                ),
+                encoding="utf-8",
+            )
+            missing_review_context = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            review.write_text(
+                review_text(
+                    summary,
+                    include_snapshot=True,
+                    duplicate_context=True,
+                ),
+                encoding="utf-8",
+            )
+            duplicate_review_context = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            review.write_text(
+                review_text(
+                    summary,
+                    include_snapshot=True,
+                    recorded_review_input=f"sha256:{'3' * 64}",
+                ),
+                encoding="utf-8",
+            )
+            stale_review_input = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            review.write_text(
+                review_text(
+                    summary,
+                    include_snapshot=True,
+                    reviewed_attempt="2",
+                ),
+                encoding="utf-8",
+            )
+            stale_review_attempt = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            review.write_text(
+                review_text(summary, include_snapshot=True), encoding="utf-8"
+            )
+            valid_review_bytes = review.read_bytes()
+
+            changed_during_validation = run_artifact(
+                "review-step",
+                review_control,
+                root_metadata(),
+                extra_env={"GC_TEST_MUTATE_ON_LIST_PATH": str(review)},
+            )
+            review.write_bytes(valid_review_bytes)
+
+            outside_review = root / "outside-review.md"
+            outside_review.write_bytes(valid_review_bytes)
+            review_outside_artifact_root = run_artifact(
+                "review-step",
+                review_control,
+                root_metadata(
+                    **{"gc.build.review_report_path": str(outside_review)}
+                ),
+            )
+
+            summary_trace_link = artifact_root / "summary-trace-link.md"
+            summary_trace_link.symlink_to(summary)
+            review.write_text(
+                review_text(summary_trace_link, include_snapshot=True),
+                encoding="utf-8",
+            )
+            aliased_review_summary = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            context_trace_link = artifact_root / "context-trace-link.md"
+            context_trace_link.symlink_to(review_context)
+            review.write_text(
+                review_text(
+                    summary,
+                    include_snapshot=True,
+                    context_path=context_trace_link,
+                ),
+                encoding="utf-8",
+            )
+            aliased_review_context = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            trace_alias_dir = artifact_root / "trace-alias"
+            trace_alias_dir.mkdir()
+            summary_trace_dot_dot = trace_alias_dir / ".." / summary.name
+            review.write_text(
+                review_text(summary_trace_dot_dot, include_snapshot=True),
+                encoding="utf-8",
+            )
+            dot_dot_review_summary = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            review.write_text(
+                review_text(
+                    summary,
+                    include_snapshot=True,
+                    canonical_identity=False,
+                ),
+                encoding="utf-8",
+            )
+            wrong_review_identity = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+            review.write_text(
+                review_text(summary, include_snapshot=True, approved=False),
+                encoding="utf-8",
+            )
+            changes_required_review = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+            review.write_bytes(valid_review_bytes)
+            stale_rows = json.loads(review_rows)
+            next(row for row in stale_rows if row["id"] == "apply")["metadata"][
+                "code_review.review_input_snapshot"
+            ] = f"sha256:{'4' * 64}"
+            stale_closed_rows = run_artifact(
+                "review-step",
+                review_control,
+                root_metadata(),
+                rows_payload=json.dumps(stale_rows),
+            )
+            later_rows = json.loads(review_rows)
+            for row in list(later_rows):
+                if row["metadata"].get("gc.scope_role") != "member":
+                    continue
+                newer = json.loads(json.dumps(row))
+                newer["id"] = f"{row['id']}-attempt-2"
+                newer["metadata"]["gc.attempt"] = "2"
+                newer["metadata"]["code_review.reviewed_attempt"] = "2"
+                newer["metadata"]["gc.scope_ref"] = (
+                    "review.build-basic-review-loop.iteration.2"
+                )
+                if newer["metadata"]["gc.step_id"] == "review.apply-review-findings":
+                    newer["metadata"]["code_review.verdict"] = "iterate"
+                later_rows.append(newer)
+            stale_earlier_attempt = run_artifact(
+                "review-step",
+                review_control,
+                root_metadata(),
+                rows_payload=json.dumps(later_rows),
+            )
+            missing_review_convoy = run_artifact(
+                "review-step",
+                review_control,
+                root_metadata(include_convoy=False),
+                convoy_payload="{}",
+            )
+            valid_review = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+
+            original_context = review_context.read_bytes()
+            review_context.write_bytes(original_context + b"\nRewritten after approval.\n")
+            rewritten_input = self._review_input_snapshot(
+                snapshot,
+                summary,
+                review_context,
+            )
+            review.write_text(
+                review_text(
+                    summary,
+                    include_snapshot=True,
+                    recorded_review_input=rewritten_input,
+                ),
+                encoding="utf-8",
+            )
+            post_loop_rewrite = run_artifact(
+                "review-step", review_control, root_metadata()
+            )
+            review_context.write_bytes(original_context)
+            review.write_bytes(valid_review_bytes)
+
+            summary_digest = hashlib.sha256(summary.read_bytes()).hexdigest()
+            final_report = artifact_root / "factory-run.md"
+
+            def final_text(
+                *,
+                include_review: bool,
+                recorded_snapshot: str,
+                recorded_review_input: str = review_input_snapshot,
+                review_path: pathlib.Path | None = None,
+            ) -> str:
+                traced_review = review_path or review
+                review_trace = (
+                    f"    - path: {json.dumps(str(traced_review))}\n"
+                    "      hash: sha256:"
+                    f"{hashlib.sha256(traced_review.read_bytes()).hexdigest()}\n"
+                    if include_review
+                    else ""
+                )
+                return (
+                    "---\n"
+                    "schema: gc.build.final-report.v1\n"
+                    "workflow: {id: root, formula: build-basic}\n"
+                    "methodology: {pack: gascity, name: build-basic}\n"
+                    "producer: {formula: build-basic, stage: finalize, attempt: 1}\n"
+                    "status: approved\n"
+                    f"implementation_snapshot: {recorded_snapshot}\n"
+                    f"review_input_snapshot: {recorded_review_input}\n"
+                    "reviewed_attempt: 1\n"
+                    "trace:\n"
+                    "  upstream:\n"
+                    f"    - path: {json.dumps(str(summary))}\n"
+                    f"      hash: sha256:{summary_digest}\n"
+                    f"{review_trace}"
+                    "  coverage: []\n"
+                    "---\n\n"
+                    "## Summary\n\nComplete.\n\n"
+                    "## Outcome\n\nApproved.\n\n"
+                    "## Artifacts\n\nProvenance recorded.\n\n"
+                    "## Remaining Risks\n\nNone.\n"
+                )
+
+            final_control = json.dumps(
+                [{
+                    "id": "final-step",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.final-report.v1",
+                        "gc.build.artifact_path_keys": "gc.build.final_report_path",
+                        "gc.build.require_implementation_provenance": "true",
+                    },
+                }]
+            )
+            final_root = root_metadata(
+                **{"gc.build.final_report_path": str(final_report)}
+            )
+
+            final_report.write_text(
+                final_text(include_review=False, recorded_snapshot=snapshot),
+                encoding="utf-8",
+            )
+            missing_final_review = run_artifact(
+                "final-step", final_control, final_root
+            )
+
+            final_report.write_text(
+                final_text(
+                    include_review=True,
+                    recorded_snapshot=f"sha256:{'2' * 64}",
+                ),
+                encoding="utf-8",
+            )
+            stale_final_snapshot = run_artifact(
+                "final-step", final_control, final_root
+            )
+
+            final_report.write_text(
+                final_text(
+                    include_review=True,
+                    recorded_snapshot=snapshot,
+                    recorded_review_input=f"sha256:{'5' * 64}",
+                ),
+                encoding="utf-8",
+            )
+            stale_final_review_input = run_artifact(
+                "final-step", final_control, final_root
+            )
+
+            final_report.write_text(
+                final_text(include_review=True, recorded_snapshot=snapshot),
+                encoding="utf-8",
+            )
+            valid_final = run_artifact(
+                "final-step", final_control, final_root
+            )
+
+            outside_final_report = root / "outside-factory-run.md"
+            outside_final_report.write_text(
+                final_text(include_review=True, recorded_snapshot=snapshot),
+                encoding="utf-8",
+            )
+            final_outside_artifact_root = run_artifact(
+                "final-step",
+                final_control,
+                root_metadata(
+                    **{"gc.build.final_report_path": str(outside_final_report)}
+                ),
+            )
+
+            final_report.write_text(
+                final_text(
+                    include_review=True,
+                    recorded_snapshot=snapshot,
+                    review_path=outside_review,
+                ),
+                encoding="utf-8",
+            )
+            final_traces_review_outside_artifact_root = run_artifact(
+                "final-step",
+                final_control,
+                root_metadata(
+                    **{
+                        "gc.build.final_report_path": str(final_report),
+                        "gc.build.review_report_path": str(outside_review),
+                    }
+                ),
+            )
+            final_report.write_text(
+                final_text(include_review=True, recorded_snapshot=snapshot),
+                encoding="utf-8",
+            )
+
+            product.write_text("value = 'drifted after review'\n", encoding="utf-8")
+            drifted_final = run_artifact(
+                "final-step", final_control, final_root
+            )
+
+        for case, result in (
+            ("missing review snapshot", missing_review_snapshot),
+            ("wrong review summary", wrong_review_summary),
+            ("missing review context", missing_review_context),
+            ("duplicate review context", duplicate_review_context),
+            ("stale review input", stale_review_input),
+            ("stale review attempt", stale_review_attempt),
+            ("review outside artifact root", review_outside_artifact_root),
+            ("aliased review summary trace", aliased_review_summary),
+            ("aliased review context trace", aliased_review_context),
+            ("dot-dot review summary trace", dot_dot_review_summary),
+            ("wrong review identity", wrong_review_identity),
+            ("changes-required review", changes_required_review),
+            ("stale closed review rows", stale_closed_rows),
+            ("stale earlier review attempt", stale_earlier_attempt),
+            ("post-loop input rewrite", post_loop_rewrite),
+            ("missing review convoy", missing_review_convoy),
+            ("missing final review", missing_final_review),
+            ("stale final snapshot", stale_final_snapshot),
+            ("stale final review input", stale_final_review_input),
+            ("final report outside artifact root", final_outside_artifact_root),
+            (
+                "final traces review outside artifact root",
+                final_traces_review_outside_artifact_root,
+            ),
+            ("post-review implementation drift", drifted_final),
+        ):
+            with self.subTest(case=case, stdout=result.stdout, stderr=result.stderr):
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("implementation provenance", result.stderr)
+        self.assertNotEqual(
+            changed_during_validation.returncode,
+            0,
+            changed_during_validation.stdout + changed_during_validation.stderr,
+        )
+        self.assertIn("file changed during validation", changed_during_validation.stderr)
+        for result in (valid_review, valid_final):
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_build_artifact_check_passes_valid_recorded_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:

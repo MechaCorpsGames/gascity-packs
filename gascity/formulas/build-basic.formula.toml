@@ -107,7 +107,7 @@ single_lane = true
 id = "review"
 title = "Run starter implementation review"
 needs = ["summarize-implementation"]
-metadata = { "gc.run_target" = "gc.implementation-reviewer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.review_report_path" }
+metadata = { "gc.run_target" = "gc.implementation-reviewer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.review_report_path", "gc.build.require_implementation_provenance" = "true" }
 expand = "build-basic-review"
 expand_vars = { implementation_target = "{{implementation_target}}" }
 description_file = "../assets/workflows/build-basic/review.md"
@@ -116,7 +116,7 @@ description_file = "../assets/workflows/build-basic/review.md"
 id = "finalize"
 title = "Finalize build-basic"
 needs = ["review"]
-metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.final-report.v1", "gc.build.artifact_path_keys" = "gc.build.final_report_path" }
+metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.final-report.v1", "gc.build.artifact_path_keys" = "gc.build.final_report_path", "gc.build.require_implementation_provenance" = "true" }
 description_file = "../assets/workflows/build-basic/finalize.md"
 
 [steps.check]

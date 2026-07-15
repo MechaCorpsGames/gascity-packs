@@ -1,9 +1,10 @@
 Prepare the build-basic starter factory review.
 
-Gather the requirements artifact, implementation plan, decomposition artifact,
-implementation summary, changed-file summaries, task evidence, and verification
-commands into one review context file under the build artifact root. Record that
-path on the workflow root as `gc.build.code_review_context_path`.
+Gather the requirements, plan, decomposition, canonical implementation summary,
+task evidence, changed files, and proof commands into one review context file
+under the resolved build artifact root. Record its canonical absolute path as
+`gc.build.code_review_context_path`. The context and canonical summary must be
+distinct regular non-symlink files under that root.
 
 The implementation source of truth is the closed source anchor/worktree recorded
 by the implementation summary and task evidence. Include the source anchor id,
@@ -22,11 +23,25 @@ the exact tuple list and snapshot in the review context. Fail closed if a member
 commit does not resolve in its authoritative worktree. This value binds every
 review lane to the same implementation bytes.
 
+Canonicalize every commit to its lowercase full SHA before serialization. A
+one-member payload is exactly
+`[{"commit":"<canonical lowercase full SHA>","id":"<id>"}]`: sort members by
+id, sort every object key, use compact JSON separators, and hash those bytes
+with no trailing newline.
+
+After the context is complete, bind the exact review inputs. Compute current
+`sha256:<digest>` values from the raw summary and context bytes. Serialize this
+exact compact, sorted-key JSON with canonical absolute paths and no newline:
+`{"context":{"path":"<context>","sha256":"sha256:<digest>"},"implementation_snapshot":"sha256:<digest>","summary":{"path":"<summary>","sha256":"sha256:<digest>"}}`.
+Hash those UTF-8 bytes and record the result on the workflow root as
+`gc.build.review_input_snapshot=sha256:<digest>`. Do not place that combined
+digest inside the context itself (that creates a self-hash cycle).
+
 This starter factory intentionally uses only three review lanes so new users can
 see fanout/fanin without a large reviewer roster.
 
 Do not invoke provider-native subagents. Gas City graph lanes are the
 delegation mechanism.
 
-Close this setup bead with `gc.outcome=pass` only after the review context path
-and `gc.build.implementation_snapshot` are recorded.
+Close with `gc.outcome=pass` only after the context path, implementation
+snapshot, and review-input snapshot are recorded.

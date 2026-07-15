@@ -60,7 +60,8 @@ Use mapping objects for front matter; do not use scalar shortcuts such as
 - `workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}`
 - `methodology: {pack: gascity, name: build-basic}`
 - `producer: {formula: do-work, stage: implement, attempt: <positive integer>}`
-- `status: approved` or another schema-allowed status
+- Use `status: approved` before closing; a successful implementation proof must
+  be approved.
 - `trace: {upstream: [...], coverage: [...]}`
 
 Trace front matter must use the validator shape exactly:

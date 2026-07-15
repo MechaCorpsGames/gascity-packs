@@ -27,25 +27,19 @@ The validator only recognizes a Markdown table with an `ID` column and a
 Before writing `factory-run.md`, ensure the canonical implementation summary
 exists at the path recorded on the workflow root bead as
 `gc.build.implementation_summary_path`, normally `implementation-summary.md`.
-If that path is missing, absent on disk, or not a valid
-`gc.build.implementation-summary.v1` artifact, synthesize the canonical
-`implementation-summary.md` from closed implementation source anchors and their
-recorded per-item `gc.implementation.summary_path` values. The synthesized
-artifact must be Markdown with YAML front matter, schema
-`gc.build.implementation-summary.v1`, the same trace shape and `ID`/`Status`
-coverage matrix described here, and these sections:
+It must already be an approved `gc.build.implementation-summary.v1` artifact
+whose current bytes match the approved review trace. Treat the canonical summary
+and approved review as immutable inputs. If either is missing, invalid, or
+mismatched, fail this stage and record a healable restart at review. Never
+synthesize, mutate, replace, or repoint either artifact during finalization.
+
+The existing canonical summary has these sections:
 
 - Summary
 - Intended Behavior
 - Changed Files
 - Verification
 - Remaining Risks
-
-Record the canonical path on the workflow root bead before validating or
-writing the final report. Use
-`gc bd update "<workflow-root-id>" --set-metadata "gc.build.implementation_summary_path=<absolute path>"`.
-Do not use `gc bd update --metadata 'key=value'`; `--metadata` only accepts a JSON
-object.
 
 Use mapping objects for front matter; do not use scalar shortcuts such as
 `workflow: build-basic`. The top-level YAML shape must be:
@@ -54,8 +48,22 @@ Use mapping objects for front matter; do not use scalar shortcuts such as
 - `workflow: {id: <workflow-root-id>, formula: build-basic}`
 - `methodology: {pack: gascity, name: build-basic}`
 - `producer: {formula: build-basic, stage: finalize, attempt: <positive integer>}`
-- `status: approved` or another schema-allowed status
+- `status: approved`; any other status fails finalization
+- `implementation_snapshot: <exact approved snapshot>`
+- `review_input_snapshot: <exact approved review-input snapshot>`
+- `reviewed_attempt: <exact approved positive loop attempt>`
 - `trace: {upstream: [...], coverage: [...]}`
+
+Trace the exact canonical implementation summary once at its absolute path with
+a freshly computed `sha256:<digest>`. Trace the approved review artifact once
+at its absolute path with its own freshly computed digest. The extra
+`implementation_snapshot: <exact approved snapshot>` must equal the root and
+approved review artifact snapshots; repeat it in Artifacts.
+The review-input snapshot and reviewed attempt must exactly equal the approved
+review artifact and the still-closed lane/synthesis/apply group. Recompute the
+live combined value from the immutable summary and review context before writing
+the final report. The approved review must still trace that context exactly
+once; finalization verifies it transitively and never repoints it.
 
 Trace front matter must use the validator shape exactly:
 

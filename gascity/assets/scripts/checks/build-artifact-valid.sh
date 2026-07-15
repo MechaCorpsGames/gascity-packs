@@ -82,6 +82,63 @@ canonical_file_path() {
   python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$1"
 }
 
+file_fingerprint() {
+  python3 - "$1" <<'PY'
+import hashlib
+import json
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+before = path.lstat()
+if not stat.S_ISREG(before.st_mode):
+    raise SystemExit(f"not a regular non-symlink file: {path}")
+
+digest = hashlib.sha256()
+with path.open("rb") as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+
+after = path.lstat()
+fields = lambda value: (
+    value.st_dev,
+    value.st_ino,
+    value.st_mode,
+    value.st_nlink,
+    value.st_size,
+    value.st_mtime_ns,
+    value.st_ctime_ns,
+)
+if fields(before) != fields(after) or not stat.S_ISREG(after.st_mode):
+    raise SystemExit(f"file changed while fingerprinting: {path}")
+
+print(json.dumps([*fields(after), digest.hexdigest()], separators=(",", ":")))
+PY
+}
+
+PINNED_PATHS=()
+PINNED_FINGERPRINTS=()
+
+pin_file() {
+  local path fingerprint
+  path="$1"
+  fingerprint="$(file_fingerprint "$path")" || fail "could not fingerprint file: $path"
+  PINNED_PATHS+=("$path")
+  PINNED_FINGERPRINTS+=("$fingerprint")
+}
+
+verify_pinned_files() {
+  local index path observed
+  for index in "${!PINNED_PATHS[@]}"; do
+    path="${PINNED_PATHS[$index]}"
+    observed="$(file_fingerprint "$path")" || fail "could not re-read pinned file: $path"
+    if [ "$observed" != "${PINNED_FINGERPRINTS[$index]}" ]; then
+      fail "file changed during validation: $path"
+    fi
+  done
+}
+
 git_worktree_root_for_file() {
   local file_path file_dir git_root
   file_path="$(canonical_file_path "$1")" || return 1
@@ -147,6 +204,239 @@ if expected_hash not in observed:
 PY
 }
 
+require_implementation_provenance() {
+  artifact_path="$1"
+  expected_snapshot="$2"
+  expected_review_input="$3"
+  expected_reviewed_attempt="$4"
+  artifact_kind="$5"
+  workflow_root_id="$6"
+  shift 6
+  python3 - "$artifact_path" "$expected_snapshot" "$expected_review_input" "$expected_reviewed_attempt" "$artifact_kind" "$workflow_root_id" "$@" <<'PY'
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+import yaml
+
+artifact_path = Path(sys.argv[1])
+expected_snapshot = sys.argv[2]
+expected_review_input = sys.argv[3]
+expected_reviewed_attempt = sys.argv[4]
+artifact_kind = sys.argv[5]
+workflow_root_id = sys.argv[6]
+required_paths = [Path(value).resolve(strict=True) for value in sys.argv[7:]]
+text = artifact_path.read_text(encoding="utf-8", errors="replace")
+match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
+if not match:
+    print(
+        f"build-artifact-check: implementation provenance front matter is missing: {artifact_path}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+front_matter = yaml.safe_load(match.group("front")) or {}
+contracts = {
+    "review": {
+        "schema": "gc.build.review.v1",
+        "workflow": {"id": workflow_root_id, "formula": "build-basic"},
+        "methodology": {"pack": "gascity", "name": "build-basic"},
+        "producer": {"formula": "build-basic-review", "stage": "review"},
+    },
+    "final-report": {
+        "schema": "gc.build.final-report.v1",
+        "workflow": {"id": workflow_root_id, "formula": "build-basic"},
+        "methodology": {"pack": "gascity", "name": "build-basic"},
+        "producer": {"formula": "build-basic", "stage": "finalize"},
+    },
+}
+contract = contracts.get(artifact_kind)
+if contract is None:
+    print(
+        f"build-artifact-check: implementation provenance artifact kind is unsupported: {artifact_kind}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+def mapping(value):
+    return value if isinstance(value, dict) else {}
+
+identity_matches = (
+    isinstance(front_matter, dict)
+    and front_matter.get("schema") == contract["schema"]
+    and front_matter.get("status") == "approved"
+    and all(mapping(front_matter.get("workflow")).get(key) == value for key, value in contract["workflow"].items())
+    and all(mapping(front_matter.get("methodology")).get(key) == value for key, value in contract["methodology"].items())
+    and all(mapping(front_matter.get("producer")).get(key) == value for key, value in contract["producer"].items())
+)
+if not identity_matches:
+    print(
+        "build-artifact-check: implementation provenance artifact identity/status mismatch: "
+        f"artifact={artifact_path} kind={artifact_kind} root={workflow_root_id}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+observed_snapshot = (
+    front_matter.get("implementation_snapshot", "")
+    if isinstance(front_matter, dict)
+    else ""
+)
+if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_snapshot) or observed_snapshot != expected_snapshot:
+    print(
+        "build-artifact-check: implementation provenance snapshot mismatch: "
+        f"artifact={artifact_path} expected={expected_snapshot or '<missing>'} "
+        f"observed={observed_snapshot or '<missing>'}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+observed_review_input = (
+    front_matter.get("review_input_snapshot", "")
+    if isinstance(front_matter, dict)
+    else ""
+)
+observed_reviewed_attempt = (
+    str(front_matter.get("reviewed_attempt", ""))
+    if isinstance(front_matter, dict)
+    else ""
+)
+if (
+    not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_review_input)
+    or observed_review_input != expected_review_input
+    or not re.fullmatch(r"[1-9][0-9]*", expected_reviewed_attempt)
+    or observed_reviewed_attempt != expected_reviewed_attempt
+):
+    print(
+        "build-artifact-check: implementation provenance review input mismatch: "
+        f"artifact={artifact_path} expected_input={expected_review_input or '<missing>'} "
+        f"observed_input={observed_review_input or '<missing>'} "
+        f"expected_attempt={expected_reviewed_attempt or '<missing>'} "
+        f"observed_attempt={observed_reviewed_attempt or '<missing>'}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+trace = front_matter.get("trace") if isinstance(front_matter, dict) else None
+upstream = trace.get("upstream") if isinstance(trace, dict) else None
+coverage = trace.get("coverage") if isinstance(trace, dict) else None
+if not isinstance(upstream, list):
+    print(
+        f"build-artifact-check: implementation provenance trace.upstream is missing: {artifact_path}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if artifact_kind == "review" and (
+    not isinstance(coverage, list)
+    or any(isinstance(entry, dict) and entry.get("status") == "blocked" for entry in coverage)
+):
+    print(
+        f"build-artifact-check: implementation provenance approved review has blocked or malformed coverage: {artifact_path}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+for required_path in required_paths:
+    expected_hash = f"sha256:{hashlib.sha256(required_path.read_bytes()).hexdigest()}"
+    expected_path = str(required_path)
+    observed_hashes = []
+    for entry in upstream:
+        if not isinstance(entry, dict):
+            continue
+        raw_path = entry.get("path")
+        if raw_path == expected_path:
+            observed_hashes.append(str(entry.get("hash") or ""))
+    if observed_hashes != [expected_hash]:
+        print(
+            "build-artifact-check: implementation provenance must trace exact current bytes once: "
+            f"artifact={artifact_path} upstream={required_path} "
+            f"expected={expected_hash} observed={observed_hashes}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+PY
+}
+
+front_matter_value() {
+  python3 - "$1" "$2" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+import yaml
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
+if not match:
+    raise SystemExit(1)
+front = yaml.safe_load(match.group("front")) or {}
+value = front.get(sys.argv[2], "") if isinstance(front, dict) else ""
+print(value if isinstance(value, (str, int)) else "")
+PY
+}
+
+require_review_attempt_provenance() {
+  workflow_root_id="$1"
+  reviewed_attempt="$2"
+  expected_snapshot="$3"
+  expected_review_input="$4"
+  rows="$(gc bd list --all --metadata-field \
+    "gc.root_bead_id=$workflow_root_id" --json --limit=0 2>/dev/null)" || \
+    fail "implementation provenance could not list review rows for $workflow_root_id"
+  if ! printf '%s\n' "$rows" | jq -e \
+    --arg root "$workflow_root_id" \
+    --arg attempt "$reviewed_attempt" \
+    --arg snapshot "$expected_snapshot" \
+    --arg review_input "$expected_review_input" '
+    def rows_for($step):
+      [.[] | select(
+        (.metadata["gc.root_bead_id"] // "") == $root and
+        (.metadata["gc.attempt"] // "") == $attempt and
+        (.metadata["gc.ralph_step_id"] // "") == "review.build-basic-review-loop" and
+        (.metadata["gc.step_id"] // "") == $step and
+        (.metadata["gc.scope_role"] // "") == "member"
+      )];
+    def all_review_rows:
+      [.[] | select(
+        (.metadata["gc.root_bead_id"] // "") == $root and
+        (.metadata["gc.ralph_step_id"] // "") == "review.build-basic-review-loop" and
+        (.metadata["gc.scope_role"] // "") == "member"
+      )];
+    def latest_attempt_ok:
+      all_review_rows as $rows
+      | (($attempt | test("^[1-9][0-9]*$")) and
+         (($rows | length) > 0) and
+         all($rows[]; ((.metadata["gc.attempt"] // "") | test("^[1-9][0-9]*$"))) and
+         (([$rows[] | .metadata["gc.attempt"] | tonumber] | max) == ($attempt | tonumber)));
+    def base_ok($rows):
+      (($rows | length) == 1) and
+      (($rows[0].status // "") == "closed") and
+      (($rows[0].metadata["gc.outcome"] // "") == "pass") and
+      (($rows[0].metadata["code_review.reviewed_attempt"] // "") == $attempt) and
+      (($rows[0].metadata["code_review.implementation_snapshot"] // "") == $snapshot) and
+      (($rows[0].metadata["code_review.review_input_snapshot"] // "") == $review_input);
+    latest_attempt_ok and (
+      rows_for("review.acceptance-review") as $acceptance
+      | rows_for("review.test-evidence-review") as $tests
+      | rows_for("review.simplicity-review") as $simplicity
+      | rows_for("review.synthesize-review") as $synthesis
+      | rows_for("review.apply-review-findings") as $apply
+      | base_ok($acceptance)
+      and (($acceptance[0].metadata["code_review.acceptance_verdict"] // "") == "approve")
+      and base_ok($tests)
+      and (($tests[0].metadata["code_review.test_evidence_verdict"] // "") == "approve")
+      and base_ok($simplicity)
+      and (($simplicity[0].metadata["code_review.simplicity_verdict"] // "") == "approve")
+      and base_ok($synthesis)
+      and base_ok($apply)
+      and (($apply[0].metadata["code_review.verdict"] // "") == "done")
+    )
+  ' >/dev/null 2>&1; then
+    fail "implementation provenance exact review attempt is incomplete or stale: root=$workflow_root_id attempt=$reviewed_attempt"
+  fi
+}
+
 SHOW_JSON="$(gc bd show "$BEAD_ID" --json 2>/dev/null)" || fail "gc bd show $BEAD_ID failed"
 
 SCHEMA="$(metadata_value "$SHOW_JSON" "gc.build.artifact_schema")"
@@ -177,6 +467,8 @@ done
 
 ARTIFACT_PATH="$(resolve_declared_path "$ARTIFACT_PATH" "$RESOLVED_KEY")"
 [ -f "$ARTIFACT_PATH" ] || fail "artifact $ARTIFACT_PATH from $RESOLVED_KEY does not exist"
+[ ! -L "$ARTIFACT_PATH" ] || fail "artifact $ARTIFACT_PATH from $RESOLVED_KEY must not be a symlink"
+pin_file "$ARTIFACT_PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VALIDATOR="$SCRIPT_DIR/../validate_build_artifact.py"
@@ -196,13 +488,105 @@ VALIDATOR_UPSTREAM_ARGS=("${BASE_VALIDATOR_UPSTREAM_ARGS[@]}")
 if ARTIFACT_WORKTREE_ROOT="$(git_worktree_root_for_file "$ARTIFACT_PATH")"; then
   VALIDATOR_UPSTREAM_ARGS+=(--upstream-root "$ARTIFACT_WORKTREE_ROOT")
 fi
+VALIDATOR_POLICY_ARGS=()
+if [ "$(metadata_value "$SHOW_JSON" "gc.build.require_review_status_coverage")" = "true" ]; then
+  VALIDATOR_POLICY_ARGS+=(--enforce-review-status-coverage)
+fi
 
-if ! OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" --verify-absolute-upstreams "${VALIDATOR_UPSTREAM_ARGS[@]}" 2>&1)"; then
+if ! OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" \
+  --verify-absolute-upstreams "${VALIDATOR_UPSTREAM_ARGS[@]}" \
+  "${VALIDATOR_POLICY_ARGS[@]}" 2>&1)"; then
   echo "build-artifact-check: schema=$SCHEMA path=$ARTIFACT_PATH failed validation" >&2
   printf '%s\n' "$OUTPUT" >&2
   exit 1
 fi
 [ -z "$MISSING_LAUNCHER_ROOT" ] || fail "$MISSING_LAUNCHER_ROOT"
+
+IMPLEMENTATION_PROVENANCE_REQUIRED="$(metadata_value "$SHOW_JSON" "gc.build.require_implementation_provenance")"
+if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then
+  case "$SCHEMA:$RESOLVED_KEY" in
+    gc.build.review.v1:gc.build.review_report_path) ARTIFACT_KIND="review" ;;
+    gc.build.final-report.v1:gc.build.final_report_path) ARTIFACT_KIND="final-report" ;;
+    *) fail "implementation provenance is unsupported for schema/path contract $SCHEMA:$RESOLVED_KEY" ;;
+  esac
+  WORKFLOW_ROOT_ID="${ROOT_ID:-$BEAD_ID}"
+  IMPLEMENTATION_SNAPSHOT="$(metadata_value "$ROOT_JSON" "gc.build.implementation_snapshot")"
+  REVIEW_INPUT_SNAPSHOT="$(metadata_value "$ROOT_JSON" "gc.build.review_input_snapshot")"
+  IMPLEMENTATION_SUMMARY_RAW="$(metadata_value "$ROOT_JSON" "gc.build.implementation_summary_path")"
+  REVIEW_CONTEXT_RAW="$(metadata_value "$ROOT_JSON" "gc.build.code_review_context_path")"
+  [ -n "$IMPLEMENTATION_SNAPSHOT" ] || fail "implementation provenance gc.build.implementation_snapshot is missing"
+  [ -n "$REVIEW_INPUT_SNAPSHOT" ] || fail "implementation provenance gc.build.review_input_snapshot is missing"
+  [ -n "$IMPLEMENTATION_SUMMARY_RAW" ] || fail "implementation provenance gc.build.implementation_summary_path is missing"
+  [ -n "$REVIEW_CONTEXT_RAW" ] || fail "implementation provenance gc.build.code_review_context_path is missing"
+  IMPLEMENTATION_SUMMARY_PATH="$(resolve_declared_path "$IMPLEMENTATION_SUMMARY_RAW" "gc.build.implementation_summary_path")"
+  [ -f "$IMPLEMENTATION_SUMMARY_PATH" ] || fail "implementation provenance summary does not exist: $IMPLEMENTATION_SUMMARY_PATH"
+  [ ! -L "$IMPLEMENTATION_SUMMARY_PATH" ] || fail "implementation provenance summary must not be a symlink: $IMPLEMENTATION_SUMMARY_PATH"
+  pin_file "$IMPLEMENTATION_SUMMARY_PATH"
+  REVIEW_CONTEXT_PATH="$(resolve_declared_path "$REVIEW_CONTEXT_RAW" "gc.build.code_review_context_path")"
+  [ -f "$REVIEW_CONTEXT_PATH" ] || fail "implementation provenance review context does not exist: $REVIEW_CONTEXT_PATH"
+  [ ! -L "$REVIEW_CONTEXT_PATH" ] || fail "implementation provenance review context must not be a symlink: $REVIEW_CONTEXT_PATH"
+  pin_file "$REVIEW_CONTEXT_PATH"
+  EXPECTED_ARTIFACT_ARGS=(--expected-artifact "$ARTIFACT_PATH")
+  REVIEW_REPORT_PATH=""
+  if [ "$ARTIFACT_KIND" = "final-report" ]; then
+    REVIEW_REPORT_RAW="$(metadata_value "$ROOT_JSON" "gc.build.review_report_path")"
+    [ -n "$REVIEW_REPORT_RAW" ] || fail "implementation provenance gc.build.review_report_path is missing"
+    REVIEW_REPORT_PATH="$(resolve_declared_path "$REVIEW_REPORT_RAW" "gc.build.review_report_path")"
+    [ -f "$REVIEW_REPORT_PATH" ] || fail "implementation provenance review report does not exist: $REVIEW_REPORT_PATH"
+    [ ! -L "$REVIEW_REPORT_PATH" ] || fail "implementation provenance review report must not be a symlink: $REVIEW_REPORT_PATH"
+    pin_file "$REVIEW_REPORT_PATH"
+    EXPECTED_ARTIFACT_ARGS+=(--expected-artifact "$REVIEW_REPORT_PATH")
+  fi
+  PROVENANCE_VERIFIER="$SCRIPT_DIR/../verify_implementation_provenance.py"
+  [ -f "$PROVENANCE_VERIFIER" ] || fail "installed implementation provenance verifier is missing: $PROVENANCE_VERIFIER"
+  if ! PROVENANCE_OUTPUT="$(python3 "$PROVENANCE_VERIFIER" \
+    --root-id "$WORKFLOW_ROOT_ID" \
+    --expected-snapshot "$IMPLEMENTATION_SNAPSHOT" \
+    --expected-summary "$IMPLEMENTATION_SUMMARY_PATH" \
+    "${EXPECTED_ARTIFACT_ARGS[@]}" \
+    --validator "$VALIDATOR" 2>&1)"; then
+    echo "build-artifact-check: implementation provenance validation failed" >&2
+    printf '%s\n' "$PROVENANCE_OUTPUT" >&2
+    exit 1
+  fi
+
+  if [ "$ARTIFACT_KIND" = "review" ]; then
+    REVIEWED_ATTEMPT="$(front_matter_value "$ARTIFACT_PATH" reviewed_attempt)" || \
+      fail "implementation provenance review artifact reviewed_attempt is unreadable"
+    require_review_attempt_provenance \
+      "$WORKFLOW_ROOT_ID" "$REVIEWED_ATTEMPT" \
+      "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT"
+    require_implementation_provenance \
+      "$ARTIFACT_PATH" "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT" \
+      "$REVIEWED_ATTEMPT" review "$WORKFLOW_ROOT_ID" \
+      "$IMPLEMENTATION_SUMMARY_PATH" "$REVIEW_CONTEXT_PATH" || exit 1
+  else
+    REVIEW_VALIDATOR_UPSTREAM_ARGS=("${BASE_VALIDATOR_UPSTREAM_ARGS[@]}")
+    if REVIEW_WORKTREE_ROOT="$(git_worktree_root_for_file "$REVIEW_REPORT_PATH")"; then
+      REVIEW_VALIDATOR_UPSTREAM_ARGS+=(--upstream-root "$REVIEW_WORKTREE_ROOT")
+    fi
+    if ! REVIEW_OUTPUT="$(python3 "$VALIDATOR" --schema gc.build.review.v1 \
+      --path "$REVIEW_REPORT_PATH" --verify-absolute-upstreams \
+      "${REVIEW_VALIDATOR_UPSTREAM_ARGS[@]}" 2>&1)"; then
+      echo "build-artifact-check: implementation provenance review report failed validation: $REVIEW_REPORT_PATH" >&2
+      printf '%s\n' "$REVIEW_OUTPUT" >&2
+      exit 1
+    fi
+    REVIEWED_ATTEMPT="$(front_matter_value "$REVIEW_REPORT_PATH" reviewed_attempt)" || \
+      fail "implementation provenance approved review reviewed_attempt is unreadable"
+    require_review_attempt_provenance \
+      "$WORKFLOW_ROOT_ID" "$REVIEWED_ATTEMPT" \
+      "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT"
+    require_implementation_provenance \
+      "$REVIEW_REPORT_PATH" "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT" \
+      "$REVIEWED_ATTEMPT" review "$WORKFLOW_ROOT_ID" \
+      "$IMPLEMENTATION_SUMMARY_PATH" "$REVIEW_CONTEXT_PATH" || exit 1
+    require_implementation_provenance \
+      "$ARTIFACT_PATH" "$IMPLEMENTATION_SNAPSHOT" "$REVIEW_INPUT_SNAPSHOT" \
+      "$REVIEWED_ATTEMPT" final-report "$WORKFLOW_ROOT_ID" \
+      "$IMPLEMENTATION_SUMMARY_PATH" "$REVIEW_REPORT_PATH" || exit 1
+  fi
+fi
 
 if [ "$SCHEMA" = "gc.build.review.v1" ]; then
   CALLER_SUBJECT_RAW="$(metadata_value "$ROOT_JSON" "gc.var.subject_path")"
@@ -223,6 +607,7 @@ if [ "$SCHEMA" = "gc.build.review.v1" ]; then
     [ -f "$SUBJECT_PATH" ] || fail "canonical review subject does not exist: $SUBJECT_PATH"
   fi
   if [ -n "$SUBJECT_PATH" ]; then
+    pin_file "$SUBJECT_PATH"
     require_subject_trace "$ARTIFACT_PATH" "$SUBJECT_PATH" || exit 1
   fi
 
@@ -236,7 +621,9 @@ if [ "$SCHEMA" = "gc.build.review.v1" ]; then
   if [ -n "$INTERNAL_RAW" ] && [ "$RESOLVED_KEY" != "gc.build.code_review_report_path" ]; then
     INTERNAL_PATH="$(resolve_declared_path "$INTERNAL_RAW" "gc.build.code_review_report_path")"
     [ -f "$INTERNAL_PATH" ] || fail "internal review report does not exist: $INTERNAL_PATH"
+    [ ! -L "$INTERNAL_PATH" ] || fail "internal review report must not be a symlink: $INTERNAL_PATH"
     [ ! "$INTERNAL_PATH" -ef "$ARTIFACT_PATH" ] || fail "internal and adapter review report paths must be distinct: internal=$INTERNAL_PATH adapter=$ARTIFACT_PATH"
+    pin_file "$INTERNAL_PATH"
     INTERNAL_VALIDATOR_UPSTREAM_ARGS=("${BASE_VALIDATOR_UPSTREAM_ARGS[@]}")
     if INTERNAL_WORKTREE_ROOT="$(git_worktree_root_for_file "$INTERNAL_PATH")"; then
       INTERNAL_VALIDATOR_UPSTREAM_ARGS+=(--upstream-root "$INTERNAL_WORKTREE_ROOT")
@@ -253,4 +640,5 @@ if [ "$SCHEMA" = "gc.build.review.v1" ]; then
   fi
 fi
 
+verify_pinned_files
 echo "build artifact valid: schema=$SCHEMA path=$ARTIFACT_PATH"

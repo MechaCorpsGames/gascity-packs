@@ -18,14 +18,20 @@ and require both values to match. Review the exact current implementation snapsh
 Carry the matching value on this lane as
 `code_review.implementation_snapshot`; a missing or changed snapshot requires
 `iterate` and a fresh review.
+Recompute the root `gc.build.review_input_snapshot` from the canonical absolute
+summary/context paths, their current raw-byte SHA-256 digests, and that
+implementation snapshot. Require an exact root match and carry it as
+`code_review.review_input_snapshot`; otherwise use `iterate`.
 
-Write findings under the build artifact root. Required findings must include
-the relevant requirement or task reference plus the file, command, or artifact
-that proves the issue.
+Write findings at a canonical absolute path under the build artifact root.
+Required findings must include the relevant requirement or task reference plus
+the file, command, or artifact that proves the issue.
 
 Close with `gc.outcome=pass`,
 `code_review.acceptance_verdict=approve|iterate`, and
+`code_review.reviewed_attempt=<current gc.attempt>`,
 `code_review.implementation_snapshot=<exact current snapshot>`, and
+`code_review.review_input_snapshot=<exact current review-input snapshot>`, and
 `code_review.output_path=<acceptance review report path>`.
 
 Use explicit close metadata so the review loop can detect the lane result:
@@ -34,7 +40,9 @@ Use explicit close metadata so the review loop can detect the lane result:
 gc bd update "$CLAIMED_BEAD_ID" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'code_review.acceptance_verdict=approve' \
+  --set-metadata 'code_review.reviewed_attempt=<current gc.attempt>' \
   --set-metadata 'code_review.implementation_snapshot=<exact current snapshot>' \
+  --set-metadata 'code_review.review_input_snapshot=<exact current review-input snapshot>' \
   --set-metadata 'code_review.output_path=<acceptance review report path>'
 gc bd close "$CLAIMED_BEAD_ID" --reason 'Build-basic acceptance review approved.'
 ```

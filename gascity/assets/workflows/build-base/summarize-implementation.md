@@ -45,7 +45,8 @@ Write the artifact as Markdown with YAML front matter, not JSON. Use mapping obj
 - `workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}`
 - `methodology: {pack: <pack-name>, name: <build-formula>}`
 - `producer: {formula: <build-formula>, stage: summarize-implementation, attempt: <positive integer>}`
-- `status: approved` or another schema-allowed status
+- Use `status: approved` before closing; a successful canonical implementation
+  proof must be approved.
 - `trace: {upstream: [...], coverage: [...]}`
 
 Trace front matter must use the validator shape exactly:

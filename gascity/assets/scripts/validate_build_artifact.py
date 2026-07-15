@@ -45,6 +45,7 @@ def validate_artifact_text(
     *,
     expected_schema: str = "",
     verify_absolute_upstreams: bool = False,
+    enforce_review_status_coverage: bool = False,
     artifact_path: Path | None = None,
     upstream_roots: Iterable[Path] = (),
 ) -> BuildArtifact:
@@ -65,7 +66,8 @@ def validate_artifact_text(
         )
     coverage = validate_coverage(trace, schema)
     validate_coverage_completeness(upstream, coverage)
-    validate_status_coverage(front_matter, schema, coverage)
+    if enforce_review_status_coverage:
+        validate_status_coverage(front_matter, schema, coverage)
     validate_markdown_coverage(body, coverage)
     validate_required_sections(body, schema)
     return BuildArtifact(
@@ -427,6 +429,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         help="Additional approved root for resolving relative sha256 upstream paths (repeatable)",
     )
+    parser.add_argument(
+        "--enforce-review-status-coverage",
+        action="store_true",
+        help="Apply producer policy requiring top-level review status to agree with blocked coverage",
+    )
     return parser.parse_args(argv)
 
 
@@ -437,6 +444,7 @@ def main(argv: list[str] | None = None) -> int:
             args.path.read_text(encoding="utf-8"),
             expected_schema=args.schema,
             verify_absolute_upstreams=args.verify_absolute_upstreams,
+            enforce_review_status_coverage=args.enforce_review_status_coverage,
             artifact_path=args.path,
             upstream_roots=args.upstream_root,
         )
