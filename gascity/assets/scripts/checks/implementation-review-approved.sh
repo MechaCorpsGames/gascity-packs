@@ -60,9 +60,104 @@ validate_declared_artifact() {
   GC_BEAD_ID="$ROOT_ID" "$artifact_check"
 }
 
+implementation_provenance_fail() {
+  echo "review check: implementation provenance $*" >&2
+  return 1
+}
+
+validate_implementation_provenance() {
+  local required convoy_id convoy_json member_ids drain_policy member_id member_json
+  local status outcome work_dir explicit_worktree canonical_worktree recorded_commit
+  local resolved_commit head found_terminal_commit
+
+  required="$(metadata_value "$ROOT_JSON" "gc.build.require_implementation_provenance")"
+  if [ -z "$required" ]; then
+    required="$(metadata_value "$PARENT_JSON" "gc.build.require_implementation_provenance")"
+  fi
+  [ "$required" = "true" ] || return 0
+
+  convoy_id="$(metadata_value "$PARENT_JSON" "gc.build.implementation_convoy_id")"
+  [ -n "$convoy_id" ] || implementation_provenance_fail \
+    "requires gc.build.implementation_convoy_id on workflow root $PARENT_ROOT"
+
+  convoy_json="$(gc convoy status "$convoy_id" --json 2>/dev/null || true)"
+  if ! printf '%s\n' "$convoy_json" | jq -e --arg id "$convoy_id" '
+    (.convoy.id == $id) and
+    (.convoy.status == "closed") and
+    (.children | type == "array" and length > 0) and
+    (all(.children[]; (.id | type == "string" and length > 0) and .status == "closed")) and
+    (([.children[].id] | unique | length) == (.children | length))
+  ' >/dev/null 2>&1; then
+    implementation_provenance_fail "convoy $convoy_id must be closed with unique closed members"
+  fi
+  member_ids="$(printf '%s\n' "$convoy_json" | jq -r '.children[].id')"
+  drain_policy="$(metadata_value "$PARENT_JSON" "gc.var.drain_policy")"
+  found_terminal_commit=false
+
+  while IFS= read -r member_id; do
+    [ -n "$member_id" ] || continue
+    member_json="$(gc bd show "$member_id" --json 2>/dev/null || true)"
+    status="$(printf '%s\n' "$member_json" | jq -r '
+      (if type == "array" then (.[0] // {}) else . end) | .status // ""
+    ' 2>/dev/null)"
+    outcome="$(metadata_value "$member_json" "gc.outcome")"
+    if [ "$status" != "closed" ] || [ "$outcome" != "pass" ]; then
+      implementation_provenance_fail \
+        "member $member_id must be closed/pass, got status=${status:-<missing>} outcome=${outcome:-<missing>}"
+    fi
+
+    work_dir="$(metadata_value "$member_json" "work_dir")"
+    explicit_worktree="$(metadata_value "$member_json" "gc.implementation.worktree_path")"
+    [ -n "$work_dir" ] || implementation_provenance_fail "member $member_id is missing work_dir"
+    [ -n "$explicit_worktree" ] || implementation_provenance_fail \
+      "member $member_id is missing gc.implementation.worktree_path"
+    canonical_worktree="$(cd "$work_dir" 2>/dev/null && pwd -P)" || implementation_provenance_fail \
+      "member $member_id work_dir does not resolve: $work_dir"
+    if [ "$(cd "$explicit_worktree" 2>/dev/null && pwd -P || true)" != "$canonical_worktree" ]; then
+      implementation_provenance_fail \
+        "member $member_id work_dir and gc.implementation.worktree_path disagree"
+    fi
+
+    recorded_commit="$(metadata_value "$member_json" "gc.implementation.commit")"
+    case "$recorded_commit" in
+      *[!0-9a-fA-F]*|'') implementation_provenance_fail \
+        "member $member_id gc.implementation.commit must be hexadecimal" ;;
+    esac
+    [ "${#recorded_commit}" -eq 40 ] || implementation_provenance_fail \
+      "member $member_id gc.implementation.commit must be a full 40-character commit"
+    resolved_commit="$(git -C "$canonical_worktree" rev-parse --verify "${recorded_commit}^{commit}" 2>/dev/null)" || \
+      implementation_provenance_fail "member $member_id recorded commit does not resolve"
+    head="$(git -C "$canonical_worktree" rev-parse HEAD 2>/dev/null)" || \
+      implementation_provenance_fail "member $member_id worktree HEAD is unreadable"
+
+    if [ "$drain_policy" = "same-session" ]; then
+      git -C "$canonical_worktree" merge-base --is-ancestor "$resolved_commit" "$head" 2>/dev/null || \
+        implementation_provenance_fail \
+          "member $member_id recorded commit is not an ancestor of shared worktree HEAD $head"
+      if [ "$resolved_commit" = "$head" ]; then
+        found_terminal_commit=true
+      fi
+    elif [ "$resolved_commit" != "$head" ]; then
+      implementation_provenance_fail \
+        "member $member_id recorded commit $resolved_commit does not equal worktree HEAD $head"
+    fi
+
+    if ! git -C "$canonical_worktree" diff --quiet "$head" --; then
+      implementation_provenance_fail \
+        "member $member_id tracked bytes differ from recorded worktree HEAD $head"
+    fi
+  done <<<"$member_ids"
+
+  if [ "$drain_policy" = "same-session" ] && [ "$found_terminal_commit" != "true" ]; then
+    implementation_provenance_fail \
+      "same-session members do not bind the terminal shared worktree HEAD"
+  fi
+}
+
 approve() {
   local message="$1"
   validate_declared_artifact
+  validate_implementation_provenance
   echo "$message"
   exit 0
 }

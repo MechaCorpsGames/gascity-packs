@@ -1883,6 +1883,10 @@ class FormulaAssetTests(unittest.TestCase):
         templates = {template["id"]: template for template in review["template"]}
         loop = templates["{target}.build-basic-review-loop"]
         self.assertEqual(
+            loop["metadata"]["gc.build.require_implementation_provenance"],
+            "true",
+        )
+        self.assertEqual(
             [child["id"] for child in loop["children"]],
             [
                 "{target}.acceptance-review",
@@ -2099,6 +2103,64 @@ class FormulaAssetTests(unittest.TestCase):
             ):
                 with self.subTest(asset=relative_path, fragment=fragment):
                     self.assertIn(fragment, text)
+
+    def test_build_basic_approved_review_does_not_apply_nonblocking_suggestions(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        apply_findings = (
+            root
+            / "assets"
+            / "workflows"
+            / "build-basic-review"
+            / "{target}.apply-review-findings.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(apply_findings.split()).lower()
+
+        assertions = (
+            (
+                "approved review is a no-op",
+                r"all three review lanes approve.{0,120}no-op",
+            ),
+            (
+                "optional/non-blocking findings are explicitly classified",
+                r"optional\s*(?:or|and|/)\s*non-?blocking suggestions",
+            ),
+            (
+                "optional/non-blocking findings cannot authorize edits",
+                r"(?:optional|non-?blocking).{0,160}(?:must not|do not).{0,80}"
+                r"(?:apply|edit|modify|change)|(?:must not|do not).{0,80}"
+                r"(?:apply|edit|modify|change).{0,160}(?:optional|non-?blocking)",
+            ),
+        )
+        for contract, pattern in assertions:
+            with self.subTest(contract=contract):
+                self.assertRegex(normalized, pattern)
+
+    def test_build_basic_required_review_fixes_reconcile_authoritative_provenance(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        apply_findings = (
+            root
+            / "assets"
+            / "workflows"
+            / "build-basic-review"
+            / "{target}.apply-review-findings.md"
+        ).read_text(encoding="utf-8")
+        required_fix_start = apply_findings.index("If required fixes")
+        verdict_start = apply_findings.index(
+            "Set `code_review.verdict=done`", required_fix_start
+        )
+        required_fix_contract = apply_findings[required_fix_start:verdict_start]
+
+        for fragment in (
+            "authoritative implementation worktree",
+            "gc.implementation.worktree_path",
+            "gc.implementation.commit",
+            "gc.implementation.summary_path",
+            "gc.build.implementation_summary_path",
+            "current full commit",
+            "sha256",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, required_fix_contract)
 
     def test_build_artifact_prompts_use_set_metadata_for_paths(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
@@ -6807,6 +6869,8 @@ description = "Override sink that writes the base triage report contract."
         show_json: str,
         list_json: str,
         parent_show_json: str | None = None,
+        member_show_json: dict[str, str] | None = None,
+        convoy_json: str = "{}",
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
         root = pathlib.Path(__file__).resolve().parents[1]
@@ -6819,25 +6883,36 @@ description = "Override sink that writes the base triage report contract."
             show_path = tmp / "show.json"
             parent_show_path = tmp / "parent-show.json"
             list_path = tmp / "list.json"
+            member_show_dir = tmp / "member-show"
+            member_show_dir.mkdir()
+            convoy_path = tmp / "convoy.json"
             show_path.write_text(show_json, encoding="utf-8")
             parent_show_path.write_text(parent_show_json or show_json, encoding="utf-8")
             list_path.write_text(list_json, encoding="utf-8")
+            convoy_path.write_text(convoy_json, encoding="utf-8")
+            for bead_id, payload in (member_show_json or {}).items():
+                (member_show_dir / f"{bead_id}.json").write_text(payload, encoding="utf-8")
             fake_gc = bin_dir / "gc"
             fake_gc.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
-                "while [ \"${1:-}\" != \"bd\" ]; do shift; done\n"
-                "shift\n"
-                "case \"$1\" in\n"
-                "  version) exit 0 ;;\n"
-                "  show)\n"
+                "command_name=''\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  case \"$1\" in bd|convoy) command_name=\"$1\"; shift; break ;; *) shift ;; esac\n"
+                "done\n"
+                "case \"$command_name:${1:-}\" in\n"
+                "  bd:version) exit 0 ;;\n"
+                "  bd:show)\n"
                 "    if [ \"${2:-}\" = \"root\" ]; then\n"
                 "      cat \"$BD_PARENT_SHOW_JSON\"\n"
+                "    elif [ -f \"$BD_MEMBER_SHOW_DIR/${2:-}.json\" ]; then\n"
+                "      cat \"$BD_MEMBER_SHOW_DIR/${2:-}.json\"\n"
                 "    else\n"
                 "      cat \"$BD_SHOW_JSON\"\n"
                 "    fi\n"
                 "    ;;\n"
-                "  list) cat \"$BD_LIST_JSON\" ;;\n"
+                "  bd:list) cat \"$BD_LIST_JSON\" ;;\n"
+                "  convoy:status) cat \"$CONVOY_JSON\" ;;\n"
                 "  *) exit 2 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -6849,7 +6924,9 @@ description = "Override sink that writes the base triage report contract."
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                 "BD_SHOW_JSON": str(show_path),
                 "BD_PARENT_SHOW_JSON": str(parent_show_path),
+                "BD_MEMBER_SHOW_DIR": str(member_show_dir),
                 "BD_LIST_JSON": str(list_path),
+                "CONVOY_JSON": str(convoy_path),
                 "GC_BEAD_ID": "loop",
                 "GC_ITERATION": "1",
                 **(extra_env or {}),
@@ -6861,6 +6938,105 @@ description = "Override sink that writes the base triage report contract."
                 capture_output=True,
                 check=False,
             )
+
+    def test_implementation_review_check_rejects_tracked_bytes_after_recorded_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = pathlib.Path(td) / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Review Test"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "review@example.invalid"], cwd=worktree, check=True
+            )
+            product = worktree / "slugger.py"
+            product.write_text("value = 'recorded'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "recorded implementation"], cwd=worktree, check=True)
+            recorded_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            loop = json.dumps(
+                [
+                    {
+                        "id": "loop",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.step_id": "review.build-basic-review-loop",
+                            "gc.build.require_implementation_provenance": "true",
+                        },
+                    }
+                ]
+            )
+            parent = json.dumps(
+                [
+                    {
+                        "id": "root",
+                        "metadata": {
+                            "gc.formula_name": "build-basic",
+                            "gc.build.implementation_convoy_id": "implementation",
+                        },
+                    }
+                ]
+            )
+            member = json.dumps(
+                [
+                    {
+                        "id": "member",
+                        "status": "closed",
+                        "metadata": {
+                            "gc.outcome": "pass",
+                            "work_dir": str(worktree),
+                            "gc.implementation.worktree_path": str(worktree),
+                            "gc.implementation.commit": recorded_commit,
+                        },
+                    }
+                ]
+            )
+            convoy = json.dumps(
+                {
+                    "convoy": {"id": "implementation", "status": "closed"},
+                    "children": [{"id": "member", "status": "closed"}],
+                }
+            )
+            lanes = json.dumps(
+                [
+                    {
+                        "id": "apply",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": "1",
+                            "gc.ralph_step_id": "review.build-basic-review-loop",
+                            "code_review.verdict": "done",
+                        },
+                    }
+                ]
+            )
+
+            clean = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+            product.write_text("value = 'optional review rewrite'\n", encoding="utf-8")
+            result = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("implementation provenance", result.stderr)
+        self.assertIn("tracked bytes", result.stderr)
 
     def test_implementation_review_check_accepts_approved_build_basic_lanes(self) -> None:
         show_json = """[
