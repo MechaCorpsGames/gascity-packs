@@ -18,6 +18,13 @@ Read `gc.var.interaction_mode`, `gc.var.brainstorming_approval_mode`,
 Use only paths recorded on the workflow root or the claimed bead.
 Do not guess prior bead ids or worktree paths.
 
+Resolve product scope from workflow root `gc.var.convoy_id` as
+`<launch-convoy-id>` and run `gc convoy status <launch-convoy-id> --json`.
+Treat every direct launch-convoy member as a source target; run
+`gc bd show <source-target-id> --json` for each. Its title, description,
+acceptance criteria, and constraints are authoritative. If the convoy is
+missing, empty, or unreadable, fail closed instead of inventing a design.
+
 This lane maps stock Superpowers checklist items 1-5. Track each item in the
 design candidate so the loop state is durable:
 

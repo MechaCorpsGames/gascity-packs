@@ -4,6 +4,22 @@ but normalize its result into the Gas City build artifact described below. Do
 not use the stock `docs/brainstorms/` output as the build artifact, and do not
 write HTML or JSON.
 
+Resolve the actual build request before applying the methodology. Read the
+workflow root bead's reserved `gc.var.convoy_id` as `<launch-convoy-id>`, run
+`gc convoy status <launch-convoy-id> --json`, and treat every direct
+launch-convoy member as a source target. Run `gc bd show <source-target-id> --json`
+for each source and use its title, description, acceptance criteria, and
+constraints as authoritative product scope. The workflow and formula roots
+describe process, not requested product behavior. If the launch convoy is
+missing, empty, ambiguous, or unreadable, fail closed instead of inventing
+requirements.
+
+Trace every direct launch-convoy member exactly once using
+`path: beads/<source-target-id>` and `hash: bead:<source-target-id>`. Do not
+substitute the workflow root, prepare step, convoy, or an empty context file.
+Preserve IDs declared by a source verbatim; do not attribute invented IDs to a
+source that did not declare them.
+
 Read the exact requirements path from workflow root metadata
 `gc.build.requirements_path` (fallback `gc.var.requirements_path`). Write the
 normalized artifact to that path; do not substitute a per-attempt path.
@@ -28,8 +44,8 @@ producer:
 status: approved
 trace:
   upstream:
-    - path: <input-path-or-bead-reference>
-      hash: bead:<source-bead-id>
+    - path: beads/<source-target-id>
+      hash: bead:<source-target-id>
       ids: [<actual-source-id>]
   coverage:
     - id: <actual-source-id>
@@ -79,7 +95,7 @@ with:
 
 Before closing, read the launcher rig root from workflow root metadata
 `gc.work_dir`. If needed, walk to the nearest ancestor containing
-`.gc/scripts/checks/build-artifact-valid.sh`. From that launcher rig root run:
+`.gc/scripts/checks/build-requirements-source-valid.sh`. From that launcher rig root run:
 
 Read the exact current bead ID from the startup claim output. In the same shell
 invocation, substitute it literally for the placeholder below; variables from
@@ -87,7 +103,7 @@ earlier tool calls do not persist.
 
 ```bash
 export CLAIMED_BEAD_ID='<exact-current-bead-id>'
-GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-artifact-valid.sh
+GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-requirements-source-valid.sh
 ```
 
 Repair every reported error in the exact canonical artifact and rerun the check
@@ -96,4 +112,4 @@ metadata record the same approved requirements outcome.
 
 Do not invoke provider-native subagents or upstream plugin runtime commands.
 
-Artifact validation: this stage is gated by `.gc/scripts/checks/build-artifact-valid.sh`, which validates the artifact recorded at `gc.build.requirements_path` (fallback `gc.var.requirements_path`) against schema `gc.build.requirements.v1`. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact in place instead of rewriting it. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.
+Artifact validation: this stage is gated by `.gc/scripts/checks/build-requirements-source-valid.sh`, which validates the artifact recorded at `gc.build.requirements_path` (fallback `gc.var.requirements_path`) against schema `gc.build.requirements.v1` and requires an exact trace for every direct launch-convoy source. On repair attempts (`gc.attempt` greater than 1), read the validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact in place instead of rewriting it. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable validation errors that block downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.

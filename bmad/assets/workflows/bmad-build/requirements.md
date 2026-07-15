@@ -6,6 +6,22 @@ or present menus, and do not wait for user input in headless mode. Never wait
 for an interactive BMAD selection; make the safest evidence-backed choice and
 record unresolved ambiguity in the open-questions section.
 
+Resolve the actual build request before applying BMAD terminology. Read the
+workflow root bead's reserved `gc.var.convoy_id` as `<launch-convoy-id>`, run
+`gc convoy status <launch-convoy-id> --json`, and treat every direct
+launch-convoy member as a source target. Run `gc bd show <source-target-id> --json`
+for each source and use its title, description, acceptance criteria, and
+constraints as authoritative product scope. The workflow and formula roots
+describe process, not requested product behavior. If the launch convoy is
+missing, empty, ambiguous, or unreadable, fail closed instead of inventing
+requirements.
+
+Trace every direct launch-convoy member exactly once using
+`path: beads/<source-target-id>` and `hash: bead:<source-target-id>`. Do not
+substitute the workflow root, prepare step, convoy, or an empty context file.
+Preserve IDs declared by a source verbatim; do not attribute invented IDs to a
+source that did not declare them.
+
 Read the exact canonical output path from workflow root metadata
 `gc.build.requirements_path` (fallback `gc.var.requirements_path`). Write the
 artifact at that path and record its absolute path on the workflow root as
@@ -33,8 +49,8 @@ producer:
 status: approved
 trace:
   upstream:
-    - path: <request-or-context-path>
-      hash: sha256:<source-digest>
+    - path: beads/<source-target-id>
+      hash: bead:<source-target-id>
       ids: [<actual-source-id>]
   coverage:
     - id: <actual-source-id>
@@ -79,12 +95,12 @@ non-empty.
 Before closing, resolve the launcher rig root from workflow root metadata
 `gc.work_dir`. If it names an attempt worktree without the validator, walk to
 the nearest ancestor containing
-`.gc/scripts/checks/build-artifact-valid.sh`. Read the exact current bead ID
+`.gc/scripts/checks/build-requirements-source-valid.sh`. Read the exact current bead ID
 from the startup claim output and assign it literally in the same shell call;
 shell variables from earlier tool calls do not persist. Run:
 
 ```bash
-CLAIMED_BEAD_ID=<exact-claimed-bead-id>; GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-artifact-valid.sh
+CLAIMED_BEAD_ID=<exact-claimed-bead-id>; GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-requirements-source-valid.sh
 ```
 
 Fix every validation error at the canonical path before setting

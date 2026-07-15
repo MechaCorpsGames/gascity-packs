@@ -4,6 +4,21 @@ This lane maps stock Superpowers checklist items 6-7: write the durable design
 doc/spec, then run the inline Spec self-review before any user/spec approval
 gate can pass.
 
+Re-resolve the actual build request before writing the spec. Read workflow root
+metadata `gc.var.convoy_id` as `<launch-convoy-id>`, run
+`gc convoy status <launch-convoy-id> --json`, and treat every direct
+launch-convoy member as a source target. Run `gc bd show <source-target-id> --json`
+for each source and use its title, description, acceptance criteria, and
+constraints as authoritative product scope. The approved design may elaborate
+that scope but may not replace it. If the launch convoy is missing, empty,
+ambiguous, or unreadable, fail closed instead of inventing requirements.
+
+Trace every direct launch-convoy member exactly once using
+`path: beads/<source-target-id>` and `hash: bead:<source-target-id>`. Do not
+substitute the workflow root, expansion controls, convoy, or an empty context
+file. Preserve IDs declared by a source verbatim; do not attribute invented IDs
+to a source that did not declare them.
+
 Resolve the approved design candidate from workflow root metadata. Convert that
 design into the normalized requirements artifact consumed by build-base. Include
 the requested outcome, constraints, non-goals, accepted design, acceptance

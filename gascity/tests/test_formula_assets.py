@@ -2488,6 +2488,87 @@ class FormulaAssetTests(unittest.TestCase):
                 ]
                 self.assertEqual(gap_targets, [expected["gap_analysis_target"]])
 
+    def test_supported_build_requirements_bind_every_launch_source(self) -> None:
+        gascity_root = pathlib.Path(__file__).resolve().parents[1]
+        packs_root = gascity_root.parent
+        source_prompts = {
+            "gascity": [gascity_root / "assets/workflows/build-basic/requirements.md"],
+            "compound-engineering": [
+                packs_root / "compound-engineering/assets/workflows/compound-build/requirements.md"
+            ],
+            "bmad": [packs_root / "bmad/assets/workflows/bmad-build/requirements.md"],
+            "gstack": [packs_root / "gstack/assets/workflows/gstack-build/requirements.md"],
+            "superpowers": [
+                packs_root
+                / "superpowers/assets/workflows/superpowers-brainstorming/{target}.brainstorm-design.md",
+                packs_root
+                / "superpowers/assets/workflows/superpowers-brainstorming/write-requirements-spec.md",
+            ],
+        }
+        for pack_name, prompts in source_prompts.items():
+            for prompt in prompts:
+                text = prompt.read_text(encoding="utf-8")
+                normalized = " ".join(text.split())
+                for fragment in (
+                    "gc.var.convoy_id",
+                    "gc convoy status <launch-convoy-id> --json",
+                    "gc bd show <source-target-id> --json",
+                    "every direct launch-convoy member",
+                    "fail closed",
+                ):
+                    with self.subTest(pack=pack_name, prompt=prompt.name, fragment=fragment):
+                        self.assertIn(fragment, normalized)
+
+        trace_prompts = {
+            "gascity": source_prompts["gascity"][0],
+            "compound-engineering": source_prompts["compound-engineering"][0],
+            "bmad": source_prompts["bmad"][0],
+            "gstack": source_prompts["gstack"][0],
+            "superpowers": source_prompts["superpowers"][1],
+        }
+        for pack_name, prompt in trace_prompts.items():
+            text = prompt.read_text(encoding="utf-8")
+            for fragment in (
+                "path: beads/<source-target-id>",
+                "hash: bead:<source-target-id>",
+                "exactly once",
+            ):
+                with self.subTest(pack=pack_name, trace=prompt.name, fragment=fragment):
+                    self.assertIn(fragment, text)
+
+        build_checks = {
+            "gascity": (
+                load_formula(gascity_root, "build-basic"),
+                "requirements",
+                BUILD_REQUIREMENTS_SOURCE_CHECK_SCRIPT,
+            ),
+            "compound-engineering": (
+                load_formula(packs_root / "compound-engineering", "compound-build"),
+                "requirements",
+                BUILD_REQUIREMENTS_SOURCE_CHECK_SCRIPT,
+            ),
+            "bmad": (
+                load_formula(packs_root / "bmad", "bmad-build"),
+                "requirements",
+                BUILD_REQUIREMENTS_SOURCE_CHECK_SCRIPT,
+            ),
+            "gstack": (
+                load_formula(packs_root / "gstack", "gstack-build"),
+                "requirements",
+                "../assets/scripts/checks/gstack-build-state-valid.sh",
+            ),
+            "superpowers": (
+                load_formula(packs_root / "superpowers", "superpowers-brainstorming"),
+                "{target}",
+                BUILD_REQUIREMENTS_SOURCE_CHECK_SCRIPT,
+            ),
+        }
+        for pack_name, (formula, step_id, expected_path) in build_checks.items():
+            nodes = formula.get("steps") or formula.get("template") or []
+            step = next(node for node in nodes if node["id"] == step_id)
+            with self.subTest(pack=pack_name, check=step_id):
+                self.assertEqual(step["check"]["check"]["path"], expected_path)
+
     def test_third_party_methodology_contract_wrappers_are_adapter_selectable(self) -> None:
         gascity_root = pathlib.Path(__file__).resolve().parents[1]
         packs_root = gascity_root.parent
@@ -5400,7 +5481,7 @@ class FormulaAssetTests(unittest.TestCase):
             'GC_BEAD_ID="$CLAIMED_BEAD_ID"',
             final_requirements,
         )
-        self.assertIn("build-artifact-valid.sh", final_requirements)
+        self.assertIn("build-requirements-source-valid.sh", final_requirements)
         self.assertIn("repair every validation error before closing", final_requirements)
 
         brainstorm_design = (

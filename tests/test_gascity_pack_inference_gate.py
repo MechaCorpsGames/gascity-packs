@@ -1935,6 +1935,30 @@ def test_validate_methodology_flow_contract_rejects_missing_specialist_review_la
         )
 
 
+def test_validate_methodology_flow_contract_rejects_missing_source_bound_requirements_sink(
+    tmp_path,
+) -> None:
+    spec = gascity_pack_inference_gate.PACK_SPECS["superpowers"]
+    pack_source = tmp_path / "superpowers"
+    shutil.copytree(spec.source / "formulas", pack_source / "formulas")
+    expansion = pack_source / "formulas" / "superpowers-brainstorming.formula.toml"
+    expansion.write_text(
+        expansion.read_text(encoding="utf-8").replace(
+            "build-requirements-source-valid.sh",
+            "build-artifact-valid.sh",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="superpowers-brainstorming.*terminal.*build-requirements-source-valid",
+    ):
+        gascity_pack_inference_gate.validate_methodology_flow_contract(
+            replace(spec, source=pack_source)
+        )
+
+
 def test_validate_methodology_flow_contract_rejects_missing_gstack_release_readiness(tmp_path) -> None:
     spec = gascity_pack_inference_gate.PACK_SPECS["gstack"]
     pack_source = tmp_path / "gstack"

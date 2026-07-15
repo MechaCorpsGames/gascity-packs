@@ -217,6 +217,9 @@ METHODOLOGY_FLOW_CONTRACTS = {
             "superpowers-plan-review": "design-review-approved.sh",
             "superpowers-brainstorming": "design-review-approved.sh",
         },
+        "expansion_terminal_checks": {
+            "superpowers-brainstorming": "build-requirements-source-valid.sh",
+        },
     },
     "compound-engineering": {
         "review_expansion": "compound-code-review",
@@ -224,7 +227,7 @@ METHODOLOGY_FLOW_CONTRACTS = {
             "requirements": {
                 "run_target": "compound-engineering.ce-brainstorm",
                 "artifact_schema": "gc.build.requirements.v1",
-                "check": "build-artifact-valid.sh",
+                "check": "build-requirements-source-valid.sh",
             },
             "plan": {
                 "run_target": "compound-engineering.ce-plan",
@@ -392,7 +395,7 @@ METHODOLOGY_FLOW_CONTRACTS = {
             "requirements": {
                 "run_target": "bmad.prd-writer",
                 "artifact_schema": "gc.build.requirements.v1",
-                "check": "build-artifact-valid.sh",
+                "check": "build-requirements-source-valid.sh",
             },
             "plan": {
                 "run_target": "bmad.architect",
@@ -3157,6 +3160,7 @@ def validate_methodology_flow_contract(pack_spec: PackSpec) -> None:
 
     expansion_routes = contract.get("expansion_routes", {})
     expansion_checks = contract.get("expansion_checks", {})
+    expansion_terminal_checks = contract.get("expansion_terminal_checks", {})
     if isinstance(expansion_routes, dict):
         for expansion_name, required_routes in expansion_routes.items():
             expansion_document = load_methodology_formula(pack_spec.source, str(expansion_name), missing)
@@ -3166,7 +3170,12 @@ def validate_methodology_flow_contract(pack_spec: PackSpec) -> None:
                     str(expansion_name),
                     expansion_document,
                     tuple(str(route) for route in required_routes),
-                    str(expansion_checks.get(expansion_name, "")) if isinstance(expansion_checks, Mapping) else "",
+                    str(expansion_checks.get(expansion_name, ""))
+                    if isinstance(expansion_checks, Mapping)
+                    else "",
+                    str(expansion_terminal_checks.get(expansion_name, ""))
+                    if isinstance(expansion_terminal_checks, Mapping)
+                    else "",
                     missing,
                 )
 
@@ -3275,6 +3284,7 @@ def validate_methodology_expansion(
     document: Mapping[str, Any],
     required_routes: Sequence[str],
     required_check: str,
+    required_terminal_check: str,
     missing: list[str],
 ) -> None:
     if document.get("type") != "expansion":
@@ -3294,6 +3304,17 @@ def validate_methodology_expansion(
     ]
     if required_check and not any(step_check_path(template).endswith(required_check) for template in loop_templates):
         missing.append(f"{formula_name}: loop template missing {required_check}")
+
+    terminal_templates = [
+        template
+        for template in list_dicts(document.get("template"))
+        if not list_dicts(template.get("children"))
+    ]
+    if required_terminal_check and not any(
+        step_check_path(template).endswith(required_terminal_check)
+        for template in terminal_templates
+    ):
+        missing.append(f"{formula_name}: terminal template missing {required_terminal_check}")
 
 
 def validate_step_contract(

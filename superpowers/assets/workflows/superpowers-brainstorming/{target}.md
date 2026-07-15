@@ -10,11 +10,11 @@ exact `gc.build.requirements_path` (fallback `gc.var.requirements_path`) from
 the workflow root; do not validate an attempt-local substitute. Then read the
 launcher rig root from its `gc.work_dir`. If that work directory is a per-step
 worktree without the check, walk to the nearest ancestor containing
-`.gc/scripts/checks/build-artifact-valid.sh`. From that launcher rig root, run
+`.gc/scripts/checks/build-requirements-source-valid.sh`. From that launcher rig root, run
 the same canonical check used by the Ralph control:
 
 ```bash
-GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-artifact-valid.sh
+GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-requirements-source-valid.sh
 ```
 
 On a failed validation, repair every validation error before closing: preserve

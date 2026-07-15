@@ -104,5 +104,5 @@ max_attempts = 3
 
 [template.check.check]
 mode = "exec"
-path = ".gc/scripts/checks/build-artifact-valid.sh"
+path = ".gc/scripts/checks/build-requirements-source-valid.sh"
 timeout = "5m"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build-basic requirements provenance gate.
+# Build requirements provenance gate.
 #
 # The shared artifact check proves schema validity. This wrapper additionally
 # proves that requirements trace every direct member of the immutable launch
