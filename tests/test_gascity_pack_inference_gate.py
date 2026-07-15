@@ -1430,6 +1430,31 @@ def test_validate_review_report_requires_blocking_base_gascity_report(tmp_path) 
     )
 
 
+def test_validate_review_report_rejects_stale_additional_absolute_upstream(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()
+    stale_path = (workspace.rig_dir / "stale-review-input.md").resolve()
+    stale_path.write_text("original review input\n", encoding="utf-8")
+    stale_digest = hashlib.sha256(stale_path.read_bytes()).hexdigest()
+    stale_path.write_text("changed review input\n", encoding="utf-8")
+    report_path = (workspace.rig_dir / gascity_pack_inference_gate.REVIEW_REPORT_PATH).resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = review_artifact_traced_to_subject(subject_path, status="changes_required").replace(
+        "  coverage:\n",
+        f"    - path: {stale_path}\n      hash: sha256:{stale_digest}\n  coverage:\n",
+        1,
+    )
+    report_path.write_text(report, encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="valid expected review artifact"):
+        gascity_pack_inference_gate.validate_review_report(
+            {"metadata": {"gc.var.report_path": str(report_path)}},
+            workspace,
+            env={},
+            pack_spec=gascity_pack_inference_gate.PACK_SPECS["gascity"],
+        )
+
+
 def test_validate_review_report_accepts_exact_methodology_adapter_report(tmp_path) -> None:
     workspace = gate_workspace(tmp_path)
     subject_path = gascity_pack_inference_gate.write_review_subject(workspace.rig_dir).resolve()

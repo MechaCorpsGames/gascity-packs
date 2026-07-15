@@ -82,6 +82,22 @@ canonical_file_path() {
   python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$1"
 }
 
+git_worktree_root_for_file() {
+  local file_path file_dir git_root
+  file_path="$(canonical_file_path "$1")" || return 1
+  file_dir="$(dirname "$file_path")"
+  git_root="$(git -C "$file_dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  git_root="$(cd "$git_root" 2>/dev/null && pwd -P)" || return 1
+
+  if [ "$git_root" != "/" ]; then
+    case "$file_path" in
+      "$git_root"/*) ;;
+      *) return 1 ;;
+    esac
+  fi
+  printf '%s\n' "$git_root"
+}
+
 require_subject_trace() {
   report_path="$1"
   subject_path="$2"
@@ -166,9 +182,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VALIDATOR="$SCRIPT_DIR/../validate_build_artifact.py"
 [ -f "$VALIDATOR" ] || fail "installed validate_build_artifact.py not found beside $SCRIPT_DIR"
 
-VALIDATOR_UPSTREAM_ARGS=()
-if UPSTREAM_LAUNCHER_ROOT="$(launcher_root_from_work_dir)"; then
-  VALIDATOR_UPSTREAM_ARGS+=(--upstream-root "$UPSTREAM_LAUNCHER_ROOT")
+BASE_VALIDATOR_UPSTREAM_ARGS=()
+MISSING_LAUNCHER_ROOT=""
+if [ -n "${GC_WORK_DIR:-}" ]; then
+  if UPSTREAM_LAUNCHER_ROOT="$(launcher_root_from_work_dir)"; then
+    BASE_VALIDATOR_UPSTREAM_ARGS+=(--upstream-root "$UPSTREAM_LAUNCHER_ROOT")
+  else
+    MISSING_LAUNCHER_ROOT="GC_WORK_DIR is set but no launcher root containing .gc/scripts/checks/build-artifact-valid.sh exists at or above GC_WORK_DIR=$GC_WORK_DIR"
+  fi
+fi
+
+VALIDATOR_UPSTREAM_ARGS=("${BASE_VALIDATOR_UPSTREAM_ARGS[@]}")
+if ARTIFACT_WORKTREE_ROOT="$(git_worktree_root_for_file "$ARTIFACT_PATH")"; then
+  VALIDATOR_UPSTREAM_ARGS+=(--upstream-root "$ARTIFACT_WORKTREE_ROOT")
 fi
 
 if ! OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" --verify-absolute-upstreams "${VALIDATOR_UPSTREAM_ARGS[@]}" 2>&1)"; then
@@ -176,6 +202,7 @@ if ! OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" -
   printf '%s\n' "$OUTPUT" >&2
   exit 1
 fi
+[ -z "$MISSING_LAUNCHER_ROOT" ] || fail "$MISSING_LAUNCHER_ROOT"
 
 if [ "$SCHEMA" = "gc.build.review.v1" ]; then
   CALLER_SUBJECT_RAW="$(metadata_value "$ROOT_JSON" "gc.var.subject_path")"
@@ -210,7 +237,11 @@ if [ "$SCHEMA" = "gc.build.review.v1" ]; then
     INTERNAL_PATH="$(resolve_declared_path "$INTERNAL_RAW" "gc.build.code_review_report_path")"
     [ -f "$INTERNAL_PATH" ] || fail "internal review report does not exist: $INTERNAL_PATH"
     [ ! "$INTERNAL_PATH" -ef "$ARTIFACT_PATH" ] || fail "internal and adapter review report paths must be distinct: internal=$INTERNAL_PATH adapter=$ARTIFACT_PATH"
-    if ! INTERNAL_OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$INTERNAL_PATH" --verify-absolute-upstreams "${VALIDATOR_UPSTREAM_ARGS[@]}" 2>&1)"; then
+    INTERNAL_VALIDATOR_UPSTREAM_ARGS=("${BASE_VALIDATOR_UPSTREAM_ARGS[@]}")
+    if INTERNAL_WORKTREE_ROOT="$(git_worktree_root_for_file "$INTERNAL_PATH")"; then
+      INTERNAL_VALIDATOR_UPSTREAM_ARGS+=(--upstream-root "$INTERNAL_WORKTREE_ROOT")
+    fi
+    if ! INTERNAL_OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$INTERNAL_PATH" --verify-absolute-upstreams "${INTERNAL_VALIDATOR_UPSTREAM_ARGS[@]}" 2>&1)"; then
       echo "build-artifact-check: internal review report $INTERNAL_PATH failed validation" >&2
       printf '%s\n' "$INTERNAL_OUTPUT" >&2
       exit 1

@@ -4088,7 +4088,8 @@ class FormulaAssetTests(unittest.TestCase):
                 launcher_root=launcher,
             )
             self.assertNotEqual(stale.returncode, 0, stale.stdout + stale.stderr)
-            self.assertIn("canonical implementation summary is stale", stale.stderr)
+            self.assertIn("canonical implementation summary", stale.stderr)
+            self.assertIn("sha256 digest does not match", stale.stderr)
 
             self._write_gstack_root_implementation_summary(
                 root_summary,
@@ -4109,6 +4110,53 @@ class FormulaAssetTests(unittest.TestCase):
                 launcher_root=launcher,
             )
             self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+
+            stale_absolute_trace = (
+                "    - path: "
+                f"{json.dumps(str((worktree / 'shared.txt').resolve()))}\n"
+                f"      hash: sha256:{'0' * 64}\n"
+            )
+            summary_one.write_text(
+                summary_one.read_text(encoding="utf-8").replace(
+                    "  coverage: []\n",
+                    f"{stale_absolute_trace}  coverage: []\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [
+                    ("work-1", worktree, member_one_commit, summary_one),
+                    ("work-2", worktree, member_two_commit, summary_two),
+                ],
+            )
+            stale_absolute = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "finalize-step": finalize_control,
+                    "root": root,
+                    "work-1": member("work-1", member_one_commit, summary_one),
+                    "work-2": member("work-2", member_two_commit, summary_two),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="finalize-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(
+                stale_absolute.returncode,
+                0,
+                stale_absolute.stdout + stale_absolute.stderr,
+            )
+            self.assertIn("sha256 digest does not match", stale_absolute.stderr)
+
+            write_summary(summary_one, "work-1", member_one_commit)
+            self._write_gstack_root_implementation_summary(
+                root_summary,
+                [
+                    ("work-1", worktree, member_one_commit, summary_one),
+                    ("work-2", worktree, member_two_commit, summary_two),
+                ],
+            )
 
             root_summary.write_text(
                 root_summary.read_text(encoding="utf-8").replace(
@@ -5588,6 +5636,8 @@ class FormulaAssetTests(unittest.TestCase):
             "first line must be `---`",
             "rationale",
             "validate_build_artifact.py --schema gc.build.requirements.v1",
+            "--verify-absolute-upstreams",
+            "--upstream-root <launcher-rig>",
         ):
             with self.subTest(write_spec_contract=fragment):
                 self.assertIn(fragment, write_spec)
@@ -8590,6 +8640,64 @@ description = "Override sink that writes the base triage report contract."
 
         self.assertNotEqual(mismatched.returncode, 0, mismatched.stdout + mismatched.stderr)
         self.assertIn("sha256 digest does not match", mismatched.stderr)
+
+    def test_build_artifact_check_resolves_relative_sha256_from_artifact_worktree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            launcher_root = root / "launcher"
+            attempt_worktree = launcher_root / ".gc" / "worktrees" / "review-attempt"
+            attempt_worktree.mkdir(parents=True)
+            check_marker = (
+                launcher_root / ".gc" / "scripts" / "checks" / "build-artifact-valid.sh"
+            )
+            check_marker.parent.mkdir(parents=True)
+            check_marker.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+            member_worktree = root / "member"
+            member_worktree.mkdir()
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main"], cwd=member_worktree, check=True
+            )
+            product = member_worktree / "slugger.py"
+            product.write_text("value = 'approved'\n", encoding="utf-8")
+            digest = hashlib.sha256(product.read_bytes()).hexdigest()
+            artifact = member_worktree / "proof" / "requirements.md"
+            artifact.parent.mkdir()
+            artifact.write_text(
+                self._valid_requirements_artifact().replace(
+                    "    - path: beads/request\n"
+                    "      hash: bead:request\n",
+                    "    - path: slugger.py\n"
+                    f"      hash: sha256:{digest}\n",
+                ),
+                encoding="utf-8",
+            )
+
+            control = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.requirements.v1",
+                        "gc.build.artifact_path_keys": "gc.build.requirements_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {"gc.build.requirements_path": str(artifact)},
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+                extra_env={"GC_WORK_DIR": str(attempt_worktree)},
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_build_artifact_check_blocks_invalid_artifact_with_repair_context(self) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:

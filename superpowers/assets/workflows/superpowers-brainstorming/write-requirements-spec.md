@@ -99,7 +99,7 @@ worktree without the validator, walk to the nearest ancestor containing
 `.gc/scripts/validate_build_artifact.py`. Run:
 
 ```text
-python3 <launcher-rig>/.gc/scripts/validate_build_artifact.py --schema gc.build.requirements.v1 --path <requirements-artifact-path>
+python3 <launcher-rig>/.gc/scripts/validate_build_artifact.py --schema gc.build.requirements.v1 --path <requirements-artifact-path> --verify-absolute-upstreams --upstream-root <launcher-rig>
 ```
 
 Repair every validation error in that exact root artifact and rerun this

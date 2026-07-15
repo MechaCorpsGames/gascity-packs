@@ -1989,6 +1989,7 @@ def validate_review_report(
         validator=validator,
         env=env,
         allow_approved=allow_approved,
+        upstream_roots=(workspace.rig_dir,),
     )
 
     subject_path = (workspace.rig_dir / REVIEW_SUBJECT_PATH).resolve()
@@ -2028,6 +2029,7 @@ def validate_review_report(
             validator=validator,
             env=env,
             allow_approved=allow_approved,
+            upstream_roots=(workspace.rig_dir,),
         )
         require_canonical_review_subject_trace(internal_path, subject_path)
         if internal_path.read_bytes() != requested_report_path.read_bytes():
@@ -2045,17 +2047,22 @@ def validate_review_artifact_file(
     validator: Path,
     env: Mapping[str, str],
     allow_approved: bool,
+    upstream_roots: Sequence[Path],
 ) -> None:
     try:
+        command = [
+            sys.executable,
+            str(validator),
+            "--schema",
+            "gc.build.review.v1",
+            "--path",
+            str(report_path),
+            "--verify-absolute-upstreams",
+        ]
+        for root in upstream_roots:
+            command.extend(("--upstream-root", str(root.resolve(strict=True))))
         run_checked(
-            [
-                sys.executable,
-                str(validator),
-                "--schema",
-                "gc.build.review.v1",
-                "--path",
-                str(report_path),
-            ],
+            command,
             env=env,
             timeout=parse_duration("1m"),
             log_output=True,

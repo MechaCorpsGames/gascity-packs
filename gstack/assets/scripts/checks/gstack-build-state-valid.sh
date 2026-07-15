@@ -153,7 +153,12 @@ def front_matter(path: Path) -> dict[str, Any]:
     return data
 
 
-def validate_implementation_summary(path: Path, *, label: str) -> None:
+def validate_implementation_summary(
+    path: Path,
+    *,
+    label: str,
+    upstream_root: Path,
+) -> None:
     result = subprocess.run(
         [
             sys.executable,
@@ -162,6 +167,9 @@ def validate_implementation_summary(path: Path, *, label: str) -> None:
             "gc.build.implementation-summary.v1",
             "--path",
             str(path),
+            "--verify-absolute-upstreams",
+            "--upstream-root",
+            str(upstream_root),
         ],
         text=True,
         capture_output=True,
@@ -554,6 +562,7 @@ def implementation_state(*, require_closed: bool, require_worktree_proof: bool) 
         validate_implementation_summary(
             summary_path,
             label=f"implementation member {member_id} per-item summary",
+            upstream_root=worktree,
         )
         item_summary_front = front_matter(summary_path)
         if item_summary_front.get("status") != "approved":
@@ -602,6 +611,7 @@ def implementation_state(*, require_closed: bool, require_worktree_proof: bool) 
     validate_implementation_summary(
         root_summary_path,
         label="canonical implementation summary",
+        upstream_root=LAUNCHER_ROOT,
     )
     root_summary_front = front_matter(root_summary_path)
     if root_summary_front.get("status") != "approved":
