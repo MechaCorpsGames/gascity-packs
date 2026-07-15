@@ -2548,11 +2548,11 @@ class FormulaAssetTests(unittest.TestCase):
         self.assertEqual(len(member_commands), 1)
         for assignment in (
             "gc.implementation.commit=<current full HEAD>",
-            "gc.verified_commit=<current full HEAD>",
             "gc.implementation.summary_path=<current absolute member summary>",
         ):
             with self.subTest(member_assignment=assignment):
                 self.assertIn(assignment, member_commands[0])
+        self.assertNotIn("gc.verified_commit", member_commands[0])
         for fragment in (
             "gc.implementation.summary_path",
             "gc.build.implementation_summary_path",

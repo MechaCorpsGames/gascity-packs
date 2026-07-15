@@ -20,7 +20,7 @@ that member summary at `gc.implementation.summary_path`, then commit all tracked
 source-worktree bytes, including that member summary. Only with a clean tree may
 you capture terminal full `HEAD`, the current full commit. Atomically
 update that member, never the root or claimed apply bead:
-`gc bd update "<implementation-member-id>" --set-metadata 'gc.implementation.commit=<current full HEAD>' --set-metadata 'gc.verified_commit=<current full HEAD>' --set-metadata 'gc.implementation.summary_path=<current absolute member summary>'`.
+`gc bd update "<implementation-member-id>" --set-metadata 'gc.implementation.commit=<current full HEAD>' --set-metadata 'gc.implementation.summary_path=<current absolute member summary>'`.
 Next refresh canonical `gc.build.implementation_summary_path` and
 `gc.build.code_review_context_path` with current `sha256` traces. Run the
 installed provenance verifier with `--emit-current`; never hand-hash. Then,
