@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -38,7 +39,12 @@ class BuildArtifact:
     coverage: list[dict[str, Any]]
 
 
-def validate_artifact_text(text: str, *, expected_schema: str = "") -> BuildArtifact:
+def validate_artifact_text(
+    text: str,
+    *,
+    expected_schema: str = "",
+    verify_absolute_upstreams: bool = False,
+) -> BuildArtifact:
     schema_id, front_matter, body = parse_front_matter(text)
     if expected_schema and schema_id != expected_schema:
         raise ValidationError(f"schema must be {expected_schema!r}, got {schema_id!r}")
@@ -48,6 +54,8 @@ def validate_artifact_text(text: str, *, expected_schema: str = "") -> BuildArti
     validate_status(front_matter, schema)
     trace = validate_trace(front_matter)
     upstream = validate_upstream(trace)
+    if verify_absolute_upstreams:
+        validate_absolute_sha256_upstreams(upstream)
     coverage = validate_coverage(trace, schema)
     validate_coverage_completeness(upstream, coverage)
     validate_status_coverage(front_matter, schema, coverage)
@@ -159,6 +167,26 @@ def validate_upstream(trace: dict[str, Any]) -> list[dict[str, Any]]:
                 raise ValidationError(f"trace.upstream[{index}].ids must be a list of non-empty strings")
         upstream.append(raw)
     return upstream
+
+
+def validate_absolute_sha256_upstreams(upstream: list[dict[str, Any]]) -> None:
+    for index, entry in enumerate(upstream):
+        hash_value = str(entry["hash"])
+        if not hash_value.lower().startswith("sha256:"):
+            continue
+        path = Path(str(entry["path"]))
+        if not path.is_absolute():
+            continue
+        if not path.is_file():
+            raise ValidationError(
+                f"trace.upstream[{index}] absolute sha256 path is not a file: {path}"
+            )
+        actual = f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+        if actual.lower() != hash_value.lower():
+            raise ValidationError(
+                f"trace.upstream[{index}] sha256 digest does not match {path}: "
+                f"expected {hash_value}, got {actual}"
+            )
 
 
 def validate_coverage_completeness(upstream: list[dict[str, Any]], coverage: list[dict[str, Any]]) -> None:
@@ -316,13 +344,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate a gc build artifact")
     parser.add_argument("--schema", required=True, help="Expected schema id")
     parser.add_argument("--path", required=True, type=Path, help="Artifact markdown path")
+    parser.add_argument(
+        "--verify-absolute-upstreams",
+        action="store_true",
+        help="Require absolute sha256 upstream paths to exist and match their current bytes",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     try:
-        artifact = validate_artifact_text(args.path.read_text(encoding="utf-8"), expected_schema=args.schema)
+        artifact = validate_artifact_text(
+            args.path.read_text(encoding="utf-8"),
+            expected_schema=args.schema,
+            verify_absolute_upstreams=args.verify_absolute_upstreams,
+        )
     except CLI_ERROR_TYPES as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

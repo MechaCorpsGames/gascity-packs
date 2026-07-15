@@ -166,7 +166,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VALIDATOR="$SCRIPT_DIR/../validate_build_artifact.py"
 [ -f "$VALIDATOR" ] || fail "installed validate_build_artifact.py not found beside $SCRIPT_DIR"
 
-if ! OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" 2>&1)"; then
+if ! OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" --verify-absolute-upstreams 2>&1)"; then
   echo "build-artifact-check: schema=$SCHEMA path=$ARTIFACT_PATH failed validation" >&2
   printf '%s\n' "$OUTPUT" >&2
   exit 1
@@ -205,7 +205,7 @@ if [ "$SCHEMA" = "gc.build.review.v1" ]; then
     INTERNAL_PATH="$(resolve_declared_path "$INTERNAL_RAW" "gc.build.code_review_report_path")"
     [ -f "$INTERNAL_PATH" ] || fail "internal review report does not exist: $INTERNAL_PATH"
     [ ! "$INTERNAL_PATH" -ef "$ARTIFACT_PATH" ] || fail "internal and adapter review report paths must be distinct: internal=$INTERNAL_PATH adapter=$ARTIFACT_PATH"
-    if ! INTERNAL_OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$INTERNAL_PATH" 2>&1)"; then
+    if ! INTERNAL_OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$INTERNAL_PATH" --verify-absolute-upstreams 2>&1)"; then
       echo "build-artifact-check: internal review report $INTERNAL_PATH failed validation" >&2
       printf '%s\n' "$INTERNAL_OUTPUT" >&2
       exit 1

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import pathlib
 import sys
 import tempfile
@@ -345,6 +346,37 @@ trace:
 
         with self.assertRaisesRegex(build_artifact_validator.ValidationError, "sha256"):
             build_artifact_validator.validate_artifact_text(text, expected_schema="gc.build.requirements.v1")
+
+    def test_build_artifact_rejects_sha256_for_different_absolute_upstream_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            upstream = root / "requirements.md"
+            different = root / "different.md"
+            upstream.write_text("# Actual requirements\n", encoding="utf-8")
+            different.write_text("# Different requirements\n", encoding="utf-8")
+            correct_hash = f"sha256:{hashlib.sha256(upstream.read_bytes()).hexdigest()}"
+            different_hash = f"sha256:{hashlib.sha256(different.read_bytes()).hexdigest()}"
+            text = self.valid_artifact().replace(
+                "    - path: requirements.after.md\n"
+                "      hash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                f"    - path: {upstream}\n"
+                f"      hash: {correct_hash}\n",
+            )
+
+            artifact = build_artifact_validator.validate_artifact_text(
+                text,
+                expected_schema="gc.build.requirements.v1",
+                verify_absolute_upstreams=True,
+            )
+            self.assertEqual(artifact.upstream[0]["hash"], correct_hash)
+
+            mismatched = text.replace(correct_hash, different_hash)
+            with self.assertRaisesRegex(build_artifact_validator.ValidationError, "sha256|digest|hash"):
+                build_artifact_validator.validate_artifact_text(
+                    mismatched,
+                    expected_schema="gc.build.requirements.v1",
+                    verify_absolute_upstreams=True,
+                )
 
     def test_build_artifact_rejects_invalid_coverage_status_and_missing_rationale(self) -> None:
         invalid_status = self.valid_artifact().replace("status: deferred", "status: waiting", 1)

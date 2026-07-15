@@ -2645,7 +2645,15 @@ def validate_build_artifact_schema(
         raise GateError(f"build artifact validator was not found: {validator}")
     try:
         run_checked(
-            [sys.executable, str(validator), "--schema", schema, "--path", str(artifact_path)],
+            [
+                sys.executable,
+                str(validator),
+                "--schema",
+                schema,
+                "--path",
+                str(artifact_path),
+                "--verify-absolute-upstreams",
+            ],
             env=env,
             timeout=parse_duration("1m"),
             log_output=True,
