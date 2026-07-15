@@ -68,7 +68,11 @@ implementation_provenance_fail() {
 validate_implementation_provenance() {
   local required convoy_id convoy_json member_ids drain_policy member_id member_json
   local status outcome work_dir explicit_worktree canonical_worktree recorded_commit
-  local resolved_commit head found_terminal_commit
+  local resolved_commit head found_terminal_commit recorded_summary canonical_summary
+  local root_summary candidate_worktree relative_path absolute_path allowed_path
+  local seen allowed
+  local -a member_worktrees=()
+  local -a allowed_untracked_paths=()
 
   required="$(metadata_value "$ROOT_JSON" "gc.build.require_implementation_provenance")"
   if [ -z "$required" ]; then
@@ -146,12 +150,80 @@ validate_implementation_provenance() {
       implementation_provenance_fail \
         "member $member_id tracked bytes differ from recorded worktree HEAD $head"
     fi
+
+    member_worktrees+=("$canonical_worktree")
+    recorded_summary="$(metadata_value "$member_json" "gc.implementation.summary_path")"
+    if [ -n "$recorded_summary" ]; then
+      case "$recorded_summary" in
+        /*) ;;
+        *) implementation_provenance_fail \
+          "member $member_id gc.implementation.summary_path must be absolute" ;;
+      esac
+      [ -f "$recorded_summary" ] || implementation_provenance_fail \
+        "member $member_id gc.implementation.summary_path is not a file: $recorded_summary"
+      [ ! -L "$recorded_summary" ] || implementation_provenance_fail \
+        "member $member_id gc.implementation.summary_path must not be a symlink: $recorded_summary"
+      canonical_summary="$(cd "$(dirname "$recorded_summary")" 2>/dev/null && pwd -P)/$(basename "$recorded_summary")" || \
+        implementation_provenance_fail \
+          "member $member_id gc.implementation.summary_path does not resolve: $recorded_summary"
+      case "$canonical_summary" in
+        "$canonical_worktree"/*) allowed_untracked_paths+=("$canonical_summary") ;;
+        *) implementation_provenance_fail \
+          "member $member_id gc.implementation.summary_path must be inside its authoritative worktree" ;;
+      esac
+    fi
   done <<<"$member_ids"
 
   if [ "$drain_policy" = "same-session" ] && [ "$found_terminal_commit" != "true" ]; then
     implementation_provenance_fail \
       "same-session members do not bind the terminal shared worktree HEAD"
   fi
+
+  root_summary="$(metadata_value "$PARENT_JSON" "gc.build.implementation_summary_path")"
+  if [ -n "$root_summary" ] && [ -f "$root_summary" ] && [ ! -L "$root_summary" ]; then
+    canonical_summary="$(cd "$(dirname "$root_summary")" 2>/dev/null && pwd -P)/$(basename "$root_summary")" || \
+      implementation_provenance_fail \
+        "gc.build.implementation_summary_path does not resolve: $root_summary"
+    for candidate_worktree in "${member_worktrees[@]}"; do
+      case "$canonical_summary" in
+        "$candidate_worktree"/*) allowed_untracked_paths+=("$canonical_summary") ;;
+      esac
+    done
+  fi
+
+  local -a checked_worktrees=()
+  for candidate_worktree in "${member_worktrees[@]}"; do
+    seen=false
+    for canonical_worktree in "${checked_worktrees[@]}"; do
+      if [ "$candidate_worktree" = "$canonical_worktree" ]; then
+        seen=true
+        break
+      fi
+    done
+    [ "$seen" = "false" ] || continue
+    checked_worktrees+=("$candidate_worktree")
+
+    while IFS= read -r -d '' relative_path; do
+      case "$relative_path" in
+        .pytest_cache/*|*/.pytest_cache/*|__pycache__/*.py[co]|*/__pycache__/*.py[co])
+          continue
+          ;;
+      esac
+      absolute_path="$candidate_worktree/$relative_path"
+      allowed=false
+      for allowed_path in "${allowed_untracked_paths[@]}"; do
+        if [ "$absolute_path" = "$allowed_path" ]; then
+          allowed=true
+          break
+        fi
+      done
+      if [ "$allowed" != "true" ]; then
+        implementation_provenance_fail \
+          "unexpected untracked worktree path in $candidate_worktree: $relative_path"
+        return 1
+      fi
+    done < <(git -C "$candidate_worktree" ls-files --others --exclude-standard -z)
+  done
 }
 
 approve() {

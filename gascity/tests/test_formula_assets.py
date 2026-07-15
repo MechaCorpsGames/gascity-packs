@@ -6961,6 +6961,165 @@ description = "Override sink that writes the base triage report contract."
                 check=False,
             )
 
+    @staticmethod
+    def _implementation_snapshot(commits_by_member: dict[str, str]) -> str:
+        payload = [
+            {"id": member_id, "commit": commits_by_member[member_id]}
+            for member_id in sorted(commits_by_member)
+        ]
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+    @staticmethod
+    def _build_basic_review_rows(
+        snapshot: str,
+        *,
+        acceptance: str = "approve",
+        test_evidence: str = "approve",
+        simplicity: str = "approve",
+        apply: str = "done",
+    ) -> str:
+        common = {
+            "gc.root_bead_id": "root",
+            "gc.attempt": "1",
+            "gc.ralph_step_id": "review.build-basic-review-loop",
+            "gc.scope_ref": "review.build-basic-review-loop.iteration.1",
+            "code_review.implementation_snapshot": snapshot,
+        }
+        rows = []
+        for row_id, key, verdict in (
+            ("acceptance", "code_review.acceptance_verdict", acceptance),
+            ("test-evidence", "code_review.test_evidence_verdict", test_evidence),
+            ("simplicity", "code_review.simplicity_verdict", simplicity),
+        ):
+            rows.append({"id": row_id, "metadata": {**common, key: verdict}})
+        rows.append(
+            {
+                "id": "apply",
+                "metadata": {
+                    **common,
+                    "code_review.verdict": apply,
+                },
+            }
+        )
+        return json.dumps(rows)
+
+    def test_implementation_review_check_rejects_untracked_product_but_allows_evidence_and_caches(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = pathlib.Path(td) / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Review Test"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "review@example.invalid"],
+                cwd=worktree,
+                check=True,
+            )
+            (worktree / "slugger.py").write_text("value = 'recorded'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "record implementation"],
+                cwd=worktree,
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+
+            summary = worktree / "implementation-summary.md"
+            summary.write_text("# Exact recorded evidence\n", encoding="utf-8")
+            pytest_cache = worktree / ".pytest_cache" / "v" / "cache"
+            pytest_cache.mkdir(parents=True)
+            (pytest_cache / "nodeids").write_text("[]\n", encoding="utf-8")
+            pycache = worktree / "pkg" / "__pycache__"
+            pycache.mkdir(parents=True)
+            (pycache / "module.cpython-312.pyc").write_bytes(b"cache")
+
+            loop = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.step_id": "review.build-basic-review-loop",
+                        "gc.build.require_implementation_provenance": "true",
+                    },
+                }]
+            )
+            parent = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.formula_name": "build-basic",
+                        "gc.build.implementation_convoy_id": "implementation",
+                    },
+                }]
+            )
+            member = json.dumps(
+                [{
+                    "id": "member",
+                    "status": "closed",
+                    "metadata": {
+                        "gc.outcome": "pass",
+                        "work_dir": str(worktree),
+                        "gc.implementation.worktree_path": str(worktree),
+                        "gc.implementation.commit": commit,
+                        "gc.implementation.summary_path": str(summary),
+                    },
+                }]
+            )
+            convoy = json.dumps(
+                {
+                    "convoy": {"id": "implementation", "status": "closed"},
+                    "children": [{"id": "member", "status": "closed"}],
+                }
+            )
+            lanes = self._build_basic_review_rows(
+                self._implementation_snapshot({"member": commit})
+            )
+
+            clean = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+            product = worktree / "new_feature.py"
+            product.write_text("enabled = True\n", encoding="utf-8")
+            unexpected_product = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+            product.unlink()
+
+            near_miss = worktree / "implementation-summary.md.bak"
+            near_miss.write_text("stale evidence\n", encoding="utf-8")
+            unexpected_backup = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member},
+                convoy_json=convoy,
+                list_json=lanes,
+            )
+
+        for result in (unexpected_product, unexpected_backup):
+            with self.subTest(stderr=result.stderr):
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("unexpected untracked worktree path", result.stderr)
+
     def test_implementation_review_check_rejects_tracked_bytes_after_recorded_commit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             worktree = pathlib.Path(td) / "worktree"
