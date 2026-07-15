@@ -5305,6 +5305,28 @@ class FormulaAssetTests(unittest.TestCase):
                     all(group == "superpowers-task-{{issue}}" for group in continuation_groups)
                 )
 
+    def test_superpowers_decompose_records_both_implementation_convoy_ids(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        decompose_text = (
+            packs_root
+            / "superpowers"
+            / "assets"
+            / "workflows"
+            / "superpowers-build"
+            / "decompose.md"
+        ).read_text(encoding="utf-8")
+
+        for metadata_key in (
+            "gc.input_convoy_id",
+            "gc.build.implementation_convoy_id",
+        ):
+            with self.subTest(metadata_key=metadata_key):
+                self.assertRegex(
+                    decompose_text,
+                    rf"--set-metadata [\"']?{re.escape(metadata_key)}="
+                    r"<implementation-convoy-id>",
+                )
+
     def test_superpowers_development_converts_subagent_reviews_to_fanout(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
         pack_root = packs_root / "superpowers"

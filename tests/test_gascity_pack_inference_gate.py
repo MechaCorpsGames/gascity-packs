@@ -2140,6 +2140,19 @@ printf '%s\n' {shlex.quote(payload)}
     assert "convoy status fi-implementation --json" in args_path.read_text(encoding="utf-8")
 
 
+def test_implementation_convoy_member_ids_rejects_missing_root_convoy_id(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    root = closed_bead("fi-root", kind="workflow")
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"missing gc\.build\.implementation_convoy_id",
+    ):
+        gascity_pack_inference_gate.implementation_convoy_member_ids(
+            "gc", workspace, root, env={}
+        )
+
+
 @pytest.mark.parametrize(
     ("case", "expected"),
     (

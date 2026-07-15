@@ -37,14 +37,23 @@ beads only for actual source-code work from the original input task or convoy
 member and record the skipped lifecycle sections in the decomposition artifact.
 
 Create or update the implementation convoy with those beads and dependency
-edges. Record the implementation convoy ID on the workflow root bead as
-`gc.input_convoy_id=<implementation-convoy-id>` with
-`gc bd update <workflow-root-id> --set-metadata gc.input_convoy_id=<implementation-convoy-id>`.
+edges. Record the implementation convoy ID on the workflow root under both the
+drain input and build provenance keys in one update:
+
+```bash
+gc bd update "<workflow-root-id>" \
+  --set-metadata "gc.input_convoy_id=<implementation-convoy-id>" \
+  --set-metadata "gc.build.implementation_convoy_id=<implementation-convoy-id>"
+```
+
+Read the workflow root back after this command and require both metadata keys
+to name the exact newly-created implementation convoy.
 
 Write a decomposition artifact that maps every plan task to its bead ID and
 dependency edges. Close this step only after the decomposition artifact exists,
-the workflow root bead has `gc.input_convoy_id`, and the implementation convoy
-is ready for drain before closing.
+the workflow root bead has matching `gc.input_convoy_id` and
+`gc.build.implementation_convoy_id` values, and the implementation convoy is
+ready for drain before closing.
 
 The decomposition artifact must be Markdown with YAML front matter, not JSON.
 Use mapping objects for nested front matter.
