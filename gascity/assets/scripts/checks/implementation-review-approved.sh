@@ -70,7 +70,7 @@ validate_implementation_provenance() {
   local status outcome work_dir explicit_worktree canonical_worktree recorded_commit
   local resolved_commit head found_terminal_commit recorded_summary canonical_summary
   local root_summary candidate_worktree relative_path absolute_path allowed_path
-  local seen allowed
+  local seen allowed shared_worktree shared_head
   local -a member_worktrees=()
   local -a allowed_untracked_paths=()
 
@@ -97,6 +97,8 @@ validate_implementation_provenance() {
   member_ids="$(printf '%s\n' "$convoy_json" | jq -r '.children[].id')"
   drain_policy="$(metadata_value "$PARENT_JSON" "gc.var.drain_policy")"
   found_terminal_commit=false
+  shared_worktree=""
+  shared_head=""
 
   while IFS= read -r member_id; do
     [ -n "$member_id" ] || continue
@@ -135,6 +137,13 @@ validate_implementation_provenance() {
       implementation_provenance_fail "member $member_id worktree HEAD is unreadable"
 
     if [ "$drain_policy" = "same-session" ]; then
+      if [ -z "$shared_worktree" ]; then
+        shared_worktree="$canonical_worktree"
+        shared_head="$head"
+      elif [ "$canonical_worktree" != "$shared_worktree" ] || [ "$head" != "$shared_head" ]; then
+        implementation_provenance_fail \
+          "same-session members must share one canonical worktree and terminal HEAD: expected=$shared_worktree@$shared_head observed=$canonical_worktree@$head"
+      fi
       git -C "$canonical_worktree" merge-base --is-ancestor "$resolved_commit" "$head" 2>/dev/null || \
         implementation_provenance_fail \
           "member $member_id recorded commit is not an ancestor of shared worktree HEAD $head"

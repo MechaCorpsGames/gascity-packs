@@ -7120,6 +7120,198 @@ description = "Override sink that writes the base triage report contract."
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("unexpected untracked worktree path", result.stderr)
 
+    def test_implementation_review_check_rejects_distinct_same_session_worktrees(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            commits: dict[str, str] = {}
+            members: dict[str, str] = {}
+            for member_id in ("member-a", "member-b"):
+                worktree = root / member_id
+                worktree.mkdir()
+                subprocess.run(["git", "init", "-q", "-b", "main"], cwd=worktree, check=True)
+                subprocess.run(
+                    ["git", "config", "user.name", "Review Test"], cwd=worktree, check=True
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "review@example.invalid"],
+                    cwd=worktree,
+                    check=True,
+                )
+                (worktree / "slugger.py").write_text(
+                    f"value = '{member_id}'\n", encoding="utf-8"
+                )
+                subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+                subprocess.run(
+                    ["git", "commit", "-q", "-m", f"implement {member_id}"],
+                    cwd=worktree,
+                    check=True,
+                )
+                commit = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=worktree,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+                commits[member_id] = commit
+                members[member_id] = json.dumps(
+                    [{
+                        "id": member_id,
+                        "status": "closed",
+                        "metadata": {
+                            "gc.outcome": "pass",
+                            "work_dir": str(worktree),
+                            "gc.implementation.worktree_path": str(worktree),
+                            "gc.implementation.commit": commit,
+                        },
+                    }]
+                )
+
+            loop = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.step_id": "review.build-basic-review-loop",
+                        "gc.build.require_implementation_provenance": "true",
+                    },
+                }]
+            )
+            parent = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.formula_name": "build-basic",
+                        "gc.build.implementation_convoy_id": "implementation",
+                        "gc.var.drain_policy": "same-session",
+                    },
+                }]
+            )
+            convoy = json.dumps(
+                {
+                    "convoy": {"id": "implementation", "status": "closed"},
+                    "children": [
+                        {"id": member_id, "status": "closed"}
+                        for member_id in commits
+                    ],
+                }
+            )
+            result = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json=members,
+                convoy_json=convoy,
+                list_json=self._build_basic_review_rows(
+                    self._implementation_snapshot(commits)
+                ),
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("same-session members must share one canonical worktree", result.stderr)
+
+    def test_implementation_review_check_accepts_one_same_session_worktree_at_terminal_head(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = pathlib.Path(td) / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Review Test"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "review@example.invalid"],
+                cwd=worktree,
+                check=True,
+            )
+            product = worktree / "slugger.py"
+            product.write_text("value = 'first'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "first implementation"],
+                cwd=worktree,
+                check=True,
+            )
+            first = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            product.write_text("value = 'terminal'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "terminal implementation"],
+                cwd=worktree,
+                check=True,
+            )
+            terminal = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            commits = {"member-a": first, "member-b": terminal}
+            members = {
+                member_id: json.dumps(
+                    [{
+                        "id": member_id,
+                        "status": "closed",
+                        "metadata": {
+                            "gc.outcome": "pass",
+                            "work_dir": str(worktree),
+                            "gc.implementation.worktree_path": str(worktree),
+                            "gc.implementation.commit": commit,
+                        },
+                    }]
+                )
+                for member_id, commit in commits.items()
+            }
+            loop = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.step_id": "review.build-basic-review-loop",
+                        "gc.build.require_implementation_provenance": "true",
+                    },
+                }]
+            )
+            parent = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.formula_name": "build-basic",
+                        "gc.build.implementation_convoy_id": "implementation",
+                        "gc.var.drain_policy": "same-session",
+                    },
+                }]
+            )
+            convoy = json.dumps(
+                {
+                    "convoy": {"id": "implementation", "status": "closed"},
+                    "children": [
+                        {"id": "member-b", "status": "closed"},
+                        {"id": "member-a", "status": "closed"},
+                    ],
+                }
+            )
+
+            result = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json=members,
+                convoy_json=convoy,
+                list_json=self._build_basic_review_rows(
+                    self._implementation_snapshot(commits)
+                ),
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Implementation review approved", result.stdout)
+
     def test_implementation_review_check_rejects_tracked_bytes_after_recorded_commit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             worktree = pathlib.Path(td) / "worktree"
