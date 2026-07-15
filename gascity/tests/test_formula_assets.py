@@ -2483,6 +2483,11 @@ class FormulaAssetTests(unittest.TestCase):
             "gc convoy status <implementation-convoy-id> --json",
             "exactly equal",
             "status=closed",
+            "open, unassigned, and unrouted",
+            "gc.kind=implementation",
+            "gc.accepts_from={{implementation_target}}",
+            "Do not pass `--assignee`",
+            "do not set `gc.routed_to`",
         ):
             with self.subTest(decompose=fragment):
                 self.assertIn(fragment, decompose)
@@ -2845,12 +2850,26 @@ class FormulaAssetTests(unittest.TestCase):
                 "id": "root",
                 "metadata": {
                     "gc.var.convoy_id": "launch",
+                    "gc.var.implementation_target": "gstack.implementer",
                     "gc.build.requirements_path": str(requirements),
                     "gc.build.decomposition_path": str(decomposition),
                     "gc.input_convoy_id": "implementation",
                     "gc.build.implementation_convoy_id": "implementation",
                     "gc.build.implementation_member_ids": "work-1,work-2",
                 },
+            }
+            members = {
+                member_id: {
+                    "id": member_id,
+                    "status": "open",
+                    "assignee": None,
+                    "metadata": {
+                        "gc.kind": "implementation",
+                        "gc.accepts_from": "gstack.implementer",
+                        "gc.root_bead_id": "root",
+                    },
+                }
+                for member_id in ("work-1", "work-2")
             }
             launch = self._gstack_convoy_status(
                 "launch", "input convoy", "open", [("source-1", "open")]
@@ -2859,7 +2878,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "implementation", "work-1", "open", [("work-2", "open")]
             )
             rejected = self._run_gstack_build_state_check(
-                beads_by_id={"decompose-step": control, "root": root},
+                beads_by_id={"decompose-step": control, "root": root, **members},
                 convoys_by_id={"launch": launch, "implementation": omitted},
                 bead_id="decompose-step",
             )
@@ -2868,7 +2887,7 @@ class FormulaAssetTests(unittest.TestCase):
 
             omitted["convoy"]["title"] = "gstack implementation for root"
             missing_member = self._run_gstack_build_state_check(
-                beads_by_id={"decompose-step": control, "root": root},
+                beads_by_id={"decompose-step": control, "root": root, **members},
                 convoys_by_id={"launch": launch, "implementation": omitted},
                 bead_id="decompose-step",
             )
@@ -2884,7 +2903,7 @@ class FormulaAssetTests(unittest.TestCase):
                 [("work-1", "open"), ("work-2", "open")],
             )
             accepted = self._run_gstack_build_state_check(
-                beads_by_id={"decompose-step": control, "root": root},
+                beads_by_id={"decompose-step": control, "root": root, **members},
                 convoys_by_id={"launch": launch, "implementation": complete},
                 bead_id="decompose-step",
             )
@@ -2910,7 +2929,7 @@ class FormulaAssetTests(unittest.TestCase):
                 [("source-1", "open"), ("source-2", "open")],
             )
             notes_only = self._run_gstack_build_state_check(
-                beads_by_id={"decompose-step": control, "root": root},
+                beads_by_id={"decompose-step": control, "root": root, **members},
                 convoys_by_id={"launch": two_sources, "implementation": complete},
                 bead_id="decompose-step",
             )
@@ -2924,7 +2943,7 @@ class FormulaAssetTests(unittest.TestCase):
                 encoding="utf-8",
             )
             explicit_targets = self._run_gstack_build_state_check(
-                beads_by_id={"decompose-step": control, "root": root},
+                beads_by_id={"decompose-step": control, "root": root, **members},
                 convoys_by_id={"launch": two_sources, "implementation": complete},
                 bead_id="decompose-step",
             )
@@ -2933,6 +2952,157 @@ class FormulaAssetTests(unittest.TestCase):
                 0,
                 explicit_targets.stdout + explicit_targets.stderr,
             )
+
+    def test_gstack_state_check_rejects_member_consumed_before_implementation_drain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root_dir = pathlib.Path(td)
+            requirements = root_dir / "requirements.md"
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n    - path: beads/source-1\n"
+                "      hash: bead:source-1\n---\n",
+                encoding="utf-8",
+            )
+            decomposition = root_dir / "decomposition.md"
+            decomposition.write_text(
+                "---\ntrace: {upstream: [], coverage: []}\n---\n\n"
+                "## Work Items\n\n### work-1: Implement source\n\n"
+                "Source Targets: source-1\n",
+                encoding="utf-8",
+            )
+            control = {
+                "id": "decompose-step",
+                "metadata": {
+                    "gc.root_bead_id": "root",
+                    "gc.build.artifact_schema": "gc.build.decomposition.v1",
+                },
+            }
+            root = {
+                "id": "root",
+                "metadata": {
+                    "gc.var.convoy_id": "launch",
+                    "gc.var.implementation_target": "gstack.implementer",
+                    "gc.build.requirements_path": str(requirements),
+                    "gc.build.decomposition_path": str(decomposition),
+                    "gc.input_convoy_id": "implementation",
+                    "gc.build.implementation_convoy_id": "implementation",
+                    "gc.build.implementation_member_ids": "work-1",
+                },
+            }
+            launch = self._gstack_convoy_status(
+                "launch", "input convoy", "open", [("source-1", "open")]
+            )
+
+            scenarios = (
+                (
+                    "directly routed",
+                    {
+                        "id": "work-1",
+                        "status": "open",
+                        "assignee": None,
+                        "metadata": {
+                            "gc.kind": "implementation",
+                            "gc.accepts_from": "gstack.implementer",
+                            "gc.routed_to": "fixture/gstack.implementer",
+                            "gc.root_bead_id": "root",
+                        },
+                    },
+                    "open",
+                    "implementation member work-1 must remain open, unassigned, "
+                    "and unrouted until implementation drain",
+                ),
+                (
+                    "directly assigned",
+                    {
+                        "id": "work-1",
+                        "status": "open",
+                        "assignee": "gstack__implementer-1",
+                        "metadata": {
+                            "gc.kind": "implementation",
+                            "gc.accepts_from": "gstack.implementer",
+                            "gc.root_bead_id": "root",
+                        },
+                    },
+                    "open",
+                    "implementation member work-1 must remain open, unassigned, "
+                    "and unrouted until implementation drain",
+                ),
+                (
+                    "already closed",
+                    {
+                        "id": "work-1",
+                        "status": "closed",
+                        "assignee": None,
+                        "metadata": {
+                            "gc.kind": "implementation",
+                            "gc.accepts_from": "gstack.implementer",
+                            "gc.outcome": "pass",
+                            "gc.root_bead_id": "root",
+                        },
+                    },
+                    "closed",
+                    "implementation member work-1 must remain open, unassigned, "
+                    "and unrouted until implementation drain",
+                ),
+                (
+                    "wrong kind",
+                    {
+                        "id": "work-1",
+                        "status": "open",
+                        "assignee": None,
+                        "metadata": {
+                            "gc.kind": "task",
+                            "gc.accepts_from": "gstack.implementer",
+                            "gc.root_bead_id": "root",
+                        },
+                    },
+                    "open",
+                    "implementation member work-1 must record gc.kind=implementation",
+                ),
+                (
+                    "wrong implementation target",
+                    {
+                        "id": "work-1",
+                        "status": "open",
+                        "assignee": None,
+                        "metadata": {
+                            "gc.kind": "implementation",
+                            "gc.accepts_from": "other.implementer",
+                            "gc.root_bead_id": "root",
+                        },
+                    },
+                    "open",
+                    "implementation member work-1 must record "
+                    "gc.accepts_from=gstack.implementer",
+                ),
+            )
+            for label, member, child_status, expected_error in scenarios:
+                with self.subTest(label=label):
+                    implementation = self._gstack_convoy_status(
+                        "implementation",
+                        "gstack implementation for root",
+                        "open",
+                        [("work-1", child_status)],
+                    )
+                    rejected = self._run_gstack_build_state_check(
+                        beads_by_id={
+                            "decompose-step": control,
+                            "root": root,
+                            "work-1": member,
+                        },
+                        convoys_by_id={
+                            "launch": launch,
+                            "implementation": implementation,
+                        },
+                        bead_id="decompose-step",
+                    )
+                    self.assertNotEqual(
+                        rejected.returncode,
+                        0,
+                        rejected.stdout + rejected.stderr,
+                    )
+                    self.assertIn(expected_error, rejected.stderr)
 
     def test_gstack_state_check_rejects_non_authoritative_or_uncommitted_proof(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -6,6 +6,24 @@ acceptance criteria, files or modules likely affected, first verification
 command, and expected proof command.
 
 Create the implementation work-item beads first and capture every returned ID.
+These beads are inputs to the implementation drain, not directly routed work.
+Create each one open, unassigned, and unrouted, with metadata
+`gc.kind=implementation`, `gc.accepts_from={{implementation_target}}`, and
+`gc.root_bead_id=<workflow-root-id>`. Use the JSON-object form of `--metadata`:
+
+```bash
+gc bd create --title "<work-item-title>" --description "<work-item-description>" \
+  --type task \
+  --metadata '{"gc.root_bead_id":"<workflow-root-id>","gc.kind":"implementation","gc.accepts_from":"{{implementation_target}}"}' \
+  --json
+```
+
+Do not pass `--assignee` and do not set `gc.routed_to` on these work items; the
+downstream drain owns their routing and worktree lifecycle. Read every created
+work item back with `gc bd show <work-item-id> --json` and require `status=open`,
+an empty or absent `assignee`, an empty or absent `gc.routed_to`, and the exact
+`gc.kind` and `gc.accepts_from` metadata above before creating the convoy.
+
 Each work item must name the launch source target ID or IDs it implements under
 `Source Targets`; across all work items, every direct member of the launch
 convoy from `gc.var.convoy_id` must be accounted for. Then create one new
@@ -118,4 +136,4 @@ Close with `gc.outcome=pass`.
 
 Do not invoke provider-native subagents. Gas City graph lanes own fanout.
 
-Artifact validation: this stage is gated by the shipped `../assets/scripts/checks/gstack-build-state-valid.sh`, which first validates the artifact recorded at `gc.build.decomposition_path` (fallback `gc.var.decomposition_path`) against schema `gc.build.decomposition.v1`, then verifies launch-source accounting, the descriptive convoy name, and exact recorded membership. On repair attempts (`gc.attempt` greater than 1), read validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact and runtime metadata in place. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable failure metadata that blocks downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.
+Artifact validation: this stage is gated by the shipped `../assets/scripts/checks/gstack-build-state-valid.sh`, which first validates the artifact recorded at `gc.build.decomposition_path` (fallback `gc.var.decomposition_path`) against schema `gc.build.decomposition.v1`, then verifies launch-source accounting, the descriptive convoy name, exact recorded membership, and that every member remains an open, unassigned, unrouted drain input. On repair attempts (`gc.attempt` greater than 1), read validator errors from `gc.attempt_log` on the validation loop control bead (the dependent of this step bead) and repair the artifact and runtime metadata in place. Two bounded repair attempts follow the first failure; exhausting them closes this stage with `gc.outcome=fail` and machine-readable failure metadata that blocks downstream stages. Never ask questions in headless mode; record unresolved ambiguity inside the artifact.

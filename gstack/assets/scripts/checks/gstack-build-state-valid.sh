@@ -340,6 +340,36 @@ def implementation_state(*, require_closed: bool, require_worktree_proof: bool) 
         )
 
     if not require_closed:
+        implementation_target = metadata(ROOT, "gc.var.implementation_target")
+        if not implementation_target:
+            fail(
+                f"workflow root {ROOT_ID} is missing "
+                "gc.var.implementation_target for implementation drain validation"
+            )
+        for member_id in member_ids:
+            item = bead(member_id)
+            item_status = str(item.get("status") or "").strip()
+            item_assignee = str(item.get("assignee") or "").strip()
+            item_route = metadata(item, "gc.routed_to")
+            if item_status != "open" or item_assignee or item_route:
+                fail(
+                    f"implementation member {member_id} must remain open, unassigned, "
+                    "and unrouted until implementation drain: "
+                    f"status={item_status!r} assignee={item_assignee!r} "
+                    f"gc.routed_to={item_route!r}"
+                )
+            item_kind = metadata(item, "gc.kind")
+            if item_kind != "implementation":
+                fail(
+                    f"implementation member {member_id} must record "
+                    f"gc.kind=implementation: observed={item_kind!r}"
+                )
+            accepts_from = metadata(item, "gc.accepts_from")
+            if accepts_from != implementation_target:
+                fail(
+                    f"implementation member {member_id} must record "
+                    f"gc.accepts_from={implementation_target}: observed={accepts_from!r}"
+                )
         return
 
     if str(convoy.get("status") or "") != "closed":
