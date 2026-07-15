@@ -1548,6 +1548,43 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         self.assertEqual(fields["publish_trigger_id"], "new-msg")
         self.assertEqual(fields["publish_reply_to_discord_message_id"], "new-msg")
 
+    def test_find_latest_discord_reply_context_matches_async_terminal_session_id(self) -> None:
+        common.save_chat_ingress(
+            {
+                "ingress_id": "in-async",
+                "binding_id": "room:22@app:riley",
+                "conversation_id": "22",
+                "discord_message_id": "async-msg",
+                "created_at": "2026-07-15T02:24:01Z",
+                "status": "delivered",
+                "targets": [
+                    {
+                        "session_name": "employees.corp--riley",
+                        "status": "delivered",
+                        "response": {
+                            "status": "accepted",
+                            "request_id": "req-async",
+                        },
+                        "terminal_evidence": {
+                            "status": "succeeded",
+                            "payload": {
+                                "request_id": "req-async",
+                                "session_id": "mc-wisp-n2val",
+                                "queued": True,
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+
+        with mock.patch.object(common, "gc_api_request", return_value={"messages": []}):
+            fields = common.find_latest_discord_reply_context("mc-wisp-n2val", tail=5)
+
+        self.assertEqual(fields["ingress_receipt_id"], "in-async")
+        self.assertEqual(fields["publish_binding_id"], "room:22@app:riley")
+        self.assertEqual(fields["publish_reply_to_discord_message_id"], "async-msg")
+
     def test_extract_peer_session_mentions_ignores_urls_and_code(self) -> None:
         mentions = common.extract_peer_session_mentions(
             "\n".join(

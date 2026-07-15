@@ -2717,6 +2717,24 @@ def _chat_ingress_target_matches_selector(target: dict[str, Any], selector: str)
                 str(response.get("session_alias", "")).strip(),
             }
         )
+    terminal_evidence = target.get("terminal_evidence")
+    if isinstance(terminal_evidence, dict):
+        candidates.update(
+            {
+                str(terminal_evidence.get("session_name", "")).strip(),
+                str(terminal_evidence.get("session_id", "")).strip(),
+                str(terminal_evidence.get("session_alias", "")).strip(),
+            }
+        )
+        terminal_payload = terminal_evidence.get("payload")
+        if isinstance(terminal_payload, dict):
+            candidates.update(
+                {
+                    str(terminal_payload.get("session_name", "")).strip(),
+                    str(terminal_payload.get("session_id", "")).strip(),
+                    str(terminal_payload.get("session_alias", "")).strip(),
+                }
+            )
     return wanted in {candidate for candidate in candidates if candidate}
 
 
