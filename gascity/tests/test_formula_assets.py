@@ -2500,7 +2500,7 @@ class FormulaAssetTests(unittest.TestCase):
             "gstack": [packs_root / "gstack/assets/workflows/gstack-build/requirements.md"],
             "superpowers": [
                 packs_root
-                / "superpowers/assets/workflows/superpowers-brainstorming/{target}.brainstorm-design.md",
+                / "superpowers/assets/workflows/superpowers-brainstorming/brainstorm-design.md",
                 packs_root
                 / "superpowers/assets/workflows/superpowers-brainstorming/write-requirements-spec.md",
             ],
@@ -5513,7 +5513,7 @@ class FormulaAssetTests(unittest.TestCase):
             / "assets"
             / "workflows"
             / "superpowers-brainstorming"
-            / "{target}.brainstorm-design.md"
+            / "brainstorm-design.md"
         ).read_text(encoding="utf-8")
         for fragment in (
             "stock Superpowers checklist items 1-5",
@@ -6608,6 +6608,79 @@ description = "Override sink that writes the base triage report contract."
                 bead_id="requirements-step",
             )
             self.assertEqual(complete.returncode, 0, complete.stdout + complete.stderr)
+
+    def test_build_requirements_source_check_limits_context_only_mode_to_internal_planning(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root_dir = pathlib.Path(td)
+            requirements = root_dir / "requirements.md"
+            requirements.write_text("---\ntrace: {upstream: [], coverage: []}\n---\n", encoding="utf-8")
+            context = root_dir / "context.md"
+            context.write_text("Approved planning context.\n", encoding="utf-8")
+            control = {
+                "id": "requirements-step",
+                "metadata": {"gc.root_bead_id": "root"},
+            }
+            root = {
+                "id": "root",
+                "metadata": {
+                    "gc.formula_name": "superpowers-planning",
+                    "gc.var.context_path": str(context),
+                    "gc.build.requirements_path": str(requirements),
+                },
+            }
+
+            internal = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={},
+                bead_id="requirements-step",
+            )
+            self.assertEqual(internal.returncode, 0, internal.stdout + internal.stderr)
+            self.assertIn("internal planning context", internal.stdout)
+
+            context.unlink()
+            missing_context = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(
+                missing_context.returncode,
+                0,
+                missing_context.stdout + missing_context.stderr,
+            )
+            self.assertIn("internal planning context path does not resolve", missing_context.stderr)
+
+            root["metadata"]["gc.formula_name"] = "build-basic"
+            build = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(build.returncode, 0, build.stdout + build.stderr)
+            self.assertIn("missing reserved launch convoy", build.stderr)
+
+    def test_superpowers_context_only_source_contract_is_internal_planning_only(
+        self,
+    ) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        workflow_root = packs_root / "superpowers" / "assets" / "workflows"
+        prompts = (
+            workflow_root
+            / "superpowers-brainstorming"
+            / "brainstorm-design.md",
+            workflow_root
+            / "superpowers-brainstorming"
+            / "write-requirements-spec.md",
+            workflow_root / "superpowers-planning" / "requirements.md",
+        )
+        for prompt in prompts:
+            text = prompt.read_text(encoding="utf-8")
+            with self.subTest(prompt=prompt.relative_to(packs_root)):
+                self.assertIn("exactly `superpowers-planning`", text)
+                self.assertIn("existing regular file", text)
+                self.assertIn("real build root", text)
 
     def _run_build_artifact_check(
         self,

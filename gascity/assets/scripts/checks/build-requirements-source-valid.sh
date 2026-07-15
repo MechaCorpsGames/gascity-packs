@@ -6,7 +6,9 @@ set -euo pipefail
 # The shared artifact check proves schema validity. This wrapper additionally
 # proves that requirements trace every direct member of the immutable launch
 # convoy exactly once, preventing a workflow from replacing its requested
-# product scope with inferred or invented work.
+# product scope with inferred or invented work. The internal
+# superpowers-planning methodology has no launch convoy; it may instead use its
+# explicitly supplied context file as the source of truth.
 
 fail() {
   echo "build-requirements-source-check: $*" >&2
@@ -78,10 +80,32 @@ def metadata(item: dict[str, Any], key: str) -> str:
 step = bead(BEAD_ID)
 root_id = metadata(step, "gc.root_bead_id") or BEAD_ID
 root = bead(root_id) if root_id != BEAD_ID else step
+work_dir = Path(metadata(root, "gc.work_dir") or Path.cwd())
 
 launch_convoy_id = metadata(root, "gc.var.convoy_id")
 if not launch_convoy_id:
-    fail(f"workflow root {root_id} is missing reserved launch convoy metadata gc.var.convoy_id")
+    formula_name = metadata(root, "gc.formula_name")
+    if formula_name != "superpowers-planning":
+        fail(f"workflow root {root_id} is missing reserved launch convoy metadata gc.var.convoy_id")
+
+    raw_context_path = metadata(root, "gc.var.context_path")
+    if not raw_context_path:
+        fail(
+            f"internal planning context is missing on workflow root {root_id}: "
+            "gc.var.context_path is required"
+        )
+    context_path = Path(raw_context_path)
+    if not context_path.is_absolute():
+        context_path = work_dir / context_path
+    try:
+        context_path = context_path.resolve(strict=True)
+    except OSError as exc:
+        fail(f"internal planning context path does not resolve: {raw_context_path}: {exc}")
+    if not context_path.is_file():
+        fail(f"internal planning context path is not a regular file: {context_path}")
+
+    print(f"build requirements source valid: internal planning context path={context_path}")
+    raise SystemExit(0)
 
 status = json_command(
     ["gc", "convoy", "status", launch_convoy_id, "--json"],
@@ -110,7 +134,6 @@ if not raw_requirements_path:
     fail(f"workflow root {root_id} is missing gc.build.requirements_path")
 requirements_path = Path(raw_requirements_path)
 if not requirements_path.is_absolute():
-    work_dir = Path(metadata(root, "gc.work_dir") or Path.cwd())
     requirements_path = work_dir / requirements_path
 try:
     requirements_path = requirements_path.resolve(strict=True)

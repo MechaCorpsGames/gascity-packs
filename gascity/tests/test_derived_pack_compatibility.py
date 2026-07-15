@@ -481,6 +481,20 @@ class DerivedPackCompatibilityTests(unittest.TestCase):
                             base_contract.BUILD_ARTIFACT_GATE_MAX_ATTEMPTS,
                         )
                         expected_check_path = base_contract.BUILD_ARTIFACT_CHECK_SCRIPT
+                        if step_id == "requirements" and (
+                            (
+                                pack_name in {"compound-engineering", "bmad"}
+                                and formula_name == expected["formula"]
+                            )
+                            or (
+                                pack_name == "superpowers"
+                                and formula_name
+                                in {expected["formula"], expected["planning_formula"]}
+                            )
+                        ):
+                            expected_check_path = (
+                                base_contract.BUILD_REQUIREMENTS_SOURCE_CHECK_SCRIPT
+                            )
                         if (
                             pack_name == "gstack"
                             and formula_name == expected["formula"]

@@ -17,6 +17,11 @@ the same canonical check used by the Ralph control:
 GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-requirements-source-valid.sh
 ```
 
+The checker accepts context-only provenance only when the workflow root formula
+is exactly `superpowers-planning` and `gc.var.context_path` resolves to an
+existing regular file. Every real build root still requires its reserved launch
+convoy and exact source-bead traces.
+
 On a failed validation, repair every validation error before closing: preserve
 the approved requirements content while fixing the required YAML front matter,
 trace coverage, Markdown coverage table, or required section order. Rerun the

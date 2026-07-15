@@ -4,20 +4,30 @@ This lane maps stock Superpowers checklist items 6-7: write the durable design
 doc/spec, then run the inline Spec self-review before any user/spec approval
 gate can pass.
 
-Re-resolve the actual build request before writing the spec. Read workflow root
-metadata `gc.var.convoy_id` as `<launch-convoy-id>`, run
+Re-resolve the actual request before writing the spec. When workflow root
+metadata `gc.var.convoy_id` is present, read it as `<launch-convoy-id>`, run
 `gc convoy status <launch-convoy-id> --json`, and treat every direct
 launch-convoy member as a source target. Run `gc bd show <source-target-id> --json`
 for each source and use its title, description, acceptance criteria, and
 constraints as authoritative product scope. The approved design may elaborate
-that scope but may not replace it. If the launch convoy is missing, empty,
-ambiguous, or unreadable, fail closed instead of inventing requirements.
+that scope but may not replace it.
+
+There is one narrow context-only exception: when the workflow root formula is
+exactly `superpowers-planning` and has no launch convoy, resolve
+`gc.var.context_path`, require it to be an existing regular file, and use its
+contents as the authoritative internal planning scope. Trace that exact path in
+`trace.upstream` with the `sha256:` digest of its current bytes. Any other
+missing, empty, ambiguous, or unreadable launch convoy must fail closed instead
+of inventing requirements. A context path never replaces the launch convoy for
+a real build root.
 
 Trace every direct launch-convoy member exactly once using
 `path: beads/<source-target-id>` and `hash: bead:<source-target-id>`. Do not
 substitute the workflow root, expansion controls, convoy, or an empty context
-file. Preserve IDs declared by a source verbatim; do not attribute invented IDs
-to a source that did not declare them.
+file. This bead trace rule applies when a launch convoy exists; the internal
+planning exception instead uses the exact context path and digest described
+above. Preserve IDs declared by a source verbatim; do not attribute invented
+IDs to a source that did not declare them.
 
 Resolve the approved design candidate from workflow root metadata. Convert that
 design into the normalized requirements artifact consumed by build-base. Include

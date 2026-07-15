@@ -41,7 +41,7 @@ timeout = "10m"
 id = "{target}.brainstorm-design"
 title = "Superpowers brainstorm design"
 metadata = { "gc.run_target" = "superpowers.brainstorming" }
-description_file = "../assets/workflows/superpowers-brainstorming/{target}.brainstorm-design.md"
+description_file = "../assets/workflows/superpowers-brainstorming/brainstorm-design.md"
 
 [[template.children]]
 id = "{target}.confirm-design-approval"
