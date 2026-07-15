@@ -2427,6 +2427,47 @@ def test_validate_build_basic_result_accepts_every_member_with_commit_bound_prov
     assert selected == [record["worktree"] for record in fixture["members"].values()]
 
 
+def test_validate_build_basic_result_resolves_member_summary_repo_relative_sha(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    member = fixture["members"]["fi-two"]
+    worktree = member["worktree"]
+    old_summary = member["summary"]
+    nested_summary = worktree / "artifacts" / "implementation-summary.md"
+    nested_summary.parent.mkdir()
+    nested_summary.write_text(
+        implementation_summary_text(
+            "fi-two-workflow",
+            [
+                {"path": "beads/fi-two", "hash": "bead:fi-two"},
+                {
+                    "path": "slugger.py",
+                    "hash": f"sha256:{hashlib.sha256((worktree / 'slugger.py').read_bytes()).hexdigest()}",
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+    run_git(worktree, "add", "artifacts/implementation-summary.md")
+    run_git(worktree, "commit", "-q", "-m", "record nested implementation summary")
+    commit = run_git(worktree, "rev-parse", "HEAD")
+    member["bead"]["metadata"]["gc.implementation.summary_path"] = str(nested_summary)
+    member["bead"]["metadata"]["gc.implementation.commit"] = commit
+
+    root_summary = fixture["root_summary"]
+    old_digest = f"sha256:{hashlib.sha256(old_summary.read_bytes()).hexdigest()}"
+    new_digest = f"sha256:{hashlib.sha256(nested_summary.read_bytes()).hexdigest()}"
+    root_summary.write_text(
+        root_summary.read_text(encoding="utf-8")
+        .replace(str(old_summary), str(nested_summary))
+        .replace(old_digest, new_digest),
+        encoding="utf-8",
+    )
+
+    selected = validate_build_basic_fixture(fixture)
+
+    assert selected == [record["worktree"] for record in fixture["members"].values()]
+
+
 def test_validate_build_basic_result_rejects_shared_commit_across_distinct_member_worktrees(
     tmp_path,
 ) -> None:
@@ -2733,6 +2774,34 @@ def test_validate_build_basic_artifacts_accepts_declared_markdown_artifacts(tmp_
     for metadata_key, schema in gascity_pack_inference_gate.BUILD_BASIC_ARTIFACT_CONTRACTS:
         artifact_path = rig_dir / f"{metadata_key.rsplit('.', 1)[-1]}.md"
         artifact_path.write_text(valid_build_artifact(schema), encoding="utf-8")
+        metadata[metadata_key] = str(artifact_path)
+
+    gascity_pack_inference_gate.validate_build_basic_artifacts(
+        {"metadata": metadata},
+        rig_dir=rig_dir,
+        env={},
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+
+def test_validate_build_basic_artifacts_resolve_repo_relative_sha_from_rig_root(tmp_path) -> None:
+    rig_dir = tmp_path / "fixture"
+    artifact_dir = rig_dir / "artifacts"
+    artifact_dir.mkdir(parents=True)
+    source = rig_dir / "source.md"
+    source.write_text("# Canonical build input\n", encoding="utf-8")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    metadata: dict[str, str] = {}
+
+    for metadata_key, schema in gascity_pack_inference_gate.BUILD_BASIC_ARTIFACT_CONTRACTS:
+        artifact_path = artifact_dir / f"{metadata_key.rsplit('.', 1)[-1]}.md"
+        artifact_path.write_text(
+            valid_build_artifact(schema).replace(
+                "    - path: fixture\n      hash: literal:test",
+                f"    - path: source.md\n      hash: sha256:{digest}",
+            ),
+            encoding="utf-8",
+        )
         metadata[metadata_key] = str(artifact_path)
 
     gascity_pack_inference_gate.validate_build_basic_artifacts(

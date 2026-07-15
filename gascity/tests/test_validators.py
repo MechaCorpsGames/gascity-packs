@@ -452,6 +452,20 @@ trace:
                     artifact_path=artifact_dir / "plan.md",
                 )
 
+            shadow = artifact_dir / "inputs" / "requirements.md"
+            shadow.parent.mkdir()
+            shadow.write_bytes(upstream.read_bytes())
+            with self.assertRaisesRegex(
+                build_artifact_validator.ValidationError, "ambiguous"
+            ):
+                build_artifact_validator.validate_artifact_text(
+                    text,
+                    expected_schema="gc.build.requirements.v1",
+                    verify_absolute_upstreams=True,
+                    artifact_path=artifact_dir / "plan.md",
+                    upstream_roots=[root],
+                )
+
     def test_build_artifact_rejects_invalid_coverage_status_and_missing_rationale(self) -> None:
         invalid_status = self.valid_artifact().replace("status: deferred", "status: waiting", 1)
         missing_rationale = self.valid_artifact().replace(

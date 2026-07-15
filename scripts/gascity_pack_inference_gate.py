@@ -2210,6 +2210,7 @@ def validate_build_basic_result(
             validator_source=validator_source,
             env=env,
             context=f"implementation member {member_id} summary",
+            upstream_roots=(worktree,),
         )
         validate_member_implementation_summary(
             summary_path,
@@ -2639,21 +2640,25 @@ def validate_build_artifact_schema(
     validator_source: Path,
     env: Mapping[str, str],
     context: str,
+    upstream_roots: Sequence[Path] = (),
 ) -> None:
     validator = validator_source / "assets" / "scripts" / "validate_build_artifact.py"
     if not validator.is_file():
         raise GateError(f"build artifact validator was not found: {validator}")
     try:
+        command = [
+            sys.executable,
+            str(validator),
+            "--schema",
+            schema,
+            "--path",
+            str(artifact_path),
+            "--verify-absolute-upstreams",
+        ]
+        for root in upstream_roots:
+            command.extend(("--upstream-root", str(root.resolve(strict=True))))
         run_checked(
-            [
-                sys.executable,
-                str(validator),
-                "--schema",
-                schema,
-                "--path",
-                str(artifact_path),
-                "--verify-absolute-upstreams",
-            ],
+            command,
             env=env,
             timeout=parse_duration("1m"),
             log_output=True,
@@ -2816,6 +2821,7 @@ def validate_build_basic_artifacts(
             validator_source=validator_source,
             env=env,
             context=f"build-basic artifact from {metadata_key}",
+            upstream_roots=(rig_dir,),
         )
         print(f"validated build-basic artifact: {metadata_key} schema={schema} path={artifact_path}", flush=True)
 
