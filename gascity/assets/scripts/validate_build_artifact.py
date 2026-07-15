@@ -50,6 +50,7 @@ def validate_artifact_text(text: str, *, expected_schema: str = "") -> BuildArti
     upstream = validate_upstream(trace)
     coverage = validate_coverage(trace, schema)
     validate_coverage_completeness(upstream, coverage)
+    validate_status_coverage(front_matter, schema, coverage)
     validate_markdown_coverage(body, coverage)
     validate_required_sections(body, schema)
     return BuildArtifact(
@@ -199,6 +200,26 @@ def validate_coverage(trace: dict[str, Any], schema: dict[str, Any]) -> list[dic
             required_string(raw, "rationale", prefix=f"trace.coverage[{index}]")
         coverage.append(raw)
     return coverage
+
+
+def validate_status_coverage(
+    front_matter: dict[str, Any],
+    schema: dict[str, Any],
+    coverage: list[dict[str, Any]],
+) -> None:
+    if schema.get("artifact") != "review":
+        return
+
+    status = required_string(front_matter, "status")
+    has_blocked_coverage = any(
+        item.get("status") == "blocked" for item in coverage
+    )
+    if status in {"changes_required", "blocked"} and not has_blocked_coverage:
+        raise ValidationError(
+            f"review status {status!r} requires at least one blocked coverage entry"
+        )
+    if status == "approved" and has_blocked_coverage:
+        raise ValidationError("approved review must not include blocked coverage")
 
 
 def validate_markdown_coverage(body: str, coverage: list[dict[str, Any]]) -> None:

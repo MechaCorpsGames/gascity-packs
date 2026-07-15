@@ -403,6 +403,45 @@ trace:
                 summary_complete, expected_schema="gc.build.implementation-summary.v1"
             )
 
+    def test_review_artifact_status_matches_blocking_coverage(self) -> None:
+        approved = self.valid_artifact("gc.build.review.v1")
+        changes_without_blocker = approved.replace(
+            "\nstatus: approved\n", "\nstatus: changes_required\n"
+        )
+        blocked_without_blocker = approved.replace(
+            "\nstatus: approved\n", "\nstatus: blocked\n"
+        )
+        approved_with_blocker = approved.replace(
+            "      status: deferred\n", "      status: blocked\n"
+        ).replace("| GC-METH-012 | deferred |", "| GC-METH-012 | blocked |")
+        changes_with_blocker = approved_with_blocker.replace(
+            "\nstatus: approved\n", "\nstatus: changes_required\n"
+        )
+
+        for text in (changes_without_blocker, blocked_without_blocker):
+            front_matter = build_artifact_validator.parse_front_matter(text)[1]
+            with self.subTest(status=front_matter["status"]):
+                with self.assertRaisesRegex(
+                    build_artifact_validator.ValidationError,
+                    "requires at least one blocked coverage entry",
+                ):
+                    build_artifact_validator.validate_artifact_text(
+                        text, expected_schema="gc.build.review.v1"
+                    )
+
+        with self.assertRaisesRegex(
+            build_artifact_validator.ValidationError,
+            "approved review must not include blocked coverage",
+        ):
+            build_artifact_validator.validate_artifact_text(
+                approved_with_blocker, expected_schema="gc.build.review.v1"
+            )
+
+        artifact = build_artifact_validator.validate_artifact_text(
+            changes_with_blocker, expected_schema="gc.build.review.v1"
+        )
+        self.assertEqual(artifact.front_matter["status"], "changes_required")
+
     def test_build_artifact_requires_coverage_for_declared_upstream_ids(self) -> None:
         declared = self.valid_artifact().replace(
             "      hash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",

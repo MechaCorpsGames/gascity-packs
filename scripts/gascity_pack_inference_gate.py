@@ -1810,6 +1810,8 @@ def require_closed_pass_lineage_bead(bead: Mapping[str, Any], context: str) -> N
         for key in ("gc.blocked_reason", "gc.failure_class")
         if metadata_value(bead, key).strip()
     ]
+    if metadata_value(bead, "gc.build.status") == "blocked":
+        stale.append("gc.build.status='blocked'")
     if stale:
         raise GateError(f"{context} has stale failure metadata: {', '.join(stale)}")
 
@@ -1871,6 +1873,8 @@ def wait_for_workflow_pass(
                         for key in ("gc.blocked_reason", "gc.failure_class")
                         if metadata_value(last_bead, key).strip()
                     ]
+                    if metadata_value(last_bead, "gc.build.status") == "blocked":
+                        stale_markers.append(("gc.build.status", "blocked"))
                     if stale_markers:
                         details = ", ".join(f"{key}={value!r}" for key, value in stale_markers)
                         raise GateError(

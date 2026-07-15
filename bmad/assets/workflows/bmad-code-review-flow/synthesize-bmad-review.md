@@ -5,6 +5,15 @@ blind-hunter, edge-case, acceptance-auditor, and gap-analysis reports.
 Deduplicate findings, preserve their source lanes, and classify required fixes,
 residual risks, and missing test evidence.
 
+A lane's `iterate` verdict is review evidence, not an automatic required fix.
+Re-evaluate every finding against the authoritative requirements, acceptance
+criteria, constraints, and verification evidence. A suggestion is blocking
+only when it proves an unmet in-scope requirement, an acceptance failure, or
+missing evidence that the approved scope requires. If behavior is explicitly
+out of scope, or the source forbids test changes, classify related hardening or
+extra-test suggestions as `out_of_scope`, `deferred`, or `not_applicable`; do
+not turn them into required work.
+
 Read `gc.var.subject_path` and the canonical
 `gc.build.review_subject_path` from workflow root metadata. When the adapter
 supplied a subject, it remains the authoritative review scope and every stated
@@ -36,6 +45,16 @@ table when coverage is non-empty; and include `## Verdict`, `## Findings`, and
 every required review lane approves. Use `status: changes_required` when any
 required fix remains, and `status: blocked` when evidence cannot support a
 review.
+
+Keep top-level review status and coverage mechanically coherent:
+
+- `status: changes_required` or `status: blocked` requires at least one
+  `blocked` coverage row tied to a concrete required finding.
+- `status: approved` requires no `blocked` coverage rows. Covered, deferred,
+  out-of-scope, not-applicable, or superseded observations may remain as
+  residual evidence without preventing approval.
+- Never emit `changes_required` merely because a lane requested optional tests,
+  documentation, or behavior outside the authoritative scope.
 
 Do not use dotted YAML keys such as `workflow.id`, and do not make `trace` a list.
 

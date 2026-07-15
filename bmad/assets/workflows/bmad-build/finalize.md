@@ -42,6 +42,44 @@ implementation evidence passed, and the review contract permits completion.
 Otherwise use `status: blocked`, retain failure metadata, and do not mark the
 build completed.
 
+Use these mutually exclusive terminal branches. A successful review-expansion
+step only proves that it delivered a valid report; it does not authorize a
+top-level build pass when that report still requires changes.
+
+Successful branch:
+
+- Require the canonical review artifact to have `status: approved`, including
+  when `gc.var.review_mode=report` and
+  `gc.build.code_review_status=reported` records report delivery.
+- Require readiness approval and successful implementation evidence.
+- Write the final artifact with `status: approved`, record
+  `gc.build.repair_status=not_needed` when no review fix ran or
+  `gc.build.repair_status=approved` when the fix loop resolved findings. Apply
+  only the completed/success lifecycle update below, and close the claimed step
+  with `gc.outcome=pass`.
+
+Blocked branch:
+
+- A review artifact with `status: changes_required` or `status: blocked`, a
+  readiness failure, missing implementation evidence, or validation failure
+  cannot use the successful branch.
+- For report-mode `changes_required`, write the final artifact with
+  `status: blocked` and atomically record at least
+  `gc.outcome=fail`, `gc.build.status=blocked`,
+  `gc.build.finalize_status=failed`, `gc.build.finalize_outcome=failure`,
+  `gc.build.repair_status=repairable`,
+  `gc.restart.entrypoint=build-from-review`,
+  `gc.restart.reason=review_changes_required`,
+  `gc.restart.review_report_path=<canonical review report path>`,
+  `gc.blocked_reason=code_review_changes_required`, and
+  `gc.failure_class=review_iteration_needed` on the workflow root.
+- For a blocked review or other failed prerequisite, use the same failure-only
+  lifecycle shape with `gc.build.repair_status=blocked` and a precise restart
+  reason and failure class.
+- Close the claimed step with `gc.outcome=fail`. This branch must not set
+  `gc.outcome=pass`, must not set `gc.build.finalize_status=completed`, and
+  must not set `gc.build.finalize_outcome=success` anywhere.
+
 Every `trace.upstream` entry must contain `path` and a scheme-qualified `hash`.
 Preserve actual source IDs verbatim; never invent, substitute, or renumber
 them. Every declared ID must appear exactly once in `trace.coverage`; when no
@@ -91,13 +129,18 @@ gc bd update <workflow-root-id> \
   --set-metadata 'gc.build.status=completed' \
   --set-metadata 'gc.build.finalize_status=completed' \
   --set-metadata 'gc.build.finalize_outcome=success' \
+  --set-metadata 'gc.build.repair_status=<not_needed-or-approved>' \
   --unset-metadata gc.blocked_reason \
-  --unset-metadata gc.failure_class
+  --unset-metadata gc.failure_class \
+  --unset-metadata gc.restart.entrypoint \
+  --unset-metadata gc.restart.reason \
+  --unset-metadata gc.restart.review_report_path \
+  --unset-metadata gc.restart.review_fix_formula \
+  --unset-metadata gc.restart.implementation_target
 ```
 
-Then set the claimed step to `gc.outcome=pass` and close it. If validation or
-required evidence fails, retain or set `gc.blocked_reason` and
-`gc.failure_class`, set `gc.build.finalize_outcome=failure`, and close with
-`gc.outcome=fail`; never emit completed lifecycle metadata on failure.
+Then set the claimed step to `gc.outcome=pass` and close it. This update belongs
+only to the successful branch. If validation or required evidence fails, use
+the blocked branch above; never emit completed lifecycle metadata on failure.
 
 Do not invoke provider-native subagents or upstream BMAD runtime commands.

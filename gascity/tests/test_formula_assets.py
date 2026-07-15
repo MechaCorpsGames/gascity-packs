@@ -7028,6 +7028,46 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("Do not require", context_prompt)
         self.assertIn("review-config.yaml", context_prompt)
 
+    def test_bmad_review_and_finalization_keep_blocked_outcomes_coherent(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        workflow_root = packs_root / "bmad" / "assets" / "workflows"
+        synthesis = " ".join(
+            (
+                workflow_root / "bmad-code-review-flow" / "synthesize-bmad-review.md"
+            ).read_text(encoding="utf-8").split()
+        )
+        finalize = " ".join(
+            (workflow_root / "bmad-build" / "finalize.md")
+            .read_text(encoding="utf-8")
+            .split()
+        )
+
+        for fragment in (
+            "lane's `iterate` verdict is review evidence",
+            "explicitly out of scope",
+            "forbids test changes",
+            "at least one `blocked` coverage row",
+            "no `blocked` coverage rows",
+        ):
+            with self.subTest(prompt="synthesis", fragment=fragment):
+                self.assertIn(fragment, synthesis)
+
+        for fragment in (
+            "mutually exclusive terminal branches",
+            "gc.build.repair_status=repairable",
+            "gc.restart.entrypoint=build-from-review",
+            "gc.restart.reason=review_changes_required",
+            "gc.build.finalize_status=failed",
+            "gc.build.finalize_outcome=failure",
+            "gc.build.repair_status=approved",
+            "gc.build.repair_status=<not_needed-or-approved>",
+            "--unset-metadata gc.restart.review_report_path",
+            "must not set `gc.outcome=pass`",
+            "must not set `gc.build.finalize_outcome=success`",
+        ):
+            with self.subTest(prompt="finalize", fragment=fragment):
+                self.assertIn(fragment, finalize)
+
     def test_implementation_review_check_rejects_incomplete_build_basic_lanes(self) -> None:
         show_json = """[
   {
@@ -7144,10 +7184,17 @@ description = "Override sink that writes the base triage report contract."
             "  upstream:\n"
             f"    - path: {subject}\n"
             f"      hash: {digest}\n"
-            "  coverage: []\n"
+            "      ids: [SEC-001]\n"
+            "  coverage:\n"
+            "    - id: SEC-001\n"
+            "      status: blocked\n"
+            "      rationale: Shell injection remains unresolved.\n"
             "---\n"
             "\n"
             "## Verdict\n\nChanges required.\n\n"
+            "| ID | Status |\n"
+            "| --- | --- |\n"
+            "| SEC-001 | blocked |\n\n"
             "## Findings\n\nShell injection through subprocess shell=True.\n\n"
             "## Verification\n\nUse an argument vector with shell=False.\n"
         )

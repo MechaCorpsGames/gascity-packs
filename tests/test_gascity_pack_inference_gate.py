@@ -1168,6 +1168,7 @@ def complete_nested_workflow_lineage() -> list[dict]:
         ("open-root", r"fi-nested.*closed/pass"),
         ("failed-root", r"fi-nested.*closed/pass"),
         ("stale-root", r"fi-nested.*stale failure"),
+        ("blocked-status-root", r"fi-nested.*stale failure.*gc.build.status"),
         ("missing-finalizer", r"fi-nested.*workflow-finalize"),
         ("open-control", r"fi-nested-control.*closed/pass"),
         ("unset-control-outcome", r"fi-nested-control.*closed/pass"),
@@ -1189,6 +1190,8 @@ def test_validate_workflow_lineage_rejects_incomplete_nested_state(case, expecte
         nested["metadata"]["gc.outcome"] = "fail"
     elif case == "stale-root":
         nested["metadata"]["gc.failure_class"] = "old failure"
+    elif case == "blocked-status-root":
+        nested["metadata"]["gc.build.status"] = "blocked"
     elif case == "missing-finalizer":
         beads[:] = [bead for bead in beads if bead["id"] != "fi-nested-finalize"]
     elif case == "open-control":
@@ -1360,13 +1363,22 @@ def test_wait_for_workflow_pass_rejects_failed_finalizer(tmp_path, monkeypatch) 
         )
 
 
-@pytest.mark.parametrize("marker", ("gc.blocked_reason", "gc.failure_class"))
-def test_wait_for_workflow_pass_rejects_stale_root_failure_marker(tmp_path, monkeypatch, marker: str) -> None:
+@pytest.mark.parametrize(
+    ("marker", "value"),
+    (
+        ("gc.blocked_reason", "stale failure state"),
+        ("gc.failure_class", "stale failure state"),
+        ("gc.build.status", "blocked"),
+    ),
+)
+def test_wait_for_workflow_pass_rejects_stale_root_failure_marker(
+    tmp_path, monkeypatch, marker: str, value: str
+) -> None:
     workspace = gate_workspace(tmp_path)
     root = {
         "id": "fi-root",
         "status": "closed",
-        "metadata": {"gc.outcome": "pass", marker: "stale failure state"},
+        "metadata": {"gc.outcome": "pass", marker: value},
     }
     finalizer = {
         "id": "fi-finalize",
@@ -2726,7 +2738,16 @@ def test_validate_build_basic_artifacts_rejects_json_artifacts(tmp_path) -> None
 
 
 def valid_review_artifact(status: str) -> str:
-    artifact = valid_build_artifact("gc.build.review.v1").replace("status: approved", f"status: {status}", 1)
+    artifact = valid_build_artifact("gc.build.review.v1").replace(
+        "status: approved", f"status: {status}", 1
+    )
+    if status in {"changes_required", "blocked"}:
+        artifact = artifact.replace(
+            "      status: covered\n",
+            "      status: blocked\n"
+            "      rationale: The required security remediation remains unresolved.\n",
+            1,
+        ).replace("| AC1 | covered |", "| AC1 | blocked |", 1)
     return (
         artifact
         + """
