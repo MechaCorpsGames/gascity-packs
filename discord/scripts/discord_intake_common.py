@@ -38,6 +38,11 @@ DEFAULT_SUPERVISOR_API_BASE = "http://127.0.0.1:8372"
 LOCAL_API_BINDS = {"", "0.0.0.0", "::", "[::]", "*"}
 DISCORD_RATE_LIMIT_RETRIES = 2
 GC_API_REQUEST_TIMEOUT_SECONDS = 20.0
+GC_EVENT_REQUEST_FAILED = "request.failed"
+GC_EVENT_SESSION_MESSAGE_SUCCEEDED = "request.result.session.message"
+GC_EVENT_SESSION_SUBMIT_SUCCEEDED = "request.result.session.submit"
+GC_OPERATION_SESSION_MESSAGE = "session.message"
+GC_OPERATION_SESSION_SUBMIT = "session.submit"
 SERVICE_SOCKET_PROBE_TIMEOUT_SECONDS = 0.2
 NON_ROUTABLE_SESSION_STATES = {"", "closed", "stopped", "orphaned", "quarantined"}
 PEER_DELIVERY_TIMEOUT_SECONDS = 10.0
@@ -2378,6 +2383,25 @@ def gc_api_base_url() -> str:
     return f"http://{bind}:{port}"
 
 
+def gc_api_url(path: str) -> str:
+    base_url = gc_api_base_url()
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    # Skip scope discovery if the caller provided an explicit base URL
+    # (it already includes the scope prefix). Strip /v0/ from path
+    # since the base URL already contains the scoped root.
+    override = str(os.environ.get("GC_API_BASE_URL", "")).strip()
+    if override:
+        normalized_path = "/" + path[len("/v0/") :] if path.startswith("/v0/") else path
+    else:
+        city_cfg = load_city_toml()
+        scope_prefix = discover_supervisor_gc_api_scope(city_cfg)
+        normalized_path = path
+        if scope_prefix and path.startswith("/v0/"):
+            normalized_path = scope_prefix + "/" + path[len("/v0/") :]
+    return urllib.parse.urljoin(base_url.rstrip("/") + "/", normalized_path.lstrip("/"))
+
+
 def gc_api_request(
     method: str,
     path: str,
@@ -2385,24 +2409,7 @@ def gc_api_request(
     headers: dict[str, str] | None = None,
     timeout: float = GC_API_REQUEST_TIMEOUT_SECONDS,
 ) -> Any:
-    base_url = gc_api_base_url()
-    if path.startswith("http://") or path.startswith("https://"):
-        url = path
-    else:
-        # Skip scope discovery if the caller provided an explicit base URL
-        # (it already includes the scope prefix). Strip /v0/ from path
-        # since the base URL already contains the scoped root.
-        override = str(os.environ.get("GC_API_BASE_URL", "")).strip()
-        if override:
-            # Explicit base URL already includes scope; strip /v0/ prefix.
-            normalized_path = "/" + path[len("/v0/"):] if path.startswith("/v0/") else path
-        else:
-            city_cfg = load_city_toml()
-            scope_prefix = discover_supervisor_gc_api_scope(city_cfg)
-            normalized_path = path
-            if scope_prefix and path.startswith("/v0/"):
-                normalized_path = scope_prefix + "/" + path[len("/v0/") :]
-        url = urllib.parse.urljoin(base_url.rstrip("/") + "/", normalized_path.lstrip("/"))
+    url = gc_api_url(path)
     body = None
     request_headers = {
         "Accept": "application/json",
@@ -2434,6 +2441,85 @@ def gc_api_request(
         return json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise GCAPIError(f"{method.upper()} {url} returned invalid JSON") from exc
+
+
+def wait_for_gc_request_result(
+    request_id: str,
+    *,
+    event_cursor: str,
+    success_type: str,
+    failure_operation: str,
+    timeout: float = GC_API_REQUEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    normalized_request_id = str(request_id).strip()
+    if not normalized_request_id:
+        raise GCAPIError("gc async request did not include request_id")
+    cursor = str(event_cursor).strip() or "0"
+    query = urllib.parse.urlencode({"after_seq": cursor})
+    url = gc_api_url(f"/v0/events/stream?{query}")
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "text/event-stream",
+            "User-Agent": "gas-city-discord/0.1",
+            "X-GC-Request": "true",
+        },
+        method="GET",
+    )
+    data_lines: list[str] = []
+    deadline = time.monotonic() + max(float(timeout), 0.0)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw_line in response:
+                if time.monotonic() >= deadline:
+                    raise GCAPIError(f"GET {url} timed out")
+                if isinstance(raw_line, bytes):
+                    try:
+                        line = raw_line.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise GCAPIError("gc event stream returned invalid UTF-8") from exc
+                else:
+                    line = str(raw_line)
+                line = line.rstrip("\r\n")
+                if line.startswith("data:"):
+                    data_lines.append(line.removeprefix("data:").lstrip())
+                    continue
+                if line or not data_lines:
+                    continue
+                try:
+                    envelope = json.loads("\n".join(data_lines))
+                except json.JSONDecodeError as exc:
+                    raise GCAPIError("gc event stream returned invalid JSON") from exc
+                finally:
+                    data_lines = []
+                if not isinstance(envelope, dict):
+                    continue
+                event_type = str(envelope.get("type", "")).strip()
+                payload = envelope.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if str(payload.get("request_id", "")).strip() != normalized_request_id:
+                    continue
+                if event_type == success_type:
+                    return payload
+                if event_type != GC_EVENT_REQUEST_FAILED:
+                    continue
+                if str(payload.get("operation", "")).strip() != failure_operation:
+                    continue
+                error_code = str(payload.get("error_code", "")).strip() or "request_failed"
+                error_message = str(payload.get("error_message", "")).strip() or "asynchronous request failed"
+                raise GCAPIError(f"{failure_operation} failed: {error_code}: {error_message}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        message = raw.decode("utf-8", errors="replace")
+        raise GCAPIError(f"GET {url} failed with {exc.code}: {message}") from exc
+    except urllib.error.URLError as exc:
+        raise GCAPIError(f"GET {url} failed: {exc}") from exc
+    except TimeoutError as exc:
+        raise GCAPIError(f"GET {url} timed out") from exc
+    except OSError as exc:
+        raise GCAPIError(f"GET {url} failed: {exc}") from exc
+    raise GCAPIError(f"gc event stream closed before request {normalized_request_id} completed")
 
 
 def load_session_transcript_raw(session_selector: str, tail: int = 20) -> list[dict[str, Any]]:
@@ -5183,6 +5269,21 @@ def deliver_session_message(
     )
     if not isinstance(payload, dict):
         return {}
+    request_id = str(payload.get("request_id", "")).strip()
+    if request_id:
+        if normalized_intent == "default":
+            success_type = GC_EVENT_SESSION_MESSAGE_SUCCEEDED
+            failure_operation = GC_OPERATION_SESSION_MESSAGE
+        else:
+            success_type = GC_EVENT_SESSION_SUBMIT_SUCCEEDED
+            failure_operation = GC_OPERATION_SESSION_SUBMIT
+        wait_for_gc_request_result(
+            request_id,
+            event_cursor=str(payload.get("event_cursor", "")),
+            success_type=success_type,
+            failure_operation=failure_operation,
+            timeout=timeout,
+        )
     return payload
 
 

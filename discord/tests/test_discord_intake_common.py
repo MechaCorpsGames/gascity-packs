@@ -1063,6 +1063,47 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             timeout=common.GC_API_REQUEST_TIMEOUT_SECONDS,
         )
 
+    def test_deliver_session_message_preserves_accepted_payload_after_async_success(self) -> None:
+        accepted = {"status": "accepted", "request_id": "req-submit", "event_cursor": "42"}
+        accepted_response = mock.MagicMock()
+        accepted_response.__enter__.return_value = mock.Mock(
+            read=mock.Mock(
+                return_value=b'{"status":"accepted","request_id":"req-submit","event_cursor":"42"}'
+            )
+        )
+        accepted_response.__exit__.return_value = False
+        succeeded_stream = mock.MagicMock()
+        succeeded_stream.__enter__.return_value = iter(
+            [
+                b"event: request.result.session.submit\n",
+                b'data: {"type":"request.result.session.submit","payload":{"request_id":"req-submit","session_id":"session-1","queued":true,"intent":"follow_up"}}\n',
+                b"\n",
+            ]
+        )
+        succeeded_stream.__exit__.return_value = False
+
+        with mock.patch.dict(
+            os.environ,
+            {"GC_API_BASE_URL": "http://gc.test/v0/city/test"},
+        ), mock.patch.object(
+            common.urllib.request,
+            "urlopen",
+            side_effect=[accepted_response, succeeded_stream],
+        ) as urlopen:
+            payload = common.deliver_session_message(
+                "corp--sky",
+                "hello again",
+                idempotency_key="ingress:3",
+                intent="follow_up",
+            )
+
+        self.assertEqual(payload, accepted)
+        self.assertEqual(len(urlopen.call_args_list), 2)
+        self.assertEqual(
+            urlopen.call_args_list[1].args[0].full_url,
+            "http://gc.test/v0/city/test/events/stream?after_seq=42",
+        )
+
     def test_gc_api_base_url_rejects_disabled_port(self) -> None:
         pathlib.Path(self.tempdir.name, "city.toml").write_text('[api]\nport = 0\n', encoding="utf-8")
 

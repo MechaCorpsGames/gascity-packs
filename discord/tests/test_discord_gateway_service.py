@@ -219,6 +219,75 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertEqual(lead_receipt["binding_id"], "room:22@app:ollie")
         self.assertEqual(pm_receipt["binding_id"], "room:22@app:olivia")
 
+    def test_named_app_async_submit_failure_cannot_leave_delivered_receipt(self) -> None:
+        config = common.import_app_config(
+            common.load_config(),
+            {"application_id": "999", "public_key": "ab" * 32},
+            app_name="ollie",
+        )
+        common.set_chat_binding(
+            config,
+            "room",
+            "22",
+            ["teams.lead"],
+            guild_id="1",
+            app_name="ollie",
+            channel_metadata={"channel_type": 0},
+        )
+        message = {
+            "id": "async-failure-203",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "<@999> please investigate",
+            "mentions": [{"id": "999"}],
+            "author": {"id": "u-2", "username": "alice"},
+        }
+        accepted_response = mock.MagicMock()
+        accepted_response.__enter__.return_value = mock.Mock(
+            read=mock.Mock(
+                return_value=b'{"status":"accepted","request_id":"req-submit","event_cursor":"41"}'
+            )
+        )
+        accepted_response.__exit__.return_value = False
+        failed_stream = mock.MagicMock()
+        failed_stream.__enter__.return_value = iter(
+            [
+                b"event: request.failed\n",
+                b'data: {"type":"request.failed","payload":{"request_id":"req-other-app","operation":"session.submit","error_code":"submit_failed","error_message":"other app failed"}}\n',
+                b"\n",
+                b"event: request.failed\n",
+                b'data: {"type":"request.failed","payload":{"request_id":"req-submit","operation":"session.submit","error_code":"submit_failed","error_message":"session disappeared"}}\n',
+                b"\n",
+            ]
+        )
+        failed_stream.__exit__.return_value = False
+
+        with mock.patch.dict(
+            os.environ,
+            {"GC_API_BASE_URL": "http://gc.test/v0/city/test"},
+        ), mock.patch.object(
+            common,
+            "session_index_by_name",
+            return_value={"teams.lead": {"session_name": "teams.lead", "state": "active"}},
+        ), mock.patch.object(
+            common.urllib.request,
+            "urlopen",
+            side_effect=[accepted_response, failed_stream],
+        ) as urlopen:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999", app_name="ollie")
+
+        self.assertEqual(outcome["status"], "failed")
+        self.assertEqual(len(urlopen.call_args_list), 2)
+        self.assertEqual(
+            urlopen.call_args_list[1].args[0].full_url,
+            "http://gc.test/v0/city/test/events/stream?after_seq=41",
+        )
+        receipt = common.load_chat_ingress("in-async-failure-203-app-ollie")
+        self.assertEqual(receipt["app"], "ollie")
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["targets"][0]["status"], "failed")
+        self.assertIn("session.submit failed: submit_failed: session disappeared", receipt["targets"][0]["error"])
+
     def test_named_app_gateway_policy_is_evaluated_independently(self) -> None:
         config = common.import_app_config(
             common.load_config(),
