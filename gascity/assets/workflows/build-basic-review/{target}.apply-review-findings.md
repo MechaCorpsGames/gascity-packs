@@ -1,54 +1,52 @@
 Apply build-basic starter review findings.
 
-Use implementation target {{implementation_target}} for any required code
-changes. Read the three current-attempt lane verdicts and the starter review
-synthesis before opening an implementation worktree. Lane metadata is
+Use implementation target {{implementation_target}} for required code changes.
+Read the three current-attempt lane verdicts, their
+`code_review.implementation_snapshot` values, and the synthesis. Before opening
+a worktree, recompute the current implementation snapshot from the exact convoy
+member-id/commit tuples. All lane snapshots must equal each other, the root
+`gc.build.implementation_snapshot`, and the recomputed value. Lane metadata is
 authoritative; prose cannot promote an approved observation into required work.
 
-If all three review lanes approve, this is a mandatory no-op. Optional or
-non-blocking suggestions must not authorize or receive implementation edits,
-even when described as a recommendation, simplification, or "next step". Do
-not apply, edit, modify, or change product files in this branch. Write a no-op
-review summary and set `code_review.verdict=done`.
+If all three review lanes approve at that exact snapshot, this is a mandatory
+no-op. Optional or non-blocking suggestions must not authorize or receive
+implementation edits. Do not apply, edit, modify, or change product files in
+this branch. Write a no-op summary and set `code_review.verdict=done` plus the
+unchanged `code_review.implementation_snapshot`.
 
 Resolve the authoritative implementation worktree and source-anchor bead from
-the review context. Read and retain its absolute
-`gc.implementation.worktree_path`, recorded `gc.implementation.commit`, and
-`gc.implementation.summary_path`. Before closing a no-op branch, require the
-worktree `HEAD` and tracked bytes to equal the recorded commit. If an earlier
-review-fix attempt introduced uncommitted optional drift, restore those tracked
-bytes from the recorded commit before writing the no-op summary; never bless
-the drift as a new implementation.
+the review context. Retain its absolute `gc.implementation.worktree_path`,
+recorded `gc.implementation.commit`, and `gc.implementation.summary_path`.
+Before a no-op `done`, require `HEAD`, tracked bytes, and unexpected-untracked
+status to match the recorded evidence. If earlier optional drift must be
+restored, that restoration changed implementation bytes during this pass: it
+must set `code_review.verdict=iterate`, refresh all evidence, and receive a
+subsequent unchanged review. Never restore bytes and report `done` in one pass.
 
 If required fixes or missing evidence remain, and only when a lane verdict is
 `iterate` with a concrete required item, make the smallest focused change in
 the authoritative implementation worktree recorded by
-`gc.implementation.worktree_path` and run the relevant proof commands. Commit every
-product change, capture the current full commit, and update the source anchor's
-`gc.implementation.commit` to that exact commit. Refresh the per-item artifact
-at `gc.implementation.summary_path`, including its source-bead identity and
-current proof. Then refresh the canonical artifact recorded on the workflow
-root as `gc.build.implementation_summary_path`, including the exact per-item
-summary path and its current `sha256` digest. Refresh the review context so the
-next lanes see the new commit and evidence. A change-producing pass must set
-`code_review.verdict=iterate`, never `done`; only a subsequent unchanged pass
-where all three lanes approve may set `done`.
+`gc.implementation.worktree_path` and run the relevant proof commands. Commit
+every product change, capture the current full commit, and update the source
+anchor's `gc.implementation.commit`. Refresh the per-item artifact at
+`gc.implementation.summary_path`, the canonical artifact at
+`gc.build.implementation_summary_path` with its current `sha256` digest, and the
+review context. Recompute and record `gc.build.implementation_snapshot`. Any
+pass that changes implementation bytes or commits must set
+`code_review.verdict=iterate` with the new
+`code_review.implementation_snapshot`; only a subsequent unchanged pass where
+all three freshly bound lanes approve may set `done`.
 
-Write the no-op or review-fix summary under the build artifact root.
+Write the no-op or review-fix summary under the build artifact root. Apply fixes
+to the implementation source anchor/worktree, not to the launcher rig root. An
+unchanged root checkout is owned by publish and is not itself product drift, but
+a root-checkout observation cannot override an `iterate` lane verdict or
+authorize `done`.
 
-Apply fixes to the implementation source anchor/worktree named in the review
-context, not to the launcher rig root. An unchanged root checkout is not itself
-a required fix for build-basic; publish owns propagation beyond the source
-anchor. If the only reported issue is "implementation exists in the worktree but
-not the root checkout" and the source anchor/worktree passes the requirements,
-record a no-op fix summary and set `code_review.verdict=done`.
-
-Set `code_review.verdict=done` only for the unchanged all-approved branch after
-the worktree/recorded-commit check passes. Set `code_review.verdict=iterate`
-when required fixes remain or whenever this pass changed implementation bytes.
-
-Always close with `gc.outcome=pass`,
+Set `code_review.verdict=done` only for an unchanged, all-approved, current-
+snapshot branch. Always close with `gc.outcome=pass`,
 `code_review.verdict=done|iterate`,
+`code_review.implementation_snapshot=<current snapshot>`,
 `code_review.report_path=<starter review summary path>`, and
 `code_review.output_path=<starter review summary path>`.
 
@@ -60,6 +58,7 @@ unrelated beads. Use this command shape:
 gc bd update "$CLAIMED_BEAD_ID" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'code_review.verdict=done' \
+  --set-metadata 'code_review.implementation_snapshot=<current snapshot>' \
   --set-metadata 'code_review.report_path=<starter review summary path>' \
   --set-metadata 'code_review.output_path=<starter review summary path>'
 gc bd close "$CLAIMED_BEAD_ID" --reason 'Build-basic starter review approved.'

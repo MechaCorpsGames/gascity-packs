@@ -2162,6 +2162,60 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, required_fix_contract)
 
+    def test_build_basic_review_binds_approval_to_current_implementation_snapshot(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        workflow_root = root / "assets" / "workflows" / "build-basic-review"
+        setup = (workflow_root / "{target}.setup-build-basic-review.md").read_text(
+            encoding="utf-8"
+        )
+        synthesis = (workflow_root / "{target}.synthesize-review.md").read_text(
+            encoding="utf-8"
+        )
+        apply_findings = (
+            workflow_root / "{target}.apply-review-findings.md"
+        ).read_text(encoding="utf-8")
+        lanes = (
+            workflow_root / "{target}.acceptance-review.md",
+            workflow_root / "{target}.test-evidence-review.md",
+            workflow_root / "{target}.simplicity-review.md",
+        )
+
+        for fragment in (
+            "gc.build.implementation_snapshot",
+            "sorted",
+            "member id",
+            "commit",
+            "sha256",
+        ):
+            with self.subTest(prompt="setup", fragment=fragment):
+                self.assertIn(fragment, setup)
+
+        for lane in lanes:
+            lane_text = lane.read_text(encoding="utf-8")
+            with self.subTest(prompt=lane.name):
+                self.assertIn("gc.build.implementation_snapshot", lane_text)
+                self.assertIn("code_review.implementation_snapshot", lane_text)
+                self.assertIn("exact current implementation snapshot", lane_text)
+
+        for fragment in (
+            "code_review.implementation_snapshot",
+            "all three",
+            "must match",
+        ):
+            with self.subTest(prompt="synthesis", fragment=fragment):
+                self.assertIn(fragment, synthesis)
+
+        for fragment in (
+            "recompute the current implementation snapshot",
+            "code_review.implementation_snapshot",
+            "must set `code_review.verdict=iterate`",
+            "subsequent unchanged",
+            "root-checkout observation cannot override",
+        ):
+            with self.subTest(prompt="apply", fragment=fragment):
+                self.assertIn(fragment, apply_findings)
+        self.assertNotIn("If the only reported issue is", apply_findings)
+
     def test_build_artifact_prompts_use_set_metadata_for_paths(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
         path_contracts = {
@@ -7375,18 +7429,8 @@ description = "Override sink that writes the base triage report contract."
                     "children": [{"id": "member", "status": "closed"}],
                 }
             )
-            lanes = json.dumps(
-                [
-                    {
-                        "id": "apply",
-                        "metadata": {
-                            "gc.root_bead_id": "root",
-                            "gc.attempt": "1",
-                            "gc.ralph_step_id": "review.build-basic-review-loop",
-                            "code_review.verdict": "done",
-                        },
-                    }
-                ]
+            lanes = self._build_basic_review_rows(
+                self._implementation_snapshot({"member": recorded_commit})
             )
 
             clean = self._run_implementation_review_check(
@@ -7410,6 +7454,139 @@ description = "Override sink that writes the base triage report contract."
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("implementation provenance", result.stderr)
         self.assertIn("tracked bytes", result.stderr)
+
+    def test_implementation_review_check_binds_lane_approvals_to_current_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = pathlib.Path(td) / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Review Test"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "review@example.invalid"],
+                cwd=worktree,
+                check=True,
+            )
+            product = worktree / "slugger.py"
+            product.write_text("value = 'reviewed'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "reviewed implementation"],
+                cwd=worktree,
+                check=True,
+            )
+            reviewed_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+
+            loop = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.step_id": "review.build-basic-review-loop",
+                        "gc.build.require_implementation_provenance": "true",
+                    },
+                }]
+            )
+            parent = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.formula_name": "build-basic",
+                        "gc.build.implementation_convoy_id": "implementation",
+                    },
+                }]
+            )
+            convoy = json.dumps(
+                {
+                    "convoy": {"id": "implementation", "status": "closed"},
+                    "children": [{"id": "member", "status": "closed"}],
+                }
+            )
+
+            def member_payload(commit: str) -> str:
+                return json.dumps(
+                    [{
+                        "id": "member",
+                        "status": "closed",
+                        "metadata": {
+                            "gc.outcome": "pass",
+                            "work_dir": str(worktree),
+                            "gc.implementation.worktree_path": str(worktree),
+                            "gc.implementation.commit": commit,
+                        },
+                    }]
+                )
+
+            reviewed_snapshot = self._implementation_snapshot(
+                {"member": reviewed_commit}
+            )
+            reviewed_lanes = self._build_basic_review_rows(reviewed_snapshot)
+            reviewed = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json={"member": member_payload(reviewed_commit)},
+                convoy_json=convoy,
+                list_json=reviewed_lanes,
+            )
+            self.assertEqual(reviewed.returncode, 0, reviewed.stdout + reviewed.stderr)
+
+            product.write_text("value = 'post-review change'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "slugger.py"], cwd=worktree, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "post-review implementation"],
+                cwd=worktree,
+                check=True,
+            )
+            current_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            current_member = {"member": member_payload(current_commit)}
+            stale = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json=current_member,
+                convoy_json=convoy,
+                list_json=reviewed_lanes,
+            )
+
+            current_snapshot = self._implementation_snapshot(
+                {"member": current_commit}
+            )
+            current_lanes = self._build_basic_review_rows(current_snapshot)
+            fresh = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json=current_member,
+                convoy_json=convoy,
+                list_json=current_lanes,
+            )
+
+            missing_rows = json.loads(current_lanes)
+            del missing_rows[0]["metadata"]["code_review.implementation_snapshot"]
+            missing = self._run_implementation_review_check(
+                show_json=loop,
+                parent_show_json=parent,
+                member_show_json=current_member,
+                convoy_json=convoy,
+                list_json=json.dumps(missing_rows),
+            )
+
+        for result in (stale, missing):
+            with self.subTest(stdout=result.stdout, stderr=result.stderr):
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("implementation snapshot", (result.stdout + result.stderr).lower())
+        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
 
     def test_implementation_review_check_accepts_approved_build_basic_lanes(self) -> None:
         show_json = """[

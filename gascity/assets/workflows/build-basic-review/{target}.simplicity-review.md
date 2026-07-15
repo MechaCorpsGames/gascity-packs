@@ -5,11 +5,19 @@ unnecessary abstractions, accidental broad changes, and obvious future
 maintenance risk. Keep this lane beginner-friendly: flag only concrete issues
 that a new factory user can understand and act on.
 
+Read `gc.build.implementation_snapshot` from the workflow root and the review
+context. Recompute it from the current member-id/commit tuples before reviewing
+and require both values to match. Review the exact current implementation snapshot.
+Carry the matching value on this lane as
+`code_review.implementation_snapshot`; a missing or changed snapshot requires
+`iterate` and a fresh review.
+
 Write findings under the build artifact root. Required findings must be tied to
 specific changed files or artifacts and must explain the smallest useful fix.
 
 Close with `gc.outcome=pass`,
 `code_review.simplicity_verdict=approve|iterate`, and
+`code_review.implementation_snapshot=<exact current snapshot>`, and
 `code_review.output_path=<simplicity review report path>`.
 
 Use explicit close metadata so the review loop can detect the lane result:
@@ -18,6 +26,7 @@ Use explicit close metadata so the review loop can detect the lane result:
 gc bd update "$CLAIMED_BEAD_ID" \
   --set-metadata 'gc.outcome=pass' \
   --set-metadata 'code_review.simplicity_verdict=approve' \
+  --set-metadata 'code_review.implementation_snapshot=<exact current snapshot>' \
   --set-metadata 'code_review.output_path=<simplicity review report path>'
 gc bd close "$CLAIMED_BEAD_ID" --reason 'Build-basic simplicity review approved.'
 ```

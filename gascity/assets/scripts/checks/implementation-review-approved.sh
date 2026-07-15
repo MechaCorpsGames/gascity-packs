@@ -36,6 +36,12 @@ SCOPE_REF="$(metadata_value "$ROOT_JSON" "gc.scope_ref")"
 if [ -z "$SCOPE_REF" ]; then
   SCOPE_REF="$(metadata_value "$ROOT_JSON" "gc.step_ref")"
 fi
+IMPLEMENTATION_PROVENANCE_REQUIRED="$(metadata_value "$ROOT_JSON" "gc.build.require_implementation_provenance")"
+if [ -z "$IMPLEMENTATION_PROVENANCE_REQUIRED" ]; then
+  IMPLEMENTATION_PROVENANCE_REQUIRED="$(metadata_value "$PARENT_JSON" "gc.build.require_implementation_provenance")"
+fi
+IMPLEMENTATION_PROVENANCE_VALIDATED=false
+CURRENT_IMPLEMENTATION_SNAPSHOT=""
 
 validate_declared_artifact() {
   local schema path_keys script_dir artifact_check
@@ -66,19 +72,18 @@ implementation_provenance_fail() {
 }
 
 validate_implementation_provenance() {
-  local required convoy_id convoy_json member_ids drain_policy member_id member_json
+  local convoy_id convoy_json member_ids drain_policy member_id member_json
   local status outcome work_dir explicit_worktree canonical_worktree recorded_commit
   local resolved_commit head found_terminal_commit recorded_summary canonical_summary
   local root_summary candidate_worktree relative_path absolute_path allowed_path
-  local seen allowed shared_worktree shared_head
+  local seen allowed shared_worktree shared_head snapshot_members
   local -a member_worktrees=()
   local -a allowed_untracked_paths=()
 
-  required="$(metadata_value "$ROOT_JSON" "gc.build.require_implementation_provenance")"
-  if [ -z "$required" ]; then
-    required="$(metadata_value "$PARENT_JSON" "gc.build.require_implementation_provenance")"
-  fi
-  [ "$required" = "true" ] || return 0
+  [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ] || return 0
+  [ "$IMPLEMENTATION_PROVENANCE_VALIDATED" = "false" ] || return 0
+  command -v python3 >/dev/null 2>&1 || implementation_provenance_fail \
+    "requires python3 to compute the implementation snapshot"
 
   convoy_id="$(metadata_value "$PARENT_JSON" "gc.build.implementation_convoy_id")"
   [ -n "$convoy_id" ] || implementation_provenance_fail \
@@ -99,6 +104,7 @@ validate_implementation_provenance() {
   found_terminal_commit=false
   shared_worktree=""
   shared_head=""
+  snapshot_members='[]'
 
   while IFS= read -r member_id; do
     [ -n "$member_id" ] || continue
@@ -133,6 +139,10 @@ validate_implementation_provenance() {
       "member $member_id gc.implementation.commit must be a full 40-character commit"
     resolved_commit="$(git -C "$canonical_worktree" rev-parse --verify "${recorded_commit}^{commit}" 2>/dev/null)" || \
       implementation_provenance_fail "member $member_id recorded commit does not resolve"
+    snapshot_members="$(printf '%s\n' "$snapshot_members" | jq -c \
+      --arg id "$member_id" --arg commit "$resolved_commit" \
+      '. + [{id: $id, commit: $commit}]')" || implementation_provenance_fail \
+        "could not record the implementation snapshot for member $member_id"
     head="$(git -C "$canonical_worktree" rev-parse HEAD 2>/dev/null)" || \
       implementation_provenance_fail "member $member_id worktree HEAD is unreadable"
 
@@ -188,6 +198,23 @@ validate_implementation_provenance() {
       "same-session members do not bind the terminal shared worktree HEAD"
   fi
 
+  if ! CURRENT_IMPLEMENTATION_SNAPSHOT="$(printf '%s' "$snapshot_members" | python3 -c '
+import hashlib
+import json
+import sys
+
+members = json.load(sys.stdin)
+members = [
+    {"id": str(member["id"]), "commit": str(member["commit"])}
+    for member in members
+]
+members.sort(key=lambda member: member["id"])
+payload = json.dumps(members, sort_keys=True, separators=(",", ":")).encode("utf-8")
+print("sha256:" + hashlib.sha256(payload).hexdigest())
+')"; then
+    implementation_provenance_fail "could not compute the current implementation snapshot"
+  fi
+
   root_summary="$(metadata_value "$PARENT_JSON" "gc.build.implementation_summary_path")"
   if [ -n "$root_summary" ] && [ -f "$root_summary" ] && [ ! -L "$root_summary" ]; then
     canonical_summary="$(cd "$(dirname "$root_summary")" 2>/dev/null && pwd -P)/$(basename "$root_summary")" || \
@@ -233,6 +260,7 @@ validate_implementation_provenance() {
       fi
     done < <(git -C "$candidate_worktree" ls-files --others --exclude-standard -z)
   done
+  IMPLEMENTATION_PROVENANCE_VALIDATED=true
 }
 
 approve() {
@@ -333,29 +361,66 @@ if [ "$REVIEW_MODE" = "report" ]; then
   exit 1
 fi
 
-LANE_STATUS="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r '
+validate_implementation_provenance
+
+LANE_STATUS="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r \
+  --arg require_snapshot "$IMPLEMENTATION_PROVENANCE_REQUIRED" \
+  --arg current_snapshot "$CURRENT_IMPLEMENTATION_SNAPSHOT" '
   def approved($value):
     (($value // "") | ascii_downcase) as $v
     | ($v == "approve" or $v == "approved" or $v == "pass");
+  def rendered($row):
+    (($row.verdict | if . == "" then "<missing>" else . end) + "@" +
+    ($row.snapshot | if . == "" then "<missing implementation snapshot>" else . end));
   [
     .[]
-    | .metadata
-    | {
-        acceptance: (."code_review.acceptance_verdict" // ""),
-        test_evidence: (."code_review.test_evidence_verdict" // ""),
-        simplicity: (."code_review.simplicity_verdict" // "")
-      }
+    | .metadata as $metadata
+    | [
+        {
+          lane: "acceptance",
+          verdict: ($metadata["code_review.acceptance_verdict"] // ""),
+          snapshot: ($metadata["code_review.implementation_snapshot"] // "")
+        },
+        {
+          lane: "test_evidence",
+          verdict: ($metadata["code_review.test_evidence_verdict"] // ""),
+          snapshot: ($metadata["code_review.implementation_snapshot"] // "")
+        },
+        {
+          lane: "simplicity",
+          verdict: ($metadata["code_review.simplicity_verdict"] // ""),
+          snapshot: ($metadata["code_review.implementation_snapshot"] // "")
+        }
+      ][]
+    | select(.verdict != "")
   ] as $rows
   | {
-      acceptance: ([$rows[].acceptance | select(. != "")] | last // ""),
-      test_evidence: ([$rows[].test_evidence | select(. != "")] | last // ""),
-      simplicity: ([$rows[].simplicity | select(. != "")] | last // "")
+      acceptance: ([$rows[] | select(.lane == "acceptance")] | last // {verdict: "", snapshot: ""}),
+      test_evidence: ([$rows[] | select(.lane == "test_evidence")] | last // {verdict: "", snapshot: ""}),
+      simplicity: ([$rows[] | select(.lane == "simplicity")] | last // {verdict: "", snapshot: ""})
     } as $latest
-  | if ($latest.acceptance != "" or $latest.test_evidence != "" or $latest.simplicity != "") then
-      if (approved($latest.acceptance) and approved($latest.test_evidence) and approved($latest.simplicity)) then
+  | if $require_snapshot == "true" then
+      if (
+        approved($latest.acceptance.verdict) and
+        approved($latest.test_evidence.verdict) and
+        approved($latest.simplicity.verdict) and
+        $latest.acceptance.snapshot == $current_snapshot and
+        $latest.test_evidence.snapshot == $current_snapshot and
+        $latest.simplicity.snapshot == $current_snapshot
+      ) then
         "approved"
       else
-        "iterate: acceptance=\($latest.acceptance // "<missing>") test_evidence=\($latest.test_evidence // "<missing>") simplicity=\($latest.simplicity // "<missing>")"
+        "iterate: implementation snapshot mismatch current=\($current_snapshot) acceptance=\(rendered($latest.acceptance)) test_evidence=\(rendered($latest.test_evidence)) simplicity=\(rendered($latest.simplicity))"
+      end
+    elif ($rows | length) > 0 then
+      if (
+        approved($latest.acceptance.verdict) and
+        approved($latest.test_evidence.verdict) and
+        approved($latest.simplicity.verdict)
+      ) then
+        "approved"
+      else
+        "iterate: acceptance=\($latest.acceptance.verdict // "<missing>") test_evidence=\($latest.test_evidence.verdict // "<missing>") simplicity=\($latest.simplicity.verdict // "<missing>")"
       end
     else
       ""
