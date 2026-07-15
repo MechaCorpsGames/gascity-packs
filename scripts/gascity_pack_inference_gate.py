@@ -1680,6 +1680,18 @@ def drain_manifest_root_ids(bead: Mapping[str, Any]) -> list[str]:
         raise GateError(f"workflow lineage drain {drain_id} has malformed manifest")
     if metadata_value(bead, "gc.drain_state") != "succeeded":
         raise GateError(f"workflow lineage drain {drain_id} must record gc.drain_state=succeeded")
+    raw_count = metadata_value(bead, "gc.drain_count")
+    try:
+        drain_count = int(raw_count)
+    except ValueError as exc:
+        raise GateError(
+            f"workflow lineage drain {drain_id} has invalid gc.drain_count={raw_count!r}"
+        ) from exc
+    if drain_count != len(rows):
+        raise GateError(
+            f"workflow lineage drain {drain_id} gc.drain_count does not match manifest rows: "
+            f"count={drain_count} rows={len(rows)}"
+        )
 
     root_ids: list[str] = []
     for index, row in enumerate(rows):
@@ -2101,6 +2113,7 @@ def validate_build_basic_result(
     validator_source: Path,
 ) -> list[Path]:
     validated: list[tuple[str, str, Path, Path]] = []
+    observed_commits: set[str] = set()
     observed_summaries: set[Path] = set()
     observed_worktrees: set[Path] = set()
     rig_root = rig_dir.resolve()
@@ -2130,6 +2143,12 @@ def validate_build_basic_result(
             )
         observed_worktrees.add(worktree)
         commit = resolved_member_commit(member, member_id, worktree)
+        if commit in observed_commits:
+            raise GateError(
+                "authoritative implementation commits must be distinct: "
+                f"member={member_id} commit={commit}"
+            )
+        observed_commits.add(commit)
         committed_products = validate_committed_product_bytes(
             member_id,
             worktree,

@@ -160,7 +160,11 @@ def lineage_drain(bead_id: str, root_id: str, nested_id: str, *, root_key: str =
         bead_id,
         root=root_id,
         kind="drain",
-        metadata={"gc.drain_state": "succeeded", "gc.drain_manifest.v1": json.dumps(manifest)},
+        metadata={
+            "gc.drain_count": "1",
+            "gc.drain_state": "succeeded",
+            "gc.drain_manifest.v1": json.dumps(manifest),
+        },
     )
 
 
@@ -1216,6 +1220,9 @@ def test_validate_workflow_lineage_rejects_malformed_manifest_rows(row) -> None:
     ("case", "expected"),
     (
         ("missing-manifest", r"fi-root-drain.*manifest"),
+        ("missing-count", r"fi-root-drain.*drain_count"),
+        ("invalid-count", r"fi-root-drain.*drain_count"),
+        ("count-mismatch", r"fi-root-drain.*drain_count.*manifest"),
         ("failed-state", r"fi-root-drain.*drain_state=succeeded"),
         ("failed-row", r"fi-root-drain.*manifest row 0.*status=succeeded"),
         ("failed-outcome", r"fi-root-drain.*manifest row 0.*outcome_kind=pass"),
@@ -1227,6 +1234,12 @@ def test_validate_workflow_lineage_rejects_incomplete_drain_evidence(case, expec
     manifest = json.loads(drain["metadata"]["gc.drain_manifest.v1"])
     if case == "missing-manifest":
         del drain["metadata"]["gc.drain_manifest.v1"]
+    elif case == "missing-count":
+        del drain["metadata"]["gc.drain_count"]
+    elif case == "invalid-count":
+        drain["metadata"]["gc.drain_count"] = "not-a-count"
+    elif case == "count-mismatch":
+        drain["metadata"]["gc.drain_count"] = "2"
     elif case == "failed-state":
         drain["metadata"]["gc.drain_state"] = "failed"
     elif case == "failed-row":
@@ -2234,6 +2247,25 @@ def test_validate_build_basic_result_accepts_every_member_with_commit_bound_prov
     selected = validate_build_basic_fixture(fixture)
 
     assert selected == [record["worktree"] for record in fixture["members"].values()]
+
+
+def test_validate_build_basic_result_rejects_shared_commit_across_distinct_member_worktrees(
+    tmp_path,
+) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    one, two = (fixture["members"][member_id] for member_id in ("fi-one", "fi-two"))
+    two_summary = two["summary"].read_bytes()
+
+    run_git(two["worktree"], "reset", "--hard", one["commit"])
+    two["summary"].write_bytes(two_summary)
+    two["bead"]["metadata"]["gc.implementation.commit"] = one["commit"]
+
+    assert one["worktree"] != two["worktree"]
+    assert run_git(one["worktree"], "rev-parse", "HEAD") == run_git(
+        two["worktree"], "rev-parse", "HEAD"
+    )
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="commits must be distinct"):
+        validate_build_basic_fixture(fixture)
 
 
 def test_validate_build_basic_result_rejects_launcher_only_false_pass(tmp_path) -> None:
