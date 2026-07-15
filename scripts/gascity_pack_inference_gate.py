@@ -2863,25 +2863,18 @@ def resolved_member_commit(member: Mapping[str, Any], member_id: str, worktree: 
     recorded = metadata_value(member, "gc.implementation.commit").strip()
     if not recorded:
         raise GateError(f"implementation member {member_id} is missing gc.implementation.commit")
-    if re.fullmatch(r"[0-9a-fA-F]{7,64}", recorded) is None:
+    if re.fullmatch(r"[0-9a-fA-F]+", recorded) is None:
         raise GateError(
             f"implementation member {member_id} gc.implementation.commit must be a hexadecimal commit id: "
             f"{recorded!r}"
         )
-    resolved = git_output(
-        worktree,
-        "rev-parse",
-        "--verify",
-        f"{recorded}^{{commit}}",
-        context=f"member {member_id} recorded gc.implementation.commit {recorded}",
-    ).strip()
     head = git_output(worktree, "rev-parse", "HEAD", context=f"member {member_id} HEAD").strip()
-    if resolved != head:
+    if recorded != head:
         raise GateError(
-            f"implementation member {member_id} gc.implementation.commit does not match worktree HEAD: "
-            f"recorded={recorded} resolved={resolved} HEAD={head}"
+            f"implementation member {member_id} gc.implementation.commit must equal the full worktree HEAD: "
+            f"recorded={recorded} HEAD={head}"
         )
-    return resolved
+    return head
 
 
 def launcher_baseline_tests(rig_dir: Path, launcher_commit: str) -> bytes:

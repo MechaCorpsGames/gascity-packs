@@ -2819,7 +2819,7 @@ def build_basic_result_fixture(tmp_path: Path, *, implemented: bool = True) -> d
         run_git(worktree, "commit", "-q", "-m", f"implement {member_id}")
         commit = run_git(worktree, "rev-parse", "HEAD")
         bead = closed_bead(member_id)
-        set_member_provenance(bead, worktree=worktree, summary=summary, commit=commit[:7])
+        set_member_provenance(bead, worktree=worktree, summary=summary, commit=commit)
         member_records[member_id] = {
             "bead": bead,
             "worktree": worktree,
@@ -3180,9 +3180,23 @@ def test_validate_build_basic_result_runs_pytest_in_every_member_worktree(tmp_pa
     (two["worktree"] / "slugger.py").write_text(WRONG_SLUGGER, encoding="utf-8")
     run_git(two["worktree"], "add", "slugger.py")
     run_git(two["worktree"], "commit", "-q", "-m", "break second member implementation")
-    two["bead"]["metadata"]["gc.implementation.commit"] = run_git(two["worktree"], "rev-parse", "HEAD")[:7]
+    two["bead"]["metadata"]["gc.implementation.commit"] = run_git(
+        two["worktree"], "rev-parse", "HEAD"
+    )
 
     with pytest.raises(gascity_pack_inference_gate.GateError, match="fi-two.*pytest failed"):
+        validate_build_basic_fixture(fixture)
+
+
+def test_validate_build_basic_result_rejects_abbreviated_member_commit(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    two = fixture["members"]["fi-two"]
+    two["bead"]["metadata"]["gc.implementation.commit"] = two["commit"][:7]
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"fi-two.*full worktree HEAD",
+    ):
         validate_build_basic_fixture(fixture)
 
 
