@@ -60,6 +60,7 @@ BUILD_BASIC_FORMULA = "build-basic"
 BUILD_ARTIFACT_ROOT = Path(".gc/inference-gate/build-basic")
 BUILD_TITLE = "gascity pack inference gate: build-basic"
 BUILD_SOURCE_TITLE = "Implement slugify and make pytest pass"
+BUILD_BASIC_PRODUCT_PATHS = ("slugger.py", "tests/test_slugger.py")
 GASTOWN_REVIEW_TITLE = "Gastown orchestration gate: review leg"
 GASTOWN_REVIEW_ASSIGNMENT_TITLE = "Review Gastown orchestration gate fixture"
 GASTOWN_ALWAYS_ON_AGENTS = ("mayor", "deacon", "boot", "witness")
@@ -1669,24 +1670,122 @@ def metadata_value(bead: Mapping[str, Any], key: str) -> str:
     return str(value)
 
 
-def failed_logical_controls(
-    beads: Sequence[Mapping[str, Any]],
-    root_id: str,
-) -> list[Mapping[str, Any]]:
-    failures: list[Mapping[str, Any]] = []
+def drain_manifest_root_ids(bead: Mapping[str, Any]) -> list[str]:
+    raw_manifest = metadata_value(bead, "gc.drain_manifest.v1").strip()
+    drain_id = str(bead.get("id") or "<unknown>")
+    if not raw_manifest:
+        raise GateError(f"workflow lineage drain {drain_id} is missing gc.drain_manifest.v1")
+    rows = drain_manifest_rows(bead)
+    if rows is None:
+        raise GateError(f"workflow lineage drain {drain_id} has malformed manifest")
+    if metadata_value(bead, "gc.drain_state") != "succeeded":
+        raise GateError(f"workflow lineage drain {drain_id} must record gc.drain_state=succeeded")
+
+    root_ids: list[str] = []
+    for index, row in enumerate(rows):
+        row_root_ids: list[str] = []
+        if isinstance(row, Mapping):
+            row_root_ids = [
+                value.strip()
+                for key in ("item_root_id", "outcome_bead_id")
+                if isinstance((value := row.get(key)), str) and value.strip()
+            ]
+        if not row_root_ids:
+            raise GateError(
+                f"workflow lineage drain {drain_id} has malformed manifest row {index}: "
+                "expected non-empty item_root_id or outcome_bead_id"
+            )
+        if row.get("status") != "succeeded":
+            raise GateError(
+                f"workflow lineage drain {drain_id} manifest row {index} must record status=succeeded"
+            )
+        if row.get("outcome_kind") != "pass":
+            raise GateError(
+                f"workflow lineage drain {drain_id} manifest row {index} must record outcome_kind=pass"
+            )
+        root_ids.extend(row_root_ids)
+    return dedupe_strings(root_ids)
+
+
+def drain_manifest_rows(bead: Mapping[str, Any]) -> list[Any] | None:
+    try:
+        manifest = json.loads(metadata_value(bead, "gc.drain_manifest.v1"))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    rows = manifest.get("rows") if isinstance(manifest, Mapping) else None
+    return rows if isinstance(rows, list) else None
+
+
+def validate_workflow_lineage(beads: Sequence[Mapping[str, Any]], root_id: str) -> None:
+    by_id: dict[str, list[Mapping[str, Any]]] = {}
     for bead in beads:
-        if str(bead.get("status") or "") != "closed":
-            continue
-        if metadata_value(bead, "gc.root_bead_id") != root_id:
-            continue
-        if metadata_value(bead, "gc.outcome") != "fail":
-            continue
-        if metadata_value(bead, "gc.attempt"):
-            continue
-        if metadata_value(bead, "gc.kind") not in LOGICAL_CONTROL_KINDS:
-            continue
-        failures.append(bead)
-    return sorted(failures, key=lambda bead: str(bead.get("id") or ""))
+        bead_id = bead.get("id")
+        if isinstance(bead_id, str) and bead_id:
+            by_id.setdefault(bead_id, []).append(bead)
+
+    lineage = {root_id}
+    nested_roots: set[str] = set()
+    pending = [root_id]
+    while pending:
+        parent_id = pending.pop()
+        drains = [
+            bead
+            for bead in beads
+            if metadata_value(bead, "gc.root_bead_id") == parent_id
+            and metadata_value(bead, "gc.kind") == "drain"
+            and not metadata_value(bead, "gc.attempt")
+        ]
+        for drain in drains:
+            for nested_id in drain_manifest_root_ids(drain):
+                matches = by_id.get(nested_id, [])
+                if len(matches) != 1:
+                    raise GateError(f"workflow lineage root {nested_id} must be present exactly one time")
+                nested = matches[0]
+                if metadata_value(nested, "gc.kind") != "workflow":
+                    raise GateError(f"workflow lineage root {nested_id} must record gc.kind=workflow")
+                if nested_id not in lineage:
+                    lineage.add(nested_id)
+                    nested_roots.add(nested_id)
+                    pending.append(nested_id)
+
+    for nested_id in sorted(nested_roots):
+        nested = by_id[nested_id][0]
+        require_closed_pass_lineage_bead(nested, f"workflow lineage root {nested_id}")
+
+    for lineage_root_id in sorted(lineage):
+        controls = [
+            bead
+            for bead in beads
+            if metadata_value(bead, "gc.root_bead_id") == lineage_root_id
+            and metadata_value(bead, "gc.kind") in LOGICAL_CONTROL_KINDS
+            and not metadata_value(bead, "gc.attempt")
+        ]
+        finalizers = [bead for bead in controls if metadata_value(bead, "gc.kind") == "workflow-finalize"]
+        if not finalizers:
+            raise GateError(f"workflow lineage root {lineage_root_id} is missing workflow-finalize control")
+        for control in controls:
+            control_id = str(control.get("id") or "").strip()
+            if not control_id or len(by_id.get(control_id, [])) != 1:
+                raise GateError(
+                    f"logical control beneath workflow lineage root {lineage_root_id} must be uniquely present"
+                )
+            step_ref = metadata_value(control, "gc.step_ref") or str(control.get("title") or "<untitled>")
+            require_closed_pass_lineage_bead(
+                control,
+                f"logical workflow control failed or incomplete: {control_id} ({step_ref})",
+            )
+
+
+def require_closed_pass_lineage_bead(bead: Mapping[str, Any], context: str) -> None:
+    if str(bead.get("status") or "") != "closed" or metadata_value(bead, "gc.outcome") != "pass":
+        raise GateError(f"{context} must be closed/pass")
+    stale = [
+        f"{key}={metadata_value(bead, key)!r}"
+        for key in ("gc.blocked_reason", "gc.failure_class")
+        if metadata_value(bead, key).strip()
+    ]
+    if stale:
+        raise GateError(f"{context} has stale failure metadata: {', '.join(stale)}")
 
 
 def workflow_finalizers(
@@ -1724,18 +1823,6 @@ def wait_for_workflow_pass(
         if status == "closed":
             if outcome == "pass":
                 beads = list_beads(gc_bin, workspace, env=env)
-                failed_controls = failed_logical_controls(beads, root_id)
-                if failed_controls:
-                    details = ", ".join(
-                        f"{bead.get('id', '<unknown>')}"
-                        f" ({metadata_value(bead, 'gc.step_ref') or bead.get('title', '<untitled>')})"
-                        for bead in failed_controls
-                    )
-                    raise GateError(
-                        f"logical workflow control failed beneath closed/pass root {root_id}: {details}\n"
-                        + collect_diagnostics(gc_bin, workspace, env=env)
-                    )
-
                 finalizers = workflow_finalizers(beads, root_id)
                 if not finalizers:
                     print(f"workflow {root_id}: waiting for workflow-finalize control", flush=True)
@@ -1745,18 +1832,13 @@ def wait_for_workflow_pass(
                     )
                     print(f"workflow {root_id}: waiting for workflow-finalize controls ({states})", flush=True)
                 else:
-                    incomplete_finalizers = [
-                        bead for bead in finalizers if metadata_value(bead, "gc.outcome") != "pass"
-                    ]
-                    if incomplete_finalizers:
-                        details = ", ".join(
-                            f"{bead.get('id', '<unknown>')}={metadata_value(bead, 'gc.outcome') or '<unset>'}"
-                            for bead in incomplete_finalizers
-                        )
+                    try:
+                        validate_workflow_lineage(beads, root_id)
+                    except GateError as exc:
                         raise GateError(
-                            f"workflow-finalize controls beneath closed/pass root {root_id} did not pass: {details}\n"
+                            f"{exc}\n"
                             + collect_diagnostics(gc_bin, workspace, env=env)
-                        )
+                        ) from exc
 
                     stale_markers = [
                         (key, metadata_value(last_bead, key))
@@ -1936,20 +2018,26 @@ def validate_review_artifact_file(
         ) from exc
 
 
+def artifact_front_matter(artifact_path: Path, *, label: str) -> Mapping[str, Any]:
+    text = artifact_path.read_text(encoding="utf-8", errors="strict")
+    match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
+    if not match:
+        raise GateError(f"{label} has no parseable front matter: {artifact_path}")
+    try:
+        front_matter = yaml.safe_load(match.group("front")) or {}
+    except yaml.YAMLError as exc:
+        raise GateError(f"{label} front matter is invalid at {artifact_path}: {exc}") from exc
+    if not isinstance(front_matter, Mapping):
+        raise GateError(f"{label} front matter must be a mapping at {artifact_path}")
+    return front_matter
+
+
 def require_canonical_review_subject_trace(report_path: Path, subject_path: Path) -> None:
     if not subject_path.is_file():
         raise GateError(f"canonical review subject is missing: {subject_path}")
 
-    text = report_path.read_text(encoding="utf-8", errors="replace")
-    match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
-    if not match:
-        raise GateError(f"review report has no parseable front matter: {report_path}")
-    try:
-        front_matter = yaml.safe_load(match.group("front")) or {}
-    except yaml.YAMLError as exc:
-        raise GateError(f"review report front matter is invalid at {report_path}: {exc}") from exc
-
-    trace = front_matter.get("trace") if isinstance(front_matter, dict) else None
+    front_matter = artifact_front_matter(report_path, label="review report")
+    trace = front_matter.get("trace")
     upstream = trace.get("upstream") if isinstance(trace, dict) else None
     if not isinstance(upstream, list):
         raise GateError(f"review report trace.upstream is missing at {report_path}")
@@ -2005,42 +2093,572 @@ def validate_build_basic_result(
     rig_dir: Path,
     beads: Sequence[Mapping[str, Any]],
     *,
+    root_bead: Mapping[str, Any],
+    expected_member_ids: Sequence[str],
+    launcher_commit: str,
     env: Mapping[str, str],
     timeout: float,
+    validator_source: Path,
+) -> list[Path]:
+    validated: list[tuple[str, str, Path, Path]] = []
+    observed_summaries: set[Path] = set()
+    observed_worktrees: set[Path] = set()
+    rig_root = rig_dir.resolve()
+    launcher_common_dir = git_common_dir(rig_root, context="launcher rig")
+    baseline_tests = launcher_baseline_tests(rig_root, launcher_commit)
+    for member_id, workflow_root_id in build_basic_implementation_members(
+        root_bead, beads, expected_member_ids
+    ):
+        matches = [bead for bead in beads if bead.get("id") == member_id]
+        if len(matches) != 1:
+            raise GateError(
+                f"implementation member {member_id} must have exactly one authoritative bead; "
+                f"observed {len(matches)}"
+            )
+        member = matches[0]
+        if str(member.get("status") or "") != "closed" or metadata_value(member, "gc.outcome") != "pass":
+            raise GateError(
+                f"implementation member {member_id} must be closed/pass; "
+                f"status={member.get('status')!r} outcome={metadata_value(member, 'gc.outcome')!r}"
+            )
+
+        worktree = authoritative_member_worktree(member, member_id, rig_root, launcher_common_dir)
+        if worktree in observed_worktrees:
+            raise GateError(
+                "authoritative implementation worktrees must be distinct: "
+                f"member={member_id} worktree={worktree}"
+            )
+        observed_worktrees.add(worktree)
+        commit = resolved_member_commit(member, member_id, worktree)
+        committed_products = validate_committed_product_bytes(
+            member_id,
+            worktree,
+            commit,
+            baseline_tests=baseline_tests,
+        )
+
+        slugger = worktree / "slugger.py"
+        if "NotImplementedError" in slugger.read_text(encoding="utf-8", errors="replace"):
+            raise GateError(f"implementation member {member_id} slugger.py still contains NotImplementedError")
+
+        summary_path = member_summary_path(member, member_id, worktree)
+        if summary_path in observed_summaries:
+            raise GateError(
+                f"implementation member {member_id} must use a distinct gc.implementation.summary_path: "
+                f"{summary_path}"
+            )
+        observed_summaries.add(summary_path)
+        validate_build_artifact_schema(
+            summary_path,
+            schema="gc.build.implementation-summary.v1",
+            validator_source=validator_source,
+            env=env,
+            context=f"implementation member {member_id} summary",
+        )
+        validate_member_implementation_summary(
+            summary_path,
+            member_id=member_id,
+            workflow_root_id=workflow_root_id,
+        )
+
+        validate_committed_pytest(member_id, committed_products, commit, env=env, timeout=timeout)
+
+        validated.append((member_id, workflow_root_id, worktree, summary_path))
+        print(f"validated build-basic implementation member {member_id}: {worktree}", flush=True)
+
+    validate_canonical_implementation_summary(
+        root_bead,
+        validated,
+        rig_dir=rig_dir,
+    )
+    return [worktree for _, _, worktree, _ in validated]
+
+
+def implementation_convoy_member_ids(
+    gc_bin: str,
+    workspace: GateWorkspace,
+    root_bead: Mapping[str, Any],
+    *,
+    env: Mapping[str, str],
+) -> list[str]:
+    convoy_id = metadata_value(root_bead, "gc.build.implementation_convoy_id").strip()
+    if not convoy_id:
+        raise GateError("build-basic root is missing gc.build.implementation_convoy_id")
+    output = run_checked(
+        [
+            gc_bin,
+            "--city",
+            str(workspace.city_dir),
+            "--rig",
+            workspace.rig_name,
+            "convoy",
+            "status",
+            convoy_id,
+            "--json",
+        ],
+        env=env,
+        timeout=parse_duration("30s"),
+    )
+    return convoy_status_member_ids(extract_json_payload(output), convoy_id)
+
+
+def convoy_status_member_ids(payload: Any, convoy_id: str) -> list[str]:
+    if not isinstance(payload, Mapping):
+        raise GateError(f"gc convoy status {convoy_id} did not return an object")
+    convoy = payload.get("convoy")
+    if not isinstance(convoy, Mapping) or str(convoy.get("id") or "") != convoy_id:
+        raise GateError(f"gc convoy status {convoy_id} returned a different convoy")
+    if str(convoy.get("status") or "") != "closed":
+        raise GateError(f"implementation convoy {convoy_id} must have status=closed")
+
+    children = payload.get("children")
+    if not isinstance(children, list) or not children:
+        raise GateError(f"implementation convoy {convoy_id} must have non-empty children")
+    member_ids: list[str] = []
+    for index, child in enumerate(children):
+        member_id = str(child.get("id") or "").strip() if isinstance(child, Mapping) else ""
+        if not member_id:
+            raise GateError(f"implementation convoy child {index} must have a non-empty id")
+        if str(child.get("status") or "") != "closed":
+            raise GateError(f"implementation convoy child {member_id} must be closed")
+        if child.get("dangling_track") is True:
+            raise GateError(f"implementation convoy child {member_id} has a dangling track")
+        member_ids.append(member_id)
+    if len(set(member_ids)) != len(member_ids):
+        raise GateError(f"implementation convoy must have unique child ids: {member_ids}")
+
+    progress = payload.get("progress")
+    if not isinstance(progress, Mapping):
+        raise GateError(f"implementation convoy {convoy_id} omitted progress")
+    if progress.get("dangling_tracks", 0) != 0:
+        raise GateError(f"implementation convoy {convoy_id} has dangling tracks")
+    if progress.get("total") != len(member_ids):
+        raise GateError(
+            f"implementation convoy progress.total must equal child count {len(member_ids)}: "
+            f"{progress.get('total')!r}"
+        )
+    if progress.get("closed") != len(member_ids):
+        raise GateError(
+            f"implementation convoy progress.closed must equal child count {len(member_ids)}: "
+            f"{progress.get('closed')!r}"
+        )
+    return member_ids
+
+
+def build_basic_implementation_members(
+    root_bead: Mapping[str, Any],
+    beads: Sequence[Mapping[str, Any]],
+    expected_member_ids: Sequence[str],
+) -> list[tuple[str, str]]:
+    expected_ids = [str(member_id).strip() for member_id in expected_member_ids]
+    if any(not member_id for member_id in expected_ids) or len(set(expected_ids)) != len(expected_ids):
+        raise GateError(f"implementation convoy child ids must be non-empty and unique: {expected_ids}")
+    root_id = str(root_bead.get("id") or "").strip()
+    convoy_id = metadata_value(root_bead, "gc.build.implementation_convoy_id").strip()
+    if not root_id or not convoy_id:
+        raise GateError("build-basic root requires id and gc.build.implementation_convoy_id")
+
+    drains = [
+        bead
+        for bead in beads
+        if metadata_value(bead, "gc.root_bead_id") == root_id
+        and metadata_value(bead, "gc.kind") == "drain"
+        and metadata_value(bead, "gc.drain_parent_convoy_id") == convoy_id
+    ]
+    if len(drains) != 1:
+        raise GateError(
+            f"build-basic root {root_id} requires exactly one drain manifest for implementation convoy "
+            f"{convoy_id}; observed {len(drains)}"
+        )
+    drain = drains[0]
+    if str(drain.get("status") or "") != "closed" or metadata_value(drain, "gc.outcome") != "pass":
+        raise GateError(f"implementation drain {drain.get('id', '<unknown>')} must be closed/pass")
+    if metadata_value(drain, "gc.drain_state") != "succeeded":
+        raise GateError("implementation drain must record gc.drain_state=succeeded")
+
+    rows = drain_manifest_rows(drain)
+    if not rows:
+        raise GateError("implementation drain must have a valid non-empty gc.drain_manifest.v1")
+    raw_count = metadata_value(drain, "gc.drain_count")
+    try:
+        drain_count = int(raw_count)
+    except ValueError as exc:
+        raise GateError(f"implementation drain has invalid gc.drain_count={raw_count!r}") from exc
+    if drain_count != len(rows) or drain_count != len(expected_ids):
+        raise GateError(
+            f"implementation drain gc.drain_count must match manifest and convoy: "
+            f"count={drain_count} rows={len(rows)} convoy={len(expected_ids)}"
+        )
+
+    members: list[tuple[str, str]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise GateError(f"implementation drain manifest row {index} must be an object")
+        member_id = str(row.get("member_id") or "").strip()
+        if not member_id:
+            raise GateError(f"implementation drain manifest row {index} is missing member_id")
+        if str(row.get("status") or "") != "succeeded":
+            raise GateError(f"implementation drain manifest row {index} must have status=succeeded")
+        if str(row.get("outcome_kind") or "") != "pass":
+            raise GateError(f"implementation drain manifest row {index} must have outcome_kind=pass")
+        root_ids = {
+            str(row.get(key) or "").strip()
+            for key in ("item_root_id", "outcome_bead_id")
+            if str(row.get(key) or "").strip()
+        }
+        if len(root_ids) != 1:
+            raise GateError(
+                f"implementation drain manifest row {index} must identify one consistent workflow root"
+            )
+        members.append((member_id, root_ids.pop()))
+
+    manifest_ids = [member_id for member_id, _ in members]
+    if len(set(manifest_ids)) != len(manifest_ids):
+        raise GateError(f"implementation drain manifest member ids must be unique: {manifest_ids}")
+    if set(manifest_ids) != set(expected_ids):
+        raise GateError(
+            f"implementation convoy children do not match drain manifest members: "
+            f"convoy={expected_ids} manifest={manifest_ids}"
+        )
+    by_id = {member_id: workflow_id for member_id, workflow_id in members}
+    return [(member_id, by_id[member_id]) for member_id in expected_ids]
+
+
+def authoritative_member_worktree(
+    member: Mapping[str, Any],
+    member_id: str,
+    rig_dir: Path,
+    launcher_common_dir: Path,
 ) -> Path:
-    candidates = build_result_candidates(rig_dir, beads)
-    failures: list[str] = []
-    for candidate in candidates:
-        slugger = candidate / "slugger.py"
-        tests = candidate / "tests" / "test_slugger.py"
-        if not slugger.is_file():
-            failures.append(f"{candidate}: missing slugger.py")
-            continue
-        if not tests.is_file():
-            failures.append(f"{candidate}: missing tests/test_slugger.py")
-            continue
+    worktree = required_member_path(member, member_id, "work_dir")
+    if not worktree.is_dir():
+        raise GateError(f"implementation member {member_id} work_dir is not a directory: {worktree}")
+    if worktree == rig_dir:
+        raise GateError(f"implementation member {member_id} work_dir must differ from launcher rig: {worktree}")
+    try:
+        worktree.relative_to(rig_dir)
+    except ValueError as exc:
+        raise GateError(
+            f"implementation member {member_id} worktree must stay inside launcher rig: {worktree}"
+        ) from exc
 
-        source = slugger.read_text(encoding="utf-8", errors="replace")
-        if "NotImplementedError" in source:
-            failures.append(f"{candidate}: slugger.py still contains NotImplementedError")
+    for key in (
+        "gc.implementation.work_dir",
+        "gc.implementation.worktree_path",
+        "gc.build.implementation_worktree_path",
+    ):
+        explicit = metadata_value(member, key).strip()
+        if not explicit:
             continue
+        if not Path(explicit).is_absolute() or Path(explicit).resolve() != worktree:
+            raise GateError(
+                f"implementation member {member_id} explicit {key} does not agree with authoritative work_dir: "
+                f"{explicit!r} != {worktree}"
+            )
 
+    repository_root = git_output(worktree, "rev-parse", "--show-toplevel", context=f"member {member_id} worktree")
+    if Path(repository_root.strip()).resolve() != worktree:
+        raise GateError(
+            f"implementation member {member_id} work_dir is not the root of its git worktree: "
+            f"{worktree} != {repository_root.strip()}"
+        )
+    worktree_common_dir = git_common_dir(worktree, context=f"implementation member {member_id}")
+    if worktree_common_dir != launcher_common_dir:
+        raise GateError(
+            f"implementation member {member_id} worktree is not linked to launcher repository: "
+            f"worktree={worktree_common_dir} launcher={launcher_common_dir}"
+        )
+    expected_suffix = Path("worktrees") / member_id
+    if worktree.parent.name != "worktrees" or worktree.name != member_id:
+        raise GateError(
+            f"implementation member {member_id} worktree must end with runtime-issued path {expected_suffix}: "
+            f"observed={worktree}"
+        )
+    return worktree
+
+
+def required_member_path(member: Mapping[str, Any], member_id: str, key: str) -> Path:
+    raw = metadata_value(member, key).strip()
+    if not raw:
+        raise GateError(f"implementation member {member_id} is missing {key}")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise GateError(f"implementation member {member_id} {key} must be absolute: {raw!r}")
+    try:
+        return path.resolve(strict=True)
+    except OSError as exc:
+        raise GateError(f"implementation member {member_id} {key} cannot be resolved: {raw!r}") from exc
+
+
+def resolved_member_commit(member: Mapping[str, Any], member_id: str, worktree: Path) -> str:
+    recorded = metadata_value(member, "gc.implementation.commit").strip()
+    if not recorded:
+        raise GateError(f"implementation member {member_id} is missing gc.implementation.commit")
+    if re.fullmatch(r"[0-9a-fA-F]{7,64}", recorded) is None:
+        raise GateError(
+            f"implementation member {member_id} gc.implementation.commit must be a hexadecimal commit id: "
+            f"{recorded!r}"
+        )
+    resolved = git_output(
+        worktree,
+        "rev-parse",
+        "--verify",
+        f"{recorded}^{{commit}}",
+        context=f"member {member_id} recorded gc.implementation.commit {recorded}",
+    ).strip()
+    head = git_output(worktree, "rev-parse", "HEAD", context=f"member {member_id} HEAD").strip()
+    if resolved != head:
+        raise GateError(
+            f"implementation member {member_id} gc.implementation.commit does not match worktree HEAD: "
+            f"recorded={recorded} resolved={resolved} HEAD={head}"
+        )
+    return resolved
+
+
+def launcher_baseline_tests(rig_dir: Path, launcher_commit: str) -> bytes:
+    current_head = git_output(rig_dir, "rev-parse", "HEAD", context="launcher HEAD").strip()
+    if current_head != launcher_commit:
+        raise GateError(
+            f"launcher HEAD changed after launch: expected={launcher_commit} observed={current_head}"
+        )
+    relative_path = "tests/test_slugger.py"
+    baseline = git_output_bytes(
+        rig_dir,
+        "show",
+        f"{launcher_commit}:{relative_path}",
+        context=f"launcher baseline {relative_path}",
+    )
+    test_path = rig_dir / relative_path
+    if not test_path.is_file() or test_path.read_bytes() != baseline:
+        raise GateError(f"launcher baseline {relative_path} bytes differ from launcher HEAD {launcher_commit}")
+    return baseline
+
+
+def validate_committed_product_bytes(
+    member_id: str,
+    worktree: Path,
+    commit: str,
+    *,
+    baseline_tests: bytes,
+) -> dict[str, bytes]:
+    committed_products: dict[str, bytes] = {}
+    for relative_path in BUILD_BASIC_PRODUCT_PATHS:
+        product_path = worktree / relative_path
+        if not product_path.is_file():
+            raise GateError(f"implementation member {member_id} is missing {relative_path} in {worktree}")
+        committed = git_output_bytes(
+            worktree,
+            "show",
+            f"{commit}:{relative_path}",
+            context=f"member {member_id} committed {relative_path}",
+        )
+        if product_path.read_bytes() != committed:
+            raise GateError(
+                f"implementation member {member_id} {relative_path} bytes differ from recorded commit {commit}"
+            )
+        if relative_path == "tests/test_slugger.py" and committed != baseline_tests:
+            raise GateError(
+                f"implementation member {member_id} committed tests/test_slugger.py differs from launcher baseline"
+            )
+        committed_products[relative_path] = committed
+    return committed_products
+
+
+def validate_committed_pytest(
+    member_id: str,
+    committed_products: Mapping[str, bytes],
+    commit: str,
+    *,
+    env: Mapping[str, str],
+    timeout: float,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"gascity-build-proof-{member_id}-") as raw_fixture:
+        fixture = Path(raw_fixture)
+        for relative_path, contents in committed_products.items():
+            target = fixture / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(contents)
+        proof_env = dict(env)
+        proof_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proof_env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
         try:
             run_checked(
-                [sys.executable, "-m", "pytest", "-q"],
-                cwd=candidate,
-                env=env,
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "-c",
+                    os.devnull,
+                    f"--rootdir={fixture}",
+                    f"--confcutdir={fixture}",
+                    "-p",
+                    "no:cacheprovider",
+                ],
+                cwd=fixture,
+                env=proof_env,
                 timeout=timeout,
                 log_output=True,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            failures.append(f"{candidate}: pytest failed: {exc}")
-            continue
-        print(f"validated build-basic code result: {candidate}", flush=True)
-        return candidate
+            raise GateError(f"implementation member {member_id} pytest failed at recorded commit {commit}: {exc}") from exc
 
-    detail = "\n".join(f"- {failure}" for failure in failures) if failures else "no candidate directories found"
-    raise GateError(f"build-basic did not produce a passing code result:\n{detail}")
+
+def member_summary_path(member: Mapping[str, Any], member_id: str, worktree: Path) -> Path:
+    summary_path = required_member_path(member, member_id, "gc.implementation.summary_path")
+    if not summary_path.is_file():
+        raise GateError(f"implementation member {member_id} summary is not a file: {summary_path}")
+    try:
+        summary_path.relative_to(worktree)
+    except ValueError as exc:
+        raise GateError(
+            f"implementation member {member_id} summary must be inside its authoritative worktree: "
+            f"summary={summary_path} worktree={worktree}"
+        ) from exc
+    return summary_path
+
+
+def git_output(worktree: Path, *args: str, context: str) -> str:
+    return git_output_bytes(worktree, *args, context=context).decode("utf-8", errors="strict")
+
+
+def git_common_dir(worktree: Path, *, context: str) -> Path:
+    raw = git_output(
+        worktree,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+        context=f"{context} git common dir",
+    ).strip()
+    return Path(raw).resolve(strict=True)
+
+
+def git_output_bytes(worktree: Path, *args: str, context: str) -> bytes:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=worktree,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise GateError(f"git failed while validating {context}: {detail or f'exit {result.returncode}'}")
+    return result.stdout
+
+
+def validate_build_artifact_schema(
+    artifact_path: Path,
+    *,
+    schema: str,
+    validator_source: Path,
+    env: Mapping[str, str],
+    context: str,
+) -> None:
+    validator = validator_source / "assets" / "scripts" / "validate_build_artifact.py"
+    if not validator.is_file():
+        raise GateError(f"build artifact validator was not found: {validator}")
+    try:
+        run_checked(
+            [sys.executable, str(validator), "--schema", schema, "--path", str(artifact_path)],
+            env=env,
+            timeout=parse_duration("1m"),
+            log_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise GateError(f"{context} failed validation for schema {schema} at {artifact_path}: {exc}") from exc
+
+
+def validate_canonical_implementation_summary(
+    root_bead: Mapping[str, Any],
+    members: Sequence[tuple[str, str, Path, Path]],
+    *,
+    rig_dir: Path,
+) -> None:
+    root_id = str(root_bead.get("id") or "<unknown>")
+    raw_path = metadata_value(root_bead, "gc.build.implementation_summary_path").strip()
+    if not raw_path:
+        raise GateError(f"build-basic root {root_id} is missing gc.build.implementation_summary_path")
+    summary_path = resolve_artifact_path(raw_path, base=rig_dir).resolve()
+    if not summary_path.is_file():
+        raise GateError(f"canonical implementation summary is missing: {summary_path}")
+    upstream = build_artifact_upstream(summary_path)
+
+    for member_id, _, _, member_summary in members:
+        exact_path = str(member_summary)
+        matching = [entry for entry in upstream if entry.get("path") == exact_path]
+        if len(matching) != 1:
+            observed_paths = [str(entry.get("path") or "") for entry in upstream]
+            raise GateError(
+                f"implementation member {member_id} canonical implementation summary must trace "
+                f"its summary at the exact path {exact_path}; observed={observed_paths}"
+            )
+        expected_digest = f"sha256:{hashlib.sha256(member_summary.read_bytes()).hexdigest()}"
+        observed_digest = str(matching[0].get("hash") or "")
+        if observed_digest != expected_digest:
+            raise GateError(
+                f"implementation member {member_id} canonical implementation summary digest mismatch: "
+                f"path={exact_path} expected={expected_digest} observed={observed_digest!r}"
+            )
+
+
+def validate_member_implementation_summary(
+    summary_path: Path,
+    *,
+    member_id: str,
+    workflow_root_id: str,
+) -> None:
+    front_matter = artifact_front_matter(
+        summary_path,
+        label=f"implementation member {member_id} summary",
+    )
+    workflow = front_matter.get("workflow")
+    observed_workflow_id = workflow.get("id") if isinstance(workflow, Mapping) else None
+    if observed_workflow_id != workflow_root_id:
+        raise GateError(
+            f"implementation member {member_id} summary workflow.id must equal {workflow_root_id}; "
+            f"observed={observed_workflow_id!r}"
+        )
+
+    upstream = artifact_upstream(
+        front_matter,
+        artifact_path=summary_path,
+        label=f"implementation member {member_id} summary",
+    )
+    expected_path = f"beads/{member_id}"
+    expected_hash = f"bead:{member_id}"
+    identity_entries = [
+        entry
+        for entry in upstream
+        if entry.get("path") == expected_path or entry.get("hash") == expected_hash
+    ]
+    identity = identity_entries[0] if len(identity_entries) == 1 else None
+    if identity is None or (identity.get("path"), identity.get("hash")) != (expected_path, expected_hash):
+        observed = [(entry.get("path"), entry.get("hash")) for entry in upstream]
+        raise GateError(
+            f"implementation member {member_id} summary must trace exactly one identity entry with "
+            f"path {expected_path} and hash {expected_hash}; observed={observed}"
+        )
+
+
+def build_artifact_upstream(artifact_path: Path) -> list[Mapping[str, Any]]:
+    return artifact_upstream(
+        artifact_front_matter(artifact_path, label="build artifact"),
+        artifact_path=artifact_path,
+        label="build artifact",
+    )
+
+
+def artifact_upstream(
+    front_matter: Mapping[str, Any],
+    *,
+    artifact_path: Path,
+    label: str,
+) -> list[Mapping[str, Any]]:
+    trace = front_matter.get("trace")
+    upstream = trace.get("upstream") if isinstance(trace, Mapping) else None
+    if not isinstance(upstream, list):
+        raise GateError(f"{label} trace.upstream is missing at {artifact_path}")
+    return [entry for entry in upstream if isinstance(entry, Mapping)]
 
 
 def validate_build_basic_artifacts(
@@ -2050,10 +2668,6 @@ def validate_build_basic_artifacts(
     env: Mapping[str, str],
     validator_source: Path,
 ) -> None:
-    validator = validator_source / "assets" / "scripts" / "validate_build_artifact.py"
-    if not validator.is_file():
-        raise GateError(f"build artifact validator was not found: {validator}")
-
     for metadata_key, schema in BUILD_BASIC_ARTIFACT_CONTRACTS:
         raw_path = metadata_value(root_bead, metadata_key)
         if not raw_path:
@@ -2061,18 +2675,13 @@ def validate_build_basic_artifacts(
         artifact_path = resolve_artifact_path(raw_path, base=rig_dir)
         if not artifact_path.is_file():
             raise GateError(f"build-basic artifact from {metadata_key} does not exist: {artifact_path}")
-        try:
-            run_checked(
-                [sys.executable, str(validator), "--schema", schema, "--path", str(artifact_path)],
-                env=env,
-                timeout=parse_duration("1m"),
-                log_output=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            raise GateError(
-                f"build-basic artifact failed validation for {metadata_key} "
-                f"(schema {schema}) at {artifact_path}: {exc}"
-            ) from exc
+        validate_build_artifact_schema(
+            artifact_path,
+            schema=schema,
+            validator_source=validator_source,
+            env=env,
+            context=f"build-basic artifact from {metadata_key}",
+        )
         print(f"validated build-basic artifact: {metadata_key} schema={schema} path={artifact_path}", flush=True)
 
 
@@ -2081,36 +2690,6 @@ def resolve_artifact_path(value: str, *, base: Path) -> Path:
     if path.is_absolute():
         return path
     return (base / path).resolve()
-
-
-def build_result_candidates(rig_dir: Path, beads: Sequence[Mapping[str, Any]]) -> list[Path]:
-    candidates: list[Path] = []
-    for bead in beads:
-        metadata = bead.get("metadata")
-        if not isinstance(metadata, dict):
-            continue
-        for key in ("work_dir", "gc.build.work_dir", "gc.implementation.work_dir"):
-            value = metadata.get(key)
-            if isinstance(value, str) and value.strip():
-                candidates.append(Path(value.strip()))
-    worktrees_dir = rig_dir / "worktrees"
-    if worktrees_dir.is_dir():
-        candidates.extend(sorted(path for path in worktrees_dir.iterdir() if path.is_dir()))
-
-    unique: list[Path] = []
-    seen: set[Path] = set()
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            continue
-        if resolved == rig_dir.resolve():
-            continue
-        if resolved in seen or not resolved.is_dir():
-            continue
-        unique.append(resolved)
-        seen.add(resolved)
-    return unique
 
 
 def bead_route_targets(bead: Mapping[str, Any]) -> list[str]:
@@ -2793,6 +3372,12 @@ def run_build_gate(
     timeout: float,
     poll_interval: float,
 ) -> None:
+    launcher_commit = git_output(
+        workspace.rig_dir,
+        "rev-parse",
+        "HEAD",
+        context="pre-launch launcher HEAD",
+    ).strip()
     root_id = launch_build_formula(gc_bin, workspace, env=env, pack_spec=pack_spec)
     root_bead = wait_for_workflow_pass(
         gc_bin,
@@ -2802,12 +3387,17 @@ def run_build_gate(
         timeout=timeout,
         poll_interval=poll_interval,
     )
+    expected_member_ids = implementation_convoy_member_ids(gc_bin, workspace, root_bead, env=env)
     validate_build_basic_artifacts(root_bead, rig_dir=workspace.rig_dir, env=env, validator_source=pack_spec.validator_source)
     validate_build_basic_result(
         workspace.rig_dir,
         list_beads(gc_bin, workspace, env=env),
+        root_bead=root_bead,
+        expected_member_ids=expected_member_ids,
+        launcher_commit=launcher_commit,
         env=env,
         timeout=parse_duration("2m"),
+        validator_source=pack_spec.validator_source,
     )
     validate_required_routes(
         list_beads(gc_bin, workspace, env=env),

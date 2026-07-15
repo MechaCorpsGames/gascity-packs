@@ -130,6 +130,40 @@ def gate_workspace(root: Path) -> gascity_pack_inference_gate.GateWorkspace:
     return workspace
 
 
+def closed_bead(
+    bead_id: str,
+    *,
+    root: str = "",
+    kind: str = "",
+    outcome: str = "pass",
+    metadata: dict | None = None,
+) -> dict:
+    values = dict(metadata or {})
+    values.update({key: value for key, value in (("gc.root_bead_id", root), ("gc.kind", kind)) if value})
+    values["gc.outcome"] = outcome
+    return {"id": bead_id, "status": "closed", "metadata": values}
+
+
+def lineage_drain(bead_id: str, root_id: str, nested_id: str, *, root_key: str = "item_root_id") -> dict:
+    manifest = {
+        "version": 1,
+        "rows": [
+            {
+                "member_id": f"{nested_id}-member",
+                root_key: nested_id,
+                "status": "succeeded",
+                "outcome_kind": "pass",
+            }
+        ],
+    }
+    return closed_bead(
+        bead_id,
+        root=root_id,
+        kind="drain",
+        metadata={"gc.drain_state": "succeeded", "gc.drain_manifest.v1": json.dumps(manifest)},
+    )
+
+
 def test_write_gate_workspace_uses_city_and_rig_scope_imports(tmp_path) -> None:
     pack_source = tmp_path / "repo" / "gascity"
     roles_source = pack_source / "roles"
@@ -1023,7 +1057,7 @@ case "$*" in
     printf '[{"id":"fi-root","title":"root","status":"closed","metadata":{"gc.outcome":"pass"}}]\n'
     ;;
   *"bd list --all --json --limit 1000"*) # gc-bd-argv-tail: fake gc receives the wrapper's argv tail
-    printf '[{"id":"fi-review","title":"Review implementation","status":"closed","metadata":{"gc.root_bead_id":"fi-root","gc.kind":"ralph","gc.outcome":"fail","gc.step_ref":"build.review"}}]\n'
+    printf '[{"id":"fi-review","title":"Review implementation","status":"closed","metadata":{"gc.root_bead_id":"fi-root","gc.kind":"ralph","gc.outcome":"fail","gc.step_ref":"build.review"}},{"id":"fi-finalize","status":"closed","metadata":{"gc.root_bead_id":"fi-root","gc.kind":"workflow-finalize","gc.outcome":"pass"}}]\n'
     ;;
   *)
     printf '{}\n'
@@ -1046,6 +1080,164 @@ esac
             timeout=5,
             poll_interval=0,
         )
+
+
+def test_wait_for_workflow_pass_rejects_failed_nested_implementation_control(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    root = closed_bead(
+        "fi-root",
+        kind="workflow",
+        metadata={"gc.build.implementation_convoy_id": "fi-implementation"},
+    )
+    beads = complete_nested_workflow_lineage()
+    beads.extend(
+        [
+            lineage_drain(
+                "fi-nested-drain",
+                "fi-nested",
+                "fi-leaf-workflow",
+                root_key="outcome_bead_id",
+            ),
+            closed_bead("fi-leaf-workflow", kind="workflow"),
+            closed_bead(
+                "fi-member-implement",
+                root="fi-leaf-workflow",
+                kind="ralph",
+                outcome="fail",
+                metadata={"gc.step_ref": "do-work.implement"},
+            ),
+            closed_bead("fi-member-finalize", root="fi-leaf-workflow", kind="workflow-finalize"),
+        ]
+    )
+    monkeypatch.setattr(gascity_pack_inference_gate, "show_bead", lambda *args, **kwargs: root)
+    monkeypatch.setattr(gascity_pack_inference_gate, "list_beads", lambda *args, **kwargs: beads)
+    monkeypatch.setattr(gascity_pack_inference_gate, "collect_diagnostics", lambda *args, **kwargs: "diagnostics")
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="logical workflow control failed.*fi-member-implement.*do-work.implement",
+    ):
+        gascity_pack_inference_gate.wait_for_workflow_pass(
+            "gc",
+            workspace,
+            "fi-root",
+            env={},
+            timeout=5,
+            poll_interval=0,
+        )
+
+
+def complete_nested_workflow_lineage() -> list[dict]:
+    return [
+        closed_bead("fi-root-finalize", root="fi-root", kind="workflow-finalize"),
+        lineage_drain("fi-root-drain", "fi-root", "fi-nested"),
+        closed_bead("fi-nested", kind="workflow"),
+        closed_bead("fi-nested-control", root="fi-nested", kind="ralph"),
+        closed_bead("fi-nested-finalize", root="fi-nested", kind="workflow-finalize"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        ("missing-root", r"fi-nested.*exactly one"),
+        ("duplicate-root", r"fi-nested.*exactly one"),
+        ("open-root", r"fi-nested.*closed/pass"),
+        ("failed-root", r"fi-nested.*closed/pass"),
+        ("stale-root", r"fi-nested.*stale failure"),
+        ("missing-finalizer", r"fi-nested.*workflow-finalize"),
+        ("open-control", r"fi-nested-control.*closed/pass"),
+        ("unset-control-outcome", r"fi-nested-control.*closed/pass"),
+        ("failed-control", r"fi-nested-control.*closed/pass"),
+        ("stale-control", r"fi-nested-control.*stale failure"),
+    ),
+)
+def test_validate_workflow_lineage_rejects_incomplete_nested_state(case, expected) -> None:
+    beads = complete_nested_workflow_lineage()
+    nested = next(bead for bead in beads if bead["id"] == "fi-nested")
+    control = next(bead for bead in beads if bead["id"] == "fi-nested-control")
+    if case == "missing-root":
+        beads.remove(nested)
+    elif case == "duplicate-root":
+        beads.append(dict(nested))
+    elif case == "open-root":
+        nested["status"] = "open"
+    elif case == "failed-root":
+        nested["metadata"]["gc.outcome"] = "fail"
+    elif case == "stale-root":
+        nested["metadata"]["gc.failure_class"] = "old failure"
+    elif case == "missing-finalizer":
+        beads[:] = [bead for bead in beads if bead["id"] != "fi-nested-finalize"]
+    elif case == "open-control":
+        control["status"] = "open"
+    elif case == "unset-control-outcome":
+        del control["metadata"]["gc.outcome"]
+    elif case == "failed-control":
+        control["metadata"]["gc.outcome"] = "fail"
+    else:
+        control["metadata"]["gc.blocked_reason"] = "old blocker"
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=expected):
+        gascity_pack_inference_gate.validate_workflow_lineage(beads, "fi-root")
+
+
+def test_validate_workflow_lineage_ignores_unrelated_incomplete_workflow() -> None:
+    beads = complete_nested_workflow_lineage()
+    beads.extend(
+        [
+            closed_bead("fi-unrelated", kind="workflow", outcome="fail"),
+            closed_bead("fi-unrelated-control", root="fi-unrelated", kind="ralph", outcome="fail"),
+        ]
+    )
+
+    gascity_pack_inference_gate.validate_workflow_lineage(beads, "fi-root")
+
+
+@pytest.mark.parametrize(
+    "row",
+    (42, {"member_id": "fi-member"}),
+    ids=("non-mapping", "missing-workflow-root"),
+)
+def test_validate_workflow_lineage_rejects_malformed_manifest_rows(row) -> None:
+    beads = complete_nested_workflow_lineage()
+    drain = next(bead for bead in beads if bead["id"] == "fi-root-drain")
+    drain["metadata"]["gc.drain_manifest.v1"] = json.dumps({"version": 1, "rows": [row]})
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"fi-root-drain.*manifest row 0.*item_root_id.*outcome_bead_id",
+    ):
+        gascity_pack_inference_gate.validate_workflow_lineage(beads, "fi-root")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        ("missing-manifest", r"fi-root-drain.*manifest"),
+        ("failed-state", r"fi-root-drain.*drain_state=succeeded"),
+        ("failed-row", r"fi-root-drain.*manifest row 0.*status=succeeded"),
+        ("failed-outcome", r"fi-root-drain.*manifest row 0.*outcome_kind=pass"),
+    ),
+)
+def test_validate_workflow_lineage_rejects_incomplete_drain_evidence(case, expected) -> None:
+    beads = complete_nested_workflow_lineage()
+    drain = next(bead for bead in beads if bead["id"] == "fi-root-drain")
+    manifest = json.loads(drain["metadata"]["gc.drain_manifest.v1"])
+    if case == "missing-manifest":
+        del drain["metadata"]["gc.drain_manifest.v1"]
+    elif case == "failed-state":
+        drain["metadata"]["gc.drain_state"] = "failed"
+    elif case == "failed-row":
+        manifest["rows"][0]["status"] = "failed"
+    else:
+        manifest["rows"][0]["outcome_kind"] = "fail"
+    if case not in ("missing-manifest", "failed-state"):
+        drain["metadata"]["gc.drain_manifest.v1"] = json.dumps(manifest)
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=expected):
+        gascity_pack_inference_gate.validate_workflow_lineage(beads, "fi-root")
 
 
 def test_wait_for_workflow_pass_waits_for_non_attempt_finalizer(tmp_path, monkeypatch) -> None:
@@ -1168,25 +1360,6 @@ def test_wait_for_workflow_pass_rejects_stale_root_failure_marker(tmp_path, monk
             timeout=5,
             poll_interval=0,
         )
-
-
-def test_failed_logical_controls_ignore_attempt_beads() -> None:
-    beads = [
-        {
-            "id": "fi-attempt",
-            "title": "Review implementation",
-            "status": "closed",
-            "metadata": {
-                "gc.root_bead_id": "fi-root",
-                "gc.kind": "ralph",
-                "gc.attempt": "1",
-                "gc.logical_bead_id": "fi-review",
-                "gc.outcome": "fail",
-            },
-        }
-    ]
-
-    assert gascity_pack_inference_gate.failed_logical_controls(beads, "fi-root") == []
 
 
 def test_validate_review_report_requires_blocking_base_gascity_report(tmp_path) -> None:
@@ -1779,57 +1952,567 @@ def test_build_basic_work_item_targets_code_and_pytest() -> None:
     assert "Do not change tests" in text
 
 
-def test_validate_build_basic_result_accepts_worktree_with_passing_tests(tmp_path) -> None:
-    rig_dir = tmp_path / "fixture"
-    worktree = rig_dir / "worktrees" / "fi-source"
-    gascity_pack_inference_gate.write_build_basic_fixture(rig_dir)
-    gascity_pack_inference_gate.write_build_basic_fixture(worktree)
-    (worktree / "slugger.py").write_text(
-        """\
+def valid_convoy_status_payload() -> dict:
+    return {
+        "schema_version": "1",
+        "convoy": {"id": "fi-implementation", "status": "closed"},
+        "progress": {"closed": 2, "total": 2},
+        "children": [
+            {"id": "fi-one", "status": "closed", "type": "task"},
+            {"id": "fi-two", "status": "closed", "type": "task"},
+        ],
+    }
+
+
+def test_implementation_convoy_member_ids_queries_exact_root_convoy(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    fake_gc = tmp_path / "gc"
+    args_path = tmp_path / "gc-args.txt"
+    payload = json.dumps(valid_convoy_status_payload(), separators=(",", ":"))
+    fake_gc.write_text(
+        f"""#!/bin/sh
+printf '%s\n' "$*" > {shlex.quote(str(args_path))}
+printf '%s\n' {shlex.quote(payload)}
+""",
+        encoding="utf-8",
+    )
+    fake_gc.chmod(0o755)
+    root = closed_bead(
+        "fi-root",
+        kind="workflow",
+        metadata={"gc.build.implementation_convoy_id": "fi-implementation"},
+    )
+
+    member_ids = gascity_pack_inference_gate.implementation_convoy_member_ids(
+        str(fake_gc), workspace, root, env={}
+    )
+
+    assert member_ids == ["fi-one", "fi-two"]
+    assert "convoy status fi-implementation --json" in args_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        ("wrong-convoy", "different convoy"),
+        ("open-convoy", "status=closed"),
+        ("duplicate-child", "unique child ids"),
+        ("malformed-child", "non-empty id"),
+        ("open-child", "child fi-one.*closed"),
+        ("dangling-child", "dangling"),
+        ("dangling-progress", "dangling"),
+        ("wrong-total", "progress.total"),
+        ("wrong-closed", "progress.closed"),
+    ),
+)
+def test_convoy_status_member_ids_rejects_inconsistent_payload(case, expected) -> None:
+    payload = json.loads(json.dumps(valid_convoy_status_payload()))
+    if case == "wrong-convoy":
+        payload["convoy"]["id"] = "fi-other"
+    elif case == "open-convoy":
+        payload["convoy"]["status"] = "open"
+    elif case == "duplicate-child":
+        payload["children"][1]["id"] = "fi-one"
+    elif case == "malformed-child":
+        del payload["children"][1]["id"]
+    elif case == "open-child":
+        payload["children"][0]["status"] = "open"
+    elif case == "dangling-child":
+        payload["children"][0]["dangling_track"] = True
+    elif case == "dangling-progress":
+        payload["progress"]["dangling_tracks"] = 1
+    elif case == "wrong-total":
+        payload["progress"]["total"] = 3
+    else:
+        payload["progress"]["closed"] = 1
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=expected):
+        gascity_pack_inference_gate.convoy_status_member_ids(payload, "fi-implementation")
+
+
+def implementation_summary_text(workflow_id: str, upstream: list[dict[str, str]] | None = None) -> str:
+    front_matter = {
+        "schema": "gc.build.implementation-summary.v1",
+        "workflow": {"id": workflow_id, "formula": "do-work"},
+        "methodology": {"pack": "gascity", "name": "build-basic"},
+        "producer": {"formula": "do-work", "stage": "implement", "attempt": 1},
+        "status": "approved",
+        "trace": {"upstream": upstream or [], "coverage": []},
+    }
+    body = "\n".join(
+        f"## {heading}\n\nCovered.\n"
+        for heading in ("Summary", "Intended Behavior", "Changed Files", "Verification", "Remaining Risks")
+    )
+    return f"---\n{yaml.safe_dump(front_matter, sort_keys=False)}---\n\n{body}"
+
+
+PASSING_SLUGGER = """\
 import re
 
 
 def slugify(value: str) -> str:
-    parts = re.findall(r"[a-z0-9]+", value.lower())
-    return "-".join(parts)
-""",
+    return "-".join(re.findall(r"[a-z0-9]+", value.lower()))
+"""
+WRONG_SLUGGER = "def slugify(value: str) -> str:\n    return 'wrong'\n"
+
+
+def set_member_provenance(bead: dict, *, worktree: Path, summary: Path, commit: str) -> None:
+    bead["metadata"].update(
+        {
+            "work_dir": str(worktree),
+            "gc.implementation.work_dir": str(worktree),
+            "gc.implementation.worktree_path": str(worktree),
+            "gc.build.implementation_worktree_path": str(worktree),
+            "gc.implementation.commit": commit,
+            "gc.implementation.summary_path": str(summary),
+        }
+    )
+
+
+def build_basic_result_fixture(tmp_path: Path, *, implemented: bool = True) -> dict:
+    rig_dir = tmp_path / "fixture"
+    gascity_pack_inference_gate.write_build_basic_fixture(rig_dir)
+    gascity_pack_inference_gate.initialize_rig_git(rig_dir, env=os.environ)
+    launcher_commit = run_git(rig_dir, "rev-parse", "HEAD")
+
+    member_records: dict[str, dict] = {}
+    member_beads: list[dict] = []
+    for member_id in ("fi-one", "fi-two"):
+        worktree = rig_dir / "worktrees" / member_id
+        run_git(rig_dir, "worktree", "add", "-q", "--detach", str(worktree), "HEAD")
+        if implemented:
+            (worktree / "slugger.py").write_text(PASSING_SLUGGER, encoding="utf-8")
+        summary = worktree / "implementation-summary.md"
+        summary.write_text(
+            implementation_summary_text(
+                f"{member_id}-workflow",
+                [{"path": f"beads/{member_id}", "hash": f"bead:{member_id}"}],
+            ),
+            encoding="utf-8",
+        )
+        run_git(worktree, "add", "slugger.py", "implementation-summary.md")
+        run_git(worktree, "commit", "-q", "-m", f"implement {member_id}")
+        commit = run_git(worktree, "rev-parse", "HEAD")
+        bead = closed_bead(member_id)
+        set_member_provenance(bead, worktree=worktree, summary=summary, commit=commit[:7])
+        member_records[member_id] = {
+            "bead": bead,
+            "worktree": worktree,
+            "summary": summary,
+            "commit": commit,
+        }
+        member_beads.append(bead)
+
+    drain_manifest = json.dumps(
+        {
+            "version": 1,
+            "rows": [
+                {
+                    "member_id": member_id,
+                    "item_root_id": f"{member_id}-workflow",
+                    "outcome_bead_id": f"{member_id}-workflow",
+                    "status": "succeeded",
+                    "outcome_kind": "pass",
+                }
+                for member_id in member_records
+            ],
+        }
+    )
+    root_summary = rig_dir / ".gc" / "inference-gate" / "build-basic" / "implementation-summary.md"
+    root_summary.parent.mkdir(parents=True)
+    root_summary.write_text(
+        implementation_summary_text(
+            "fi-root",
+            [
+                {
+                    "path": str(record["summary"]),
+                    "hash": f"sha256:{hashlib.sha256(record['summary'].read_bytes()).hexdigest()}",
+                }
+                for record in member_records.values()
+            ],
+        ),
         encoding="utf-8",
     )
+    root = closed_bead(
+        "fi-root",
+        kind="workflow",
+        metadata={
+            "gc.build.implementation_convoy_id": "fi-implementation",
+            "gc.build.implementation_summary_path": str(root_summary),
+        },
+    )
+    drain = closed_bead(
+        "fi-drain",
+        root="fi-root",
+        kind="drain",
+        metadata={
+            "gc.drain_parent_convoy_id": "fi-implementation",
+            "gc.drain_count": str(len(member_records)),
+            "gc.drain_state": "succeeded",
+            "gc.drain_manifest.v1": drain_manifest,
+        },
+    )
+    return {
+        "rig_dir": rig_dir,
+        "launcher_commit": launcher_commit,
+        "root": root,
+        "root_summary": root_summary,
+        "members": member_records,
+        "expected_member_ids": list(member_records),
+        "beads": [root, drain, *member_beads],
+    }
 
-    selected = gascity_pack_inference_gate.validate_build_basic_result(
-        rig_dir,
-        [{"metadata": {"work_dir": str(worktree), "gc.work_dir": str(rig_dir)}}],
-        env={},
-        timeout=30,
+
+def test_build_basic_implementation_members_matches_convoy_and_manifest(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+
+    members = gascity_pack_inference_gate.build_basic_implementation_members(
+        fixture["root"], fixture["beads"], fixture["expected_member_ids"]
     )
 
-    assert selected == worktree
+    assert members == [("fi-one", "fi-one-workflow"), ("fi-two", "fi-two-workflow")]
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        ("expected-mismatch", "convoy children.*manifest members"),
+        ("duplicate-expected", "convoy child ids.*unique"),
+        ("duplicate-row", "manifest member ids.*unique"),
+        ("malformed-row", "row 0"),
+        ("failed-row", "status=succeeded"),
+        ("failed-outcome", "outcome_kind=pass"),
+        ("count", "gc.drain_count"),
+        ("state", "gc.drain_state=succeeded"),
+    ),
+)
+def test_build_basic_implementation_members_rejects_inconsistent_evidence(tmp_path, case, expected) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    drain = next(bead for bead in fixture["beads"] if bead["id"] == "fi-drain")
+    manifest = json.loads(drain["metadata"]["gc.drain_manifest.v1"])
+    expected_ids = list(fixture["expected_member_ids"])
+    if case == "expected-mismatch":
+        expected_ids[-1] = "fi-other"
+    elif case == "duplicate-expected":
+        expected_ids[-1] = expected_ids[0]
+    elif case == "duplicate-row":
+        manifest["rows"][-1]["member_id"] = manifest["rows"][0]["member_id"]
+    elif case == "malformed-row":
+        del manifest["rows"][0]["member_id"]
+    elif case == "failed-row":
+        manifest["rows"][0]["status"] = "failed"
+    elif case == "failed-outcome":
+        manifest["rows"][0]["outcome_kind"] = "fail"
+    elif case == "count":
+        drain["metadata"]["gc.drain_count"] = "1"
+    else:
+        drain["metadata"]["gc.drain_state"] = "failed"
+    drain["metadata"]["gc.drain_manifest.v1"] = json.dumps(manifest)
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=expected):
+        gascity_pack_inference_gate.build_basic_implementation_members(
+            fixture["root"], fixture["beads"], expected_ids
+        )
+
+
+def validate_build_basic_fixture(fixture: dict) -> list[Path]:
+    return gascity_pack_inference_gate.validate_build_basic_result(
+        fixture["rig_dir"],
+        fixture["beads"],
+        root_bead=fixture["root"],
+        expected_member_ids=fixture["expected_member_ids"],
+        launcher_commit=fixture["launcher_commit"],
+        env={},
+        timeout=30,
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+    )
+
+
+def test_validate_build_basic_result_accepts_every_member_with_commit_bound_provenance(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+
+    selected = validate_build_basic_fixture(fixture)
+
+    assert selected == [record["worktree"] for record in fixture["members"].values()]
 
 
 def test_validate_build_basic_result_rejects_launcher_only_false_pass(tmp_path) -> None:
-    rig_dir = tmp_path / "fixture"
-    worktree = rig_dir / "worktrees" / "fi-source"
-    gascity_pack_inference_gate.write_build_basic_fixture(rig_dir)
-    gascity_pack_inference_gate.write_build_basic_fixture(worktree)
-    (rig_dir / "slugger.py").write_text(
+    fixture = build_basic_result_fixture(tmp_path, implemented=False)
+    (fixture["rig_dir"] / "slugger.py").write_text(PASSING_SLUGGER, encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="fi-one.*NotImplementedError"):
+        validate_build_basic_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    "metadata_key",
+    ("work_dir", "gc.implementation.commit", "gc.implementation.summary_path"),
+)
+def test_validate_build_basic_result_rejects_missing_per_member_provenance(tmp_path, metadata_key) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    del fixture["members"]["fi-two"]["bead"]["metadata"][metadata_key]
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=rf"fi-two.*{re.escape(metadata_key)}"):
+        validate_build_basic_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        ("explicit-worktree", r"fi-two.*worktree_path.*work_dir"),
+        ("commit", r"fi-two.*commit.*HEAD"),
+        ("dirty-slugger", r"fi-two.*slugger.py.*recorded commit"),
+        ("dirty-tests", r"fi-two.*tests/test_slugger.py.*recorded commit"),
+        ("summary-outside", r"fi-two.*summary.*worktree"),
+        ("invalid-summary", r"fi-two.*summary.*validation"),
+    ),
+)
+def test_validate_build_basic_result_rejects_mismatched_member_provenance(tmp_path, case, expected) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    one, two = (fixture["members"][member_id] for member_id in ("fi-one", "fi-two"))
+    if case == "explicit-worktree":
+        two["bead"]["metadata"]["gc.implementation.worktree_path"] = str(one["worktree"])
+    elif case == "commit":
+        two["bead"]["metadata"]["gc.implementation.commit"] = one["commit"]
+    elif case.startswith("dirty-"):
+        relative_path = "slugger.py" if case == "dirty-slugger" else "tests/test_slugger.py"
+        path = two["worktree"] / relative_path
+        path.write_bytes(path.read_bytes() + b"\n# uncommitted product change\n")
+    elif case == "summary-outside":
+        two["bead"]["metadata"]["gc.implementation.summary_path"] = str(one["summary"])
+    else:
+        two["summary"].write_text("not a build artifact\n", encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=expected):
+        validate_build_basic_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ("parent", "path_member", "expected_member", "expected_error"),
+    (
+        ("worktrees", "fi-member", "fi-member", None),
+        ("lanes", "fi-member", "fi-member", r"fi-member.*worktrees/fi-member"),
+        ("worktrees", "fi-one", "fi-other", r"fi-other.*worktrees/fi-other"),
+    ),
+    ids=("nested-prepare-path", "wrong-parent", "swapped-member"),
+)
+def test_authoritative_member_worktree_enforces_runtime_suffix(
+    tmp_path, parent, path_member, expected_member, expected_error
+) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    worktree = fixture["rig_dir"] / "fi-prepare-item-worktree" / parent / path_member
+    run_git(fixture["rig_dir"], "worktree", "add", "-q", "--detach", str(worktree), "HEAD")
+    member = closed_bead(path_member, metadata={"work_dir": str(worktree)})
+
+    def validate():
+        return gascity_pack_inference_gate.authoritative_member_worktree(
+            member,
+            expected_member,
+            fixture["rig_dir"].resolve(),
+            gascity_pack_inference_gate.git_common_dir(fixture["rig_dir"], context="test launcher"),
+        )
+
+    if expected_error:
+        with pytest.raises(gascity_pack_inference_gate.GateError, match=expected_error):
+            validate()
+    else:
+        assert validate() == worktree.resolve()
+
+
+def test_validate_build_basic_result_rejects_worktree_from_unrelated_repository(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    unrelated = fixture["rig_dir"] / "worktrees" / "unrelated-repository"
+    gascity_pack_inference_gate.write_build_basic_fixture(unrelated)
+    gascity_pack_inference_gate.initialize_rig_git(unrelated, env=os.environ)
+    (unrelated / "slugger.py").write_text(PASSING_SLUGGER, encoding="utf-8")
+    summary = unrelated / "implementation-summary.md"
+    summary.write_text(implementation_summary_text("fi-two-workflow"), encoding="utf-8")
+    run_git(unrelated, "add", "slugger.py", "implementation-summary.md")
+    run_git(unrelated, "commit", "-q", "-m", "unrelated implementation")
+    commit = run_git(unrelated, "rev-parse", "HEAD")
+    set_member_provenance(
+        fixture["members"]["fi-two"]["bead"],
+        worktree=unrelated,
+        summary=summary,
+        commit=commit,
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="not linked.*launcher"):
+        validate_build_basic_fixture(fixture)
+
+
+def test_validate_build_basic_result_rejects_linked_worktree_outside_rig(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    outside = tmp_path / "outside-linked"
+    run_git(fixture["rig_dir"], "worktree", "add", "-q", "--detach", str(outside), "HEAD")
+    (outside / "slugger.py").write_text(PASSING_SLUGGER, encoding="utf-8")
+    summary = outside / "implementation-summary.md"
+    summary.write_text(implementation_summary_text("fi-two-workflow"), encoding="utf-8")
+    run_git(outside, "add", "slugger.py", "implementation-summary.md")
+    run_git(outside, "commit", "-q", "-m", "outside implementation")
+    set_member_provenance(
+        fixture["members"]["fi-two"]["bead"],
+        worktree=outside,
+        summary=summary,
+        commit=run_git(outside, "rev-parse", "HEAD"),
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="inside launcher rig"):
+        validate_build_basic_fixture(fixture)
+
+
+def test_validate_build_basic_result_runs_pytest_in_every_member_worktree(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    two = fixture["members"]["fi-two"]
+    (two["worktree"] / "slugger.py").write_text(WRONG_SLUGGER, encoding="utf-8")
+    run_git(two["worktree"], "add", "slugger.py")
+    run_git(two["worktree"], "commit", "-q", "-m", "break second member implementation")
+    two["bead"]["metadata"]["gc.implementation.commit"] = run_git(two["worktree"], "rev-parse", "HEAD")[:7]
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="fi-two.*pytest failed"):
+        validate_build_basic_fixture(fixture)
+
+
+def test_validate_build_basic_result_rejects_committed_weakened_tests(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    two = fixture["members"]["fi-two"]
+    (two["worktree"] / "slugger.py").write_text(WRONG_SLUGGER, encoding="utf-8")
+    (two["worktree"] / "tests" / "test_slugger.py").write_text(
+        "from slugger import slugify\n\n\ndef test_weakened_oracle():\n    assert slugify('Gas City') == 'wrong'\n",
+        encoding="utf-8",
+    )
+    run_git(two["worktree"], "add", "slugger.py", "tests/test_slugger.py")
+    run_git(two["worktree"], "commit", "-q", "-m", "weaken implementation oracle")
+    two["bead"]["metadata"]["gc.implementation.commit"] = run_git(
+        two["worktree"], "rev-parse", "HEAD"
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"fi-two.*tests/test_slugger.py.*launcher baseline",
+    ):
+        validate_build_basic_fixture(fixture)
+
+
+def test_launcher_baseline_tests_rejects_advanced_launcher_head(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    rig_dir = fixture["rig_dir"]
+    baseline_commit = run_git(rig_dir, "rev-parse", "HEAD")
+    test_path = rig_dir / "tests" / "test_slugger.py"
+    test_path.write_text("def test_weakened():\n    assert True\n", encoding="utf-8")
+    run_git(rig_dir, "add", "tests/test_slugger.py")
+    run_git(rig_dir, "commit", "-q", "-m", "weaken launcher tests")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="launcher HEAD changed after launch"):
+        gascity_pack_inference_gate.launcher_baseline_tests(rig_dir, baseline_commit)
+
+
+def test_validate_build_basic_result_ignores_untracked_pytest_xfail_hook(tmp_path) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    two = fixture["members"]["fi-two"]
+    (two["worktree"] / "slugger.py").write_text(WRONG_SLUGGER, encoding="utf-8")
+    run_git(two["worktree"], "add", "slugger.py")
+    run_git(two["worktree"], "commit", "-q", "-m", "break committed implementation")
+    two["bead"]["metadata"]["gc.implementation.commit"] = run_git(
+        two["worktree"], "rev-parse", "HEAD"
+    )
+    (two["worktree"] / "conftest.py").write_text(
         """\
-import re
+import pytest
 
 
-def slugify(value: str) -> str:
-    parts = re.findall(r"[a-z0-9]+", value.lower())
-    return "-".join(parts)
+def pytest_collection_modifyitems(items):
+    for item in items:
+        item.add_marker(pytest.mark.xfail(reason="mask committed failure"))
 """,
         encoding="utf-8",
     )
 
-    with pytest.raises(gascity_pack_inference_gate.GateError, match="NotImplementedError"):
-        gascity_pack_inference_gate.validate_build_basic_result(
-            rig_dir,
-            [{"metadata": {"work_dir": str(worktree), "gc.work_dir": str(rig_dir)}}],
-            env={},
-            timeout=30,
-        )
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="fi-two.*pytest failed"):
+        validate_build_basic_fixture(fixture)
+
+
+def test_validate_build_basic_result_ignores_ancestor_pytest_xfail_hook(tmp_path, monkeypatch) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    two = fixture["members"]["fi-two"]
+    (two["worktree"] / "slugger.py").write_text(WRONG_SLUGGER, encoding="utf-8")
+    run_git(two["worktree"], "add", "slugger.py")
+    run_git(two["worktree"], "commit", "-q", "-m", "break committed implementation")
+    two["bead"]["metadata"]["gc.implementation.commit"] = run_git(
+        two["worktree"], "rev-parse", "HEAD"
+    )
+
+    hostile_parent = tmp_path / "hostile-pytest-parent"
+    hostile_parent.mkdir()
+    (hostile_parent / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (hostile_parent / "conftest.py").write_text(
+        """\
+import pytest
+
+
+def pytest_collection_modifyitems(items):
+    for item in items:
+        item.add_marker(pytest.mark.xfail(reason="mask committed failure"))
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gascity_pack_inference_gate.tempfile, "tempdir", str(hostile_parent))
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="fi-two.*pytest failed"):
+        validate_build_basic_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    (
+        ("id: fi-two-workflow", "id: fi-other-workflow", r"fi-two.*workflow.id.*fi-two-workflow"),
+        ("path: beads/fi-two", "path: beads/fi-other", r"fi-two.*beads/fi-two"),
+        ("hash: bead:fi-two", "hash: bead:fi-other", r"fi-two.*bead:fi-two"),
+        (
+            "  - path: beads/fi-two\n    hash: bead:fi-two",
+            "  - path: beads/fi-two\n    hash: bead:fi-two\n"
+            "  - path: beads/fi-two\n    hash: bead:fi-two",
+            r"fi-two.*beads/fi-two.*bead:fi-two",
+        ),
+    ),
+)
+def test_validate_build_basic_result_binds_member_summary_identity(tmp_path, old, new, expected) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    two = fixture["members"]["fi-two"]
+    old_bytes = two["summary"].read_bytes()
+    two["summary"].write_text(old_bytes.decode("utf-8").replace(old, new, 1), encoding="utf-8")
+    old_digest = f"sha256:{hashlib.sha256(old_bytes).hexdigest()}"
+    new_digest = f"sha256:{hashlib.sha256(two['summary'].read_bytes()).hexdigest()}"
+    root_summary = fixture["root_summary"]
+    root_summary.write_text(
+        root_summary.read_text(encoding="utf-8").replace(old_digest, new_digest),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=expected):
+        validate_build_basic_fixture(fixture)
+
+
+@pytest.mark.parametrize("case", ("digest", "path"))
+def test_validate_build_basic_result_rejects_canonical_summary_mismatch(tmp_path, case) -> None:
+    fixture = build_basic_result_fixture(tmp_path)
+    two = fixture["members"]["fi-two"]
+    root_summary = fixture["root_summary"]
+    original = root_summary.read_text(encoding="utf-8")
+    if case == "digest":
+        digest = f"sha256:{hashlib.sha256(two['summary'].read_bytes()).hexdigest()}"
+        changed = original.replace(digest, f"sha256:{'0' * 64}")
+        expected = r"fi-two.*canonical.*digest"
+    else:
+        changed = original.replace(str(two["summary"]), str(two["summary"]) + ".stale")
+        expected = r"fi-two.*canonical.*exact path"
+    root_summary.write_text(
+        changed,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match=expected):
+        validate_build_basic_fixture(fixture)
 
 
 def test_validate_build_basic_artifacts_accepts_declared_markdown_artifacts(tmp_path) -> None:
