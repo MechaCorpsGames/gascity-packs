@@ -505,6 +505,16 @@ def review_input_snapshot(
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
+def implementation_snapshot(members: list[dict[str, str]]) -> str:
+    canonical = [
+        {"id": str(member["id"]), "commit": str(member["commit"])}
+        for member in members
+    ]
+    canonical.sort(key=lambda member: member["id"])
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
 def convoy_member_ids(root: dict[str, Any]) -> list[str]:
     convoy_id = metadata(root, "gc.build.implementation_convoy_id")
     if not convoy_id:
@@ -543,10 +553,12 @@ def convoy_member_ids(root: dict[str, Any]) -> list[str]:
 
 def verify(
     root_id: str,
-    expected_snapshot: str,
+    expected_snapshot: str | None,
     expected_summary: Path,
     validator: Path,
     expected_artifacts: list[Path],
+    *,
+    enforce_recorded_snapshots: bool = True,
 ) -> tuple[str, str]:
     root = one_bead(root_id)
     launcher_work_dir = required_absolute_path(root, "gc.work_dir", label="workflow root")
@@ -750,11 +762,11 @@ def verify(
         label="canonical implementation summary",
     )
 
-    snapshot_members.sort(key=lambda item: item["id"])
-    payload = json.dumps(snapshot_members, sort_keys=True, separators=(",", ":")).encode()
-    current_snapshot = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    current_snapshot = implementation_snapshot(snapshot_members)
     root_snapshot = metadata(root, "gc.build.implementation_snapshot")
-    if root_snapshot != current_snapshot or expected_snapshot != current_snapshot:
+    if enforce_recorded_snapshots and (
+        root_snapshot != current_snapshot or expected_snapshot != current_snapshot
+    ):
         raise ProvenanceError(
             "implementation snapshot mismatch: "
             f"root={root_snapshot or '<missing>'} expected={expected_snapshot or '<missing>'} "
@@ -766,7 +778,7 @@ def verify(
         context=recorded_context,
     )
     root_review_input = metadata(root, "gc.build.review_input_snapshot")
-    if root_review_input != current_review_input:
+    if enforce_recorded_snapshots and root_review_input != current_review_input:
         raise ProvenanceError(
             "review input snapshot mismatch: "
             f"root={root_review_input or '<missing>'} current={current_review_input}"
@@ -777,7 +789,12 @@ def verify(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root-id", required=True)
-    parser.add_argument("--expected-snapshot", required=True)
+    parser.add_argument("--expected-snapshot")
+    parser.add_argument(
+        "--emit-current",
+        action="store_true",
+        help="emit deterministically computed live snapshots without comparing root snapshot metadata",
+    )
     parser.add_argument("--expected-summary", required=True, type=Path)
     parser.add_argument(
         "--expected-artifact",
@@ -786,7 +803,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
     )
     parser.add_argument("--validator", required=True, type=Path)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.emit_current and not args.expected_snapshot:
+        parser.error("--expected-snapshot is required unless --emit-current is used")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -798,6 +818,7 @@ def main(argv: list[str] | None = None) -> int:
             args.expected_summary,
             args.validator.resolve(strict=True),
             args.expected_artifact,
+            enforce_recorded_snapshots=not args.emit_current,
         )
     except (OSError, ProvenanceError) as exc:
         print(f"implementation-provenance-check: {exc}", file=sys.stderr)

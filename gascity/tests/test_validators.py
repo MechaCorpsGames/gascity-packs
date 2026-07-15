@@ -13,6 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "assets" / 
 import validate_context_bundle as context_validator
 import validate_build_artifact as build_artifact_validator
 import validate_verdict_report as verdict_validator
+import verify_implementation_provenance as provenance_validator
 
 
 class ContextBundleValidatorTests(unittest.TestCase):
@@ -747,6 +748,65 @@ findings:
             self.assertEqual(code, 1)
             self.assertIn("error:", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
+
+
+class ImplementationProvenanceValidatorTests(unittest.TestCase):
+    def test_implementation_snapshot_uses_exact_canonical_array_payload(self) -> None:
+        members = [{"id": "fi-r0k.1", "commit": "f" * 40}]
+        canonical_payload = (
+            b'[{"commit":"ffffffffffffffffffffffffffffffffffffffff",'
+            b'"id":"fi-r0k.1"}]'
+        )
+        bare_object_payload = canonical_payload[1:-1]
+        newline_payload = canonical_payload + b"\n"
+
+        snapshot = provenance_validator.implementation_snapshot(members)
+
+        self.assertEqual(
+            snapshot,
+            f"sha256:{hashlib.sha256(canonical_payload).hexdigest()}",
+        )
+        self.assertNotEqual(
+            snapshot,
+            f"sha256:{hashlib.sha256(bare_object_payload).hexdigest()}",
+        )
+        self.assertNotEqual(
+            snapshot,
+            f"sha256:{hashlib.sha256(newline_payload).hexdigest()}",
+        )
+
+    def test_provenance_parser_allows_emit_current_without_expected_snapshot(self) -> None:
+        args = provenance_validator.parse_args(
+            [
+                "--root-id",
+                "fi-r0k",
+                "--emit-current",
+                "--expected-summary",
+                "/tmp/implementation-summary.md",
+                "--validator",
+                "/tmp/validate-build-artifact.py",
+            ]
+        )
+
+        self.assertTrue(args.emit_current)
+        self.assertIsNone(args.expected_snapshot)
+
+    def test_provenance_parser_requires_expected_snapshot_for_verification(self) -> None:
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            provenance_validator.parse_args(
+                [
+                    "--root-id",
+                    "fi-r0k",
+                    "--expected-summary",
+                    "/tmp/implementation-summary.md",
+                    "--validator",
+                    "/tmp/validate-build-artifact.py",
+                ]
+            )
+
+        self.assertIn("--expected-snapshot", stderr.getvalue())
 
 
 if __name__ == "__main__":
