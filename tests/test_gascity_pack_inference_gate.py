@@ -389,7 +389,10 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert "if: steps.subset.outputs.run_gate == 'true'" in workflow
     assert "if: always() && steps.subset.outputs.run_gate == 'true'" in workflow
     assert "max-parallel: 1" in workflow
-    assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
+    document = supported_pack_nightly_document()
+    for job_name in ("resolve-nightly-inputs", "static-contracts", "inference"):
+        assert document["jobs"][job_name]["runs-on"] == "ubuntu-24.04"
+    assert "blacksmith-" not in workflow
     assert "GATE_TIMEOUT: ${{ needs.resolve-nightly-inputs.outputs.gate_timeout || matrix.gate_timeout }}" in workflow
     assert '--timeout "$GATE_TIMEOUT"' in workflow
     assert 'DOLT_VERSION: "2.1.7"' in workflow

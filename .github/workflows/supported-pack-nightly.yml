@@ -65,7 +65,7 @@ env:
 jobs:
   resolve-nightly-inputs:
     name: resolve nightly inputs
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       selected_gates: ${{ steps.inputs.outputs.selected_gates }}
@@ -282,7 +282,7 @@ jobs:
   static-contracts:
     name: static pack flow contracts
     needs: resolve-nightly-inputs
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out gascity-packs
@@ -305,7 +305,7 @@ jobs:
   inference:
     name: ${{ matrix.pack }} / ${{ matrix.gate }}
     needs: [resolve-nightly-inputs, static-contracts]
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: ${{ fromJSON(needs.resolve-nightly-inputs.outputs.job_timeout_minutes || '0') || matrix.timeout_minutes }}
     strategy:
       fail-fast: false
