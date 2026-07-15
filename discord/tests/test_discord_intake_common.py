@@ -1098,10 +1098,19 @@ class DiscordIntakeCommonTests(unittest.TestCase):
             )
 
         self.assertEqual(payload, accepted)
+        self.assertEqual(common.GC_API_ASYNC_RESULT_TIMEOUT_SECONDS, 4 * 60)
         self.assertEqual(len(urlopen.call_args_list), 2)
         self.assertEqual(
             urlopen.call_args_list[1].args[0].full_url,
             "http://gc.test/v0/city/test/events/stream?after_seq=42",
+        )
+        self.assertEqual(
+            urlopen.call_args_list[0].kwargs["timeout"],
+            common.GC_API_REQUEST_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            urlopen.call_args_list[1].kwargs["timeout"],
+            common.GC_API_ASYNC_RESULT_TIMEOUT_SECONDS,
         )
 
     def test_gc_api_base_url_rejects_disabled_port(self) -> None:

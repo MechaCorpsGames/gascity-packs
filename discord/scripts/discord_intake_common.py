@@ -38,6 +38,7 @@ DEFAULT_SUPERVISOR_API_BASE = "http://127.0.0.1:8372"
 LOCAL_API_BINDS = {"", "0.0.0.0", "::", "[::]", "*"}
 DISCORD_RATE_LIMIT_RETRIES = 2
 GC_API_REQUEST_TIMEOUT_SECONDS = 20.0
+GC_API_ASYNC_RESULT_TIMEOUT_SECONDS = 4 * 60.0
 GC_EVENT_REQUEST_FAILED = "request.failed"
 GC_EVENT_SESSION_MESSAGE_SUCCEEDED = "request.result.session.message"
 GC_EVENT_SESSION_SUBMIT_SUCCEEDED = "request.result.session.submit"
@@ -2449,7 +2450,7 @@ def wait_for_gc_request_result(
     event_cursor: str,
     success_type: str,
     failure_operation: str,
-    timeout: float = GC_API_REQUEST_TIMEOUT_SECONDS,
+    timeout: float = GC_API_ASYNC_RESULT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     normalized_request_id = str(request_id).strip()
     if not normalized_request_id:
@@ -5282,7 +5283,7 @@ def deliver_session_message(
             event_cursor=str(payload.get("event_cursor", "")),
             success_type=success_type,
             failure_operation=failure_operation,
-            timeout=timeout,
+            timeout=GC_API_ASYNC_RESULT_TIMEOUT_SECONDS,
         )
     return payload
 

@@ -2734,6 +2734,17 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertGreaterEqual(age, gateway_service.STALE_PROCESSING_RECEIPT_SECONDS)
         self.assertLess(age, gateway_service.STALE_PROCESSING_RECEIPT_SECONDS + 30)
 
+    def test_processing_receipt_staleness_exceeds_max_async_delivery_wait(self) -> None:
+        max_delivery_wait = (
+            common.GC_API_REQUEST_TIMEOUT_SECONDS
+            + common.GC_API_ASYNC_RESULT_TIMEOUT_SECONDS
+        )
+
+        self.assertGreaterEqual(
+            gateway_service.STALE_PROCESSING_RECEIPT_SECONDS - max_delivery_wait,
+            60,
+        )
+
     def test_gateway_connect_url_preserves_resume_host_and_adds_required_query_params(self) -> None:
         worker = object.__new__(gateway_service.GatewayWorker)
 
