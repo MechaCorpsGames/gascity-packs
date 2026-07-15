@@ -2104,6 +2104,7 @@ def build_basic_result_fixture(tmp_path: Path, *, implemented: bool = True) -> d
 
     member_records: dict[str, dict] = {}
     member_beads: list[dict] = []
+    workflow_beads: list[dict] = []
     for member_id in ("fi-one", "fi-two"):
         worktree = rig_dir / "worktrees" / member_id
         run_git(rig_dir, "worktree", "add", "-q", "--detach", str(worktree), "HEAD")
@@ -2129,6 +2130,16 @@ def build_basic_result_fixture(tmp_path: Path, *, implemented: bool = True) -> d
             "commit": commit,
         }
         member_beads.append(bead)
+        workflow_beads.append(
+            closed_bead(
+                f"{member_id}-workflow",
+                kind="workflow",
+                metadata={
+                    "gc.drain_control_id": "fi-drain",
+                    "gc.drain_member_id": member_id,
+                },
+            )
+        )
 
     drain_manifest = json.dumps(
         {
@@ -2186,7 +2197,7 @@ def build_basic_result_fixture(tmp_path: Path, *, implemented: bool = True) -> d
         "root_summary": root_summary,
         "members": member_records,
         "expected_member_ids": list(member_records),
-        "beads": [root, drain, *member_beads],
+        "beads": [root, drain, *workflow_beads, *member_beads],
     }
 
 
@@ -2206,6 +2217,10 @@ def test_build_basic_implementation_members_matches_convoy_and_manifest(tmp_path
         ("expected-mismatch", "convoy children.*manifest members"),
         ("duplicate-expected", "convoy child ids.*unique"),
         ("duplicate-row", "manifest member ids.*unique"),
+        ("duplicate-workflow", "workflow root ids.*unique"),
+        ("swapped-workflow", "gc.drain_member_id.*manifest member"),
+        ("missing-workflow", "workflow root fi-two-workflow.*exactly once"),
+        ("wrong-control", "gc.drain_control_id.*implementation drain"),
         ("malformed-row", "row 0"),
         ("failed-row", "status=succeeded"),
         ("failed-outcome", "outcome_kind=pass"),
@@ -2224,6 +2239,20 @@ def test_build_basic_implementation_members_rejects_inconsistent_evidence(tmp_pa
         expected_ids[-1] = expected_ids[0]
     elif case == "duplicate-row":
         manifest["rows"][-1]["member_id"] = manifest["rows"][0]["member_id"]
+    elif case == "duplicate-workflow":
+        manifest["rows"][-1]["item_root_id"] = manifest["rows"][0]["item_root_id"]
+        manifest["rows"][-1]["outcome_bead_id"] = manifest["rows"][0]["outcome_bead_id"]
+    elif case == "swapped-workflow":
+        first_root = manifest["rows"][0]["item_root_id"]
+        second_root = manifest["rows"][1]["item_root_id"]
+        for key in ("item_root_id", "outcome_bead_id"):
+            manifest["rows"][0][key] = second_root
+            manifest["rows"][1][key] = first_root
+    elif case == "missing-workflow":
+        fixture["beads"] = [bead for bead in fixture["beads"] if bead["id"] != "fi-two-workflow"]
+    elif case == "wrong-control":
+        workflow = next(bead for bead in fixture["beads"] if bead["id"] == "fi-two-workflow")
+        workflow["metadata"]["gc.drain_control_id"] = "fi-other-drain"
     elif case == "malformed-row":
         del manifest["rows"][0]["member_id"]
     elif case == "failed-row":

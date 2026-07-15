@@ -2339,6 +2339,36 @@ def build_basic_implementation_members(
             f"implementation convoy children do not match drain manifest members: "
             f"convoy={expected_ids} manifest={manifest_ids}"
         )
+    workflow_ids = [workflow_id for _, workflow_id in members]
+    if len(set(workflow_ids)) != len(workflow_ids):
+        raise GateError(
+            f"implementation drain manifest workflow root ids must be unique: {workflow_ids}"
+        )
+
+    drain_id = str(drain.get("id") or "").strip()
+    for member_id, workflow_id in members:
+        workflow_matches = [bead for bead in beads if bead.get("id") == workflow_id]
+        if len(workflow_matches) != 1:
+            raise GateError(
+                f"implementation workflow root {workflow_id} must be present exactly once; "
+                f"observed {len(workflow_matches)}"
+            )
+        workflow = workflow_matches[0]
+        if metadata_value(workflow, "gc.kind") != "workflow":
+            raise GateError(f"implementation workflow root {workflow_id} must record gc.kind=workflow")
+        workflow_member_id = metadata_value(workflow, "gc.drain_member_id").strip()
+        if workflow_member_id != member_id:
+            raise GateError(
+                f"implementation workflow root {workflow_id} gc.drain_member_id={workflow_member_id!r} "
+                f"does not match manifest member {member_id}"
+            )
+        workflow_drain_id = metadata_value(workflow, "gc.drain_control_id").strip()
+        if workflow_drain_id != drain_id:
+            raise GateError(
+                f"implementation workflow root {workflow_id} gc.drain_control_id={workflow_drain_id!r} "
+                f"does not match implementation drain {drain_id}"
+            )
+
     by_id = {member_id: workflow_id for member_id, workflow_id in members}
     return [(member_id, by_id[member_id]) for member_id in expected_ids]
 
