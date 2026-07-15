@@ -7426,8 +7426,8 @@ description = "Override sink that writes the base triage report contract."
             "status: approved\n"
             "trace:\n"
             "  upstream:\n"
-            "    - path: request.md\n"
-            "      hash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "    - path: beads/request\n"
+            "      hash: bead:request\n"
             "  coverage:\n"
             "    - id: GC-METH-001\n"
             "      status: covered\n"
@@ -7958,6 +7958,71 @@ description = "Override sink that writes the base triage report contract."
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"path={artifact}", result.stdout)
+
+    def test_build_artifact_check_resolves_relative_sha256_from_launcher_root(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            launcher_root = pathlib.Path(artifact_dir) / "rig"
+            attempt_worktree = launcher_root / ".gc" / "worktrees" / "review-attempt"
+            attempt_worktree.mkdir(parents=True)
+            check_marker = (
+                launcher_root / ".gc" / "scripts" / "checks" / "build-artifact-valid.sh"
+            )
+            check_marker.parent.mkdir(parents=True)
+            check_marker.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+            upstream = launcher_root / "inputs" / "request.md"
+            upstream.parent.mkdir()
+            upstream.write_text("# Approved request\n", encoding="utf-8")
+            digest = hashlib.sha256(upstream.read_bytes()).hexdigest()
+            artifact = launcher_root / "artifacts" / "requirements.md"
+            artifact.parent.mkdir()
+            artifact.write_text(
+                self._valid_requirements_artifact().replace(
+                    "    - path: beads/request\n"
+                    "      hash: bead:request\n",
+                    "    - path: inputs/request.md\n"
+                    f"      hash: sha256:{digest}\n",
+                ),
+                encoding="utf-8",
+            )
+
+            control = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.build.artifact_schema": "gc.build.requirements.v1",
+                        "gc.build.artifact_path_keys": "gc.build.requirements_path",
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {"gc.build.requirements_path": str(artifact)},
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+                extra_env={"GC_WORK_DIR": str(attempt_worktree)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            artifact.write_text(
+                artifact.read_text(encoding="utf-8").replace(
+                    f"sha256:{digest}", f"sha256:{'0' * 64}"
+                ),
+                encoding="utf-8",
+            )
+            mismatched = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+                extra_env={"GC_WORK_DIR": str(attempt_worktree)},
+            )
+
+        self.assertNotEqual(mismatched.returncode, 0, mismatched.stdout + mismatched.stderr)
+        self.assertIn("sha256 digest does not match", mismatched.stderr)
 
     def test_build_artifact_check_blocks_invalid_artifact_with_repair_context(self) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:

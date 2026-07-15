@@ -378,6 +378,80 @@ trace:
                     verify_absolute_upstreams=True,
                 )
 
+            relative = mismatched.replace(str(upstream), upstream.name)
+            with self.assertRaisesRegex(build_artifact_validator.ValidationError, "sha256|digest|hash"):
+                build_artifact_validator.validate_artifact_text(
+                    relative,
+                    expected_schema="gc.build.requirements.v1",
+                    verify_absolute_upstreams=True,
+                    artifact_path=root / "artifact.md",
+                )
+
+            padded_correct = text.replace(
+                f"path: {upstream}", f'path: "  {upstream}  "'
+            ).replace(
+                f"hash: {correct_hash}", f'hash: "  {correct_hash}  "'
+            )
+            normalized = build_artifact_validator.validate_artifact_text(
+                padded_correct,
+                expected_schema="gc.build.requirements.v1",
+                verify_absolute_upstreams=True,
+            )
+            self.assertEqual(normalized.upstream[0]["path"], str(upstream))
+            self.assertEqual(normalized.upstream[0]["hash"], correct_hash)
+            self.assertEqual(
+                normalized.front_matter["trace"]["upstream"][0],
+                normalized.upstream[0],
+            )
+
+            for padded in (
+                mismatched.replace(f"path: {upstream}", f'path: " {upstream}"'),
+                mismatched.replace(f"hash: {different_hash}", f'hash: " {different_hash}"'),
+            ):
+                with self.subTest(padded=padded), self.assertRaisesRegex(
+                    build_artifact_validator.ValidationError, "sha256|digest|hash"
+                ):
+                    build_artifact_validator.validate_artifact_text(
+                        padded,
+                        expected_schema="gc.build.requirements.v1",
+                        verify_absolute_upstreams=True,
+                    )
+
+    def test_build_artifact_resolves_relative_sha256_from_explicit_upstream_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            artifact_dir = root / "artifacts"
+            upstream = root / "inputs" / "requirements.md"
+            artifact_dir.mkdir()
+            upstream.parent.mkdir()
+            upstream.write_text("# Approved requirements\n", encoding="utf-8")
+            correct_hash = f"sha256:{hashlib.sha256(upstream.read_bytes()).hexdigest()}"
+            text = self.valid_artifact().replace(
+                "    - path: requirements.after.md\n"
+                "      hash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                "    - path: inputs/requirements.md\n"
+                f"      hash: {correct_hash}\n",
+            )
+
+            artifact = build_artifact_validator.validate_artifact_text(
+                text,
+                expected_schema="gc.build.requirements.v1",
+                verify_absolute_upstreams=True,
+                artifact_path=artifact_dir / "plan.md",
+                upstream_roots=[root],
+            )
+
+            self.assertEqual(artifact.upstream[0]["path"], "inputs/requirements.md")
+            with self.assertRaisesRegex(
+                build_artifact_validator.ValidationError, "relative sha256 path|resolve"
+            ):
+                build_artifact_validator.validate_artifact_text(
+                    text,
+                    expected_schema="gc.build.requirements.v1",
+                    verify_absolute_upstreams=True,
+                    artifact_path=artifact_dir / "plan.md",
+                )
+
     def test_build_artifact_rejects_invalid_coverage_status_and_missing_rationale(self) -> None:
         invalid_status = self.valid_artifact().replace("status: deferred", "status: waiting", 1)
         missing_rationale = self.valid_artifact().replace(
