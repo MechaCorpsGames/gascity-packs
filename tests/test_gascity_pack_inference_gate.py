@@ -1369,6 +1369,14 @@ def test_wait_for_workflow_pass_rejects_failed_finalizer(tmp_path, monkeypatch) 
         ("gc.blocked_reason", "stale failure state"),
         ("gc.failure_class", "stale failure state"),
         ("gc.build.status", "blocked"),
+        ("gc.build.status", "ready"),
+        ("gc.build.finalize_status", "failed"),
+        ("gc.build.finalize_outcome", "failure"),
+        ("gc.build.repair_status", "blocked"),
+        ("gc.build.repair_status", "repairable"),
+        ("gc.build.repair_status", "exhausted"),
+        ("gc.restart.entrypoint", "build-from-review"),
+        ("gc.restart.reason", "review_changes_required"),
     ),
 )
 def test_wait_for_workflow_pass_rejects_stale_root_failure_marker(

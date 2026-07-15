@@ -29,6 +29,7 @@ BASE_CHECK="$SCRIPT_DIR/build-artifact-valid.sh"
 python3 - "$BEAD_ID" <<'PY'
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -77,6 +78,39 @@ def metadata(item: dict[str, Any], key: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def requirements_upstream(
+    root: dict[str, Any], root_id: str, work_dir: Path
+) -> tuple[Path, list[Any]]:
+    raw_requirements_path = metadata(root, "gc.build.requirements_path") or metadata(
+        root, "gc.var.requirements_path"
+    )
+    if not raw_requirements_path:
+        fail(f"workflow root {root_id} is missing gc.build.requirements_path")
+    requirements_path = Path(raw_requirements_path)
+    if not requirements_path.is_absolute():
+        requirements_path = work_dir / requirements_path
+    try:
+        requirements_path = requirements_path.resolve(strict=True)
+    except OSError as exc:
+        fail(f"requirements path does not resolve: {raw_requirements_path}: {exc}")
+    if not requirements_path.is_file():
+        fail(f"requirements path is not a regular file: {requirements_path}")
+
+    text = requirements_path.read_text(encoding="utf-8", errors="replace")
+    match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
+    if not match:
+        fail(f"requirements artifact has no parseable YAML front matter: {requirements_path}")
+    try:
+        front = yaml.safe_load(match.group("front")) or {}
+    except yaml.YAMLError as exc:
+        fail(f"requirements artifact has invalid YAML front matter: {exc}")
+    trace = front.get("trace") if isinstance(front, dict) else None
+    upstream = trace.get("upstream") if isinstance(trace, dict) else None
+    if not isinstance(upstream, list):
+        fail(f"requirements trace.upstream is missing: {requirements_path}")
+    return requirements_path, upstream
+
+
 step = bead(BEAD_ID)
 root_id = metadata(step, "gc.root_bead_id") or BEAD_ID
 root = bead(root_id) if root_id != BEAD_ID else step
@@ -104,7 +138,37 @@ if not launch_convoy_id:
     if not context_path.is_file():
         fail(f"internal planning context path is not a regular file: {context_path}")
 
-    print(f"build requirements source valid: internal planning context path={context_path}")
+    requirements_path, upstream = requirements_upstream(root, root_id, work_dir)
+    expected_path = str(context_path)
+    expected_hash = f"sha256:{hashlib.sha256(context_path.read_bytes()).hexdigest()}"
+    identity_entries = [
+        entry
+        for entry in upstream
+        if isinstance(entry, dict)
+        and (entry.get("path") == expected_path or entry.get("hash") == expected_hash)
+    ]
+    if not identity_entries:
+        fail(
+            "missing internal planning context trace in requirements: "
+            f"path={expected_path} hash={expected_hash}"
+        )
+    if len(identity_entries) != 1:
+        fail(
+            "duplicate internal planning context trace in requirements: "
+            f"path={expected_path} matches={len(identity_entries)}"
+        )
+    identity = identity_entries[0]
+    if (identity.get("path"), identity.get("hash")) != (expected_path, expected_hash):
+        fail(
+            "mismatched internal planning context trace in requirements: "
+            f"expected=({expected_path}, {expected_hash}) "
+            f"observed=({identity.get('path')}, {identity.get('hash')})"
+        )
+
+    print(
+        "build requirements source valid: internal planning context "
+        f"path={context_path} requirements={requirements_path}"
+    )
     raise SystemExit(0)
 
 status = json_command(
@@ -127,33 +191,7 @@ if len(source_ids) != len(set(source_ids)):
 for source_id in source_ids:
     bead(source_id)
 
-raw_requirements_path = metadata(root, "gc.build.requirements_path") or metadata(
-    root, "gc.var.requirements_path"
-)
-if not raw_requirements_path:
-    fail(f"workflow root {root_id} is missing gc.build.requirements_path")
-requirements_path = Path(raw_requirements_path)
-if not requirements_path.is_absolute():
-    requirements_path = work_dir / requirements_path
-try:
-    requirements_path = requirements_path.resolve(strict=True)
-except OSError as exc:
-    fail(f"requirements path does not resolve: {raw_requirements_path}: {exc}")
-if not requirements_path.is_file():
-    fail(f"requirements path is not a regular file: {requirements_path}")
-
-text = requirements_path.read_text(encoding="utf-8", errors="replace")
-match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
-if not match:
-    fail(f"requirements artifact has no parseable YAML front matter: {requirements_path}")
-try:
-    front = yaml.safe_load(match.group("front")) or {}
-except yaml.YAMLError as exc:
-    fail(f"requirements artifact has invalid YAML front matter: {exc}")
-trace = front.get("trace") if isinstance(front, dict) else None
-upstream = trace.get("upstream") if isinstance(trace, dict) else None
-if not isinstance(upstream, list):
-    fail(f"requirements trace.upstream is missing: {requirements_path}")
+requirements_path, upstream = requirements_upstream(root, root_id, work_dir)
 
 observed_source_traces = [
     str(entry.get("path") or "")[len("beads/") :]

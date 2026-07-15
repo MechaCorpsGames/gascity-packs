@@ -1997,6 +1997,13 @@ class FormulaAssetTests(unittest.TestCase):
             "source anchor/worktree",
             "not a partial build",
             "Use `status: approved`",
+            "GC_BEAD_ID=\"$CLAIMED_BEAD_ID\"",
+            "gc.build.status=completed",
+            "gc.build.finalize_status=completed",
+            "gc.build.finalize_outcome=success",
+            "--unset-metadata gc.blocked_reason",
+            "--unset-metadata gc.failure_class",
+            "--unset-metadata gc.restart.entrypoint",
         ):
             with self.subTest(asset="finalize", fragment=fragment):
                 self.assertIn(fragment, finalize_text)
@@ -6615,9 +6622,9 @@ description = "Override sink that writes the base triage report contract."
         with tempfile.TemporaryDirectory() as td:
             root_dir = pathlib.Path(td)
             requirements = root_dir / "requirements.md"
-            requirements.write_text("---\ntrace: {upstream: [], coverage: []}\n---\n", encoding="utf-8")
             context = root_dir / "context.md"
             context.write_text("Approved planning context.\n", encoding="utf-8")
+            context_digest = hashlib.sha256(context.read_bytes()).hexdigest()
             control = {
                 "id": "requirements-step",
                 "metadata": {"gc.root_bead_id": "root"},
@@ -6631,6 +6638,58 @@ description = "Override sink that writes the base triage report contract."
                 },
             }
 
+            requirements.write_text(
+                "---\ntrace: {upstream: [], coverage: []}\n---\n",
+                encoding="utf-8",
+            )
+            missing_trace = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(
+                missing_trace.returncode,
+                0,
+                missing_trace.stdout + missing_trace.stderr,
+            )
+            self.assertIn("missing internal planning context trace", missing_trace.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                f"    - path: {context}\n"
+                f"      hash: sha256:{'0' * 64}\n"
+                "  coverage: []\n---\n",
+                encoding="utf-8",
+            )
+            wrong_hash = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(wrong_hash.returncode, 0, wrong_hash.stdout + wrong_hash.stderr)
+            self.assertIn("mismatched internal planning context trace", wrong_hash.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                f"    - path: {context}\n      hash: sha256:{context_digest}\n"
+                f"    - path: {context}\n      hash: sha256:{context_digest}\n"
+                "  coverage: []\n---\n",
+                encoding="utf-8",
+            )
+            duplicate = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(duplicate.returncode, 0, duplicate.stdout + duplicate.stderr)
+            self.assertIn("duplicate internal planning context trace", duplicate.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                f"    - path: {context}\n      hash: sha256:{context_digest}\n"
+                "  coverage: []\n---\n",
+                encoding="utf-8",
+            )
             internal = self._run_build_requirements_source_check(
                 beads_by_id={"requirements-step": control, "root": root},
                 convoys_by_id={},
@@ -6638,6 +6697,19 @@ description = "Override sink that writes the base triage report contract."
             )
             self.assertEqual(internal.returncode, 0, internal.stdout + internal.stderr)
             self.assertIn("internal planning context", internal.stdout)
+
+            context.write_text("Changed planning context.\n", encoding="utf-8")
+            changed_context = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(
+                changed_context.returncode,
+                0,
+                changed_context.stdout + changed_context.stderr,
+            )
+            self.assertIn("mismatched internal planning context trace", changed_context.stderr)
 
             context.unlink()
             missing_context = self._run_build_requirements_source_check(
@@ -7048,6 +7120,9 @@ description = "Override sink that writes the base triage report contract."
             "forbids test changes",
             "at least one `blocked` coverage row",
             "no `blocked` coverage rows",
+            "Approval is based on unresolved in-scope required fixes, not lane unanimity",
+            "When no authoritative input declares IDs",
+            "`coverage: []` may accompany `changes_required` or `blocked`",
         ):
             with self.subTest(prompt="synthesis", fragment=fragment):
                 self.assertIn(fragment, synthesis)

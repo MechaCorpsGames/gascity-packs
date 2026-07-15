@@ -98,10 +98,43 @@ Record the final report path on the workflow root bead as both
 Use `gc bd update "<workflow-root-id>" --set-metadata "gc.build.final_report_path=<absolute path>" --set-metadata "gc.build.factory_run_path=<absolute path>"`.
 Do not use `gc bd update --metadata 'key=value'`; `--metadata` only accepts a JSON
 object.
-Before closing this step, set the claimed step outcome with
-`gc bd update "<claimed-step-id>" --set-metadata "gc.outcome=pass"`, then close
+
+Before recording lifecycle success, resolve the launcher rig root from workflow
+root metadata `gc.work_dir`. If it names an attempt worktree without the check,
+walk to the nearest ancestor containing
+`.gc/scripts/checks/build-artifact-valid.sh`. Read the exact claimed step ID
+from the startup claim output and substitute it literally in the same shell
+call; shell variables from earlier tool calls do not persist. Run:
+
+```bash
+CLAIMED_BEAD_ID=<exact-claimed-bead-id>; GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-artifact-valid.sh
+```
+
+Repair the canonical final report until this check passes. Only after it passes
+and the implementation and review evidence are approved, reconcile the
+workflow root's successful lifecycle state in one update:
+
+```bash
+gc bd update <workflow-root-id> \
+  --set-metadata 'gc.build.status=completed' \
+  --set-metadata 'gc.build.finalize_status=completed' \
+  --set-metadata 'gc.build.finalize_outcome=success' \
+  --unset-metadata gc.blocked_reason \
+  --unset-metadata gc.failure_class \
+  --unset-metadata gc.build.repair_status \
+  --unset-metadata gc.restart.entrypoint \
+  --unset-metadata gc.restart.reason \
+  --unset-metadata gc.restart.review_report_path \
+  --unset-metadata gc.restart.review_fix_formula \
+  --unset-metadata gc.restart.implementation_target
+```
+
+Then set the claimed step outcome with
+`gc bd update "<claimed-step-id>" --set-metadata "gc.outcome=pass"` and close
 with `gc bd close "<claimed-step-id>" --reason "<concise reason>"`. Do not pass
-`--metadata` or `--set-metadata` to `gc bd close`.
+`--metadata` or `--set-metadata` to `gc bd close`. If validation or required
+evidence fails, do not emit completed/success lifecycle metadata; close with
+`gc.outcome=fail` and machine-readable failure state.
 
 Do not publish from this step.
 

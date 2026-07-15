@@ -214,7 +214,11 @@ def validate_status_coverage(
     has_blocked_coverage = any(
         item.get("status") == "blocked" for item in coverage
     )
-    if status in {"changes_required", "blocked"} and not has_blocked_coverage:
+    if (
+        status in {"changes_required", "blocked"}
+        and coverage
+        and not has_blocked_coverage
+    ):
         raise ValidationError(
             f"review status {status!r} requires at least one blocked coverage entry"
         )

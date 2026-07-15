@@ -1802,18 +1802,43 @@ def validate_workflow_lineage(beads: Sequence[Mapping[str, Any]], root_id: str) 
             )
 
 
+CLOSED_PASS_EMPTY_METADATA = (
+    "gc.blocked_reason",
+    "gc.failure_class",
+    "gc.restart.entrypoint",
+    "gc.restart.reason",
+    "gc.restart.review_report_path",
+    "gc.restart.review_fix_formula",
+    "gc.restart.implementation_target",
+)
+CLOSED_PASS_ALLOWED_STATES = {
+    "gc.build.status": {"completed"},
+    "gc.build.finalize_status": {"completed"},
+    "gc.build.finalize_outcome": {"success"},
+    "gc.build.repair_status": {"not_needed", "approved"},
+}
+
+
+def closed_pass_failure_metadata(bead: Mapping[str, Any]) -> list[tuple[str, str]]:
+    stale = [
+        (key, metadata_value(bead, key))
+        for key in CLOSED_PASS_EMPTY_METADATA
+        if metadata_value(bead, key).strip()
+    ]
+    for key, allowed in CLOSED_PASS_ALLOWED_STATES.items():
+        value = metadata_value(bead, key).strip()
+        if value and value not in allowed:
+            stale.append((key, value))
+    return stale
+
+
 def require_closed_pass_lineage_bead(bead: Mapping[str, Any], context: str) -> None:
     if str(bead.get("status") or "") != "closed" or metadata_value(bead, "gc.outcome") != "pass":
         raise GateError(f"{context} must be closed/pass")
-    stale = [
-        f"{key}={metadata_value(bead, key)!r}"
-        for key in ("gc.blocked_reason", "gc.failure_class")
-        if metadata_value(bead, key).strip()
-    ]
-    if metadata_value(bead, "gc.build.status") == "blocked":
-        stale.append("gc.build.status='blocked'")
+    stale = closed_pass_failure_metadata(bead)
     if stale:
-        raise GateError(f"{context} has stale failure metadata: {', '.join(stale)}")
+        details = ", ".join(f"{key}={value!r}" for key, value in stale)
+        raise GateError(f"{context} has stale failure metadata: {details}")
 
 
 def workflow_finalizers(
@@ -1868,13 +1893,7 @@ def wait_for_workflow_pass(
                             + collect_diagnostics(gc_bin, workspace, env=env)
                         ) from exc
 
-                    stale_markers = [
-                        (key, metadata_value(last_bead, key))
-                        for key in ("gc.blocked_reason", "gc.failure_class")
-                        if metadata_value(last_bead, key).strip()
-                    ]
-                    if metadata_value(last_bead, "gc.build.status") == "blocked":
-                        stale_markers.append(("gc.build.status", "blocked"))
+                    stale_markers = closed_pass_failure_metadata(last_bead)
                     if stale_markers:
                         details = ", ".join(f"{key}={value!r}" for key, value in stale_markers)
                         raise GateError(

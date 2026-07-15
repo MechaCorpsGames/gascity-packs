@@ -1,8 +1,9 @@
 # Base build artifact schema. Schema IDs are immutable once published;
 # breaking changes require a new version ID (for example gc.build.review.v2).
 # Base schemas must not require owner, stage-owner, persona, or role fields.
-# The shared validator requires changes_required/blocked artifacts to contain
-# blocked coverage and forbids blocked coverage on approved artifacts.
+# When coverage is non-empty, the shared validator requires
+# changes_required/blocked artifacts to contain blocked coverage. Approved
+# artifacts always forbid blocked coverage.
 schema_id: gc.build.review.v1
 artifact: review
 allowed_statuses:

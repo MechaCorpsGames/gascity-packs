@@ -417,6 +417,15 @@ trace:
         changes_with_blocker = approved_with_blocker.replace(
             "\nstatus: approved\n", "\nstatus: changes_required\n"
         )
+        changes_without_source_ids = changes_without_blocker.replace(
+            "  coverage:\n"
+            "    - id: GC-METH-001\n"
+            "      status: covered\n"
+            "    - id: GC-METH-012\n"
+            "      status: deferred\n"
+            "      rationale: Derived-pack compatibility is verified by a later work item.\n",
+            "  coverage: []\n",
+        )
 
         for text in (changes_without_blocker, blocked_without_blocker):
             front_matter = build_artifact_validator.parse_front_matter(text)[1]
@@ -441,6 +450,10 @@ trace:
             changes_with_blocker, expected_schema="gc.build.review.v1"
         )
         self.assertEqual(artifact.front_matter["status"], "changes_required")
+        no_id_artifact = build_artifact_validator.validate_artifact_text(
+            changes_without_source_ids, expected_schema="gc.build.review.v1"
+        )
+        self.assertEqual(no_id_artifact.coverage, [])
 
     def test_build_artifact_requires_coverage_for_declared_upstream_ids(self) -> None:
         declared = self.valid_artifact().replace(

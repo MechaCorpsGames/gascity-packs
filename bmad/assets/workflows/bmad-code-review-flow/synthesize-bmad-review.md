@@ -41,18 +41,24 @@ The report must be valid for `gc.build.review.v1`: its first line must be
 `---`; use nested YAML front matter containing `schema`, `workflow`,
 `methodology`, `producer`, `status`, and `trace`; include a Markdown coverage
 table when coverage is non-empty; and include `## Verdict`, `## Findings`, and
-`## Verification` sections in that order. Use `status: approved` only when
-every required review lane approves. Use `status: changes_required` when any
+`## Verification` sections in that order. Approval is based on unresolved
+in-scope required fixes, not lane unanimity: use `status: approved` when none
+remain, even if a lane's `iterate` verdict contains only optional or
+out-of-scope suggestions. Use `status: changes_required` when a concrete
 required fix remains, and `status: blocked` when evidence cannot support a
 review.
 
 Keep top-level review status and coverage mechanically coherent:
 
-- `status: changes_required` or `status: blocked` requires at least one
-  `blocked` coverage row tied to a concrete required finding.
+- When coverage is non-empty, `status: changes_required` or `status: blocked`
+  requires at least one `blocked` coverage row tied to a concrete required
+  finding.
 - `status: approved` requires no `blocked` coverage rows. Covered, deferred,
   out-of-scope, not-applicable, or superseded observations may remain as
   residual evidence without preventing approval.
+- When no authoritative input declares IDs, do not invent them: omit `ids` and
+  use `coverage: []`. That `coverage: []` may accompany `changes_required` or
+  `blocked`; record the concrete required finding in `## Findings`.
 - Never emit `changes_required` merely because a lane requested optional tests,
   documentation, or behavior outside the authoritative scope.
 
