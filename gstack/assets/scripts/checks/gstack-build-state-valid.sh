@@ -20,6 +20,7 @@ BEAD_ID="${GC_BEAD_ID:-}"
 command -v gc >/dev/null 2>&1 || fail "gc is required on PATH"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required on PATH"
 command -v git >/dev/null 2>&1 || fail "git is required on PATH"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 launcher_root_from_work_dir() {
   candidate="${GC_WORK_DIR:-}"
@@ -51,7 +52,7 @@ python3 - \
   "$BEAD_ID" \
   "$LAUNCHER_ROOT" \
   "$VALIDATOR" \
-  "$LAUNCHER_ROOT/.gc/scripts/checks/gstack-report-stage-valid.sh" <<'PY'
+  "$SCRIPT_DIR/gstack-report-stage-valid.sh" <<'PY'
 from __future__ import annotations
 
 import hashlib

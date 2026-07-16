@@ -4268,6 +4268,7 @@ class FormulaAssetTests(unittest.TestCase):
         convoys_by_id: dict[str, object],
         bead_id: str,
         launcher_root: pathlib.Path | None = None,
+        run_from_pack_source: bool = False,
     ) -> subprocess.CompletedProcess:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
         source_script = (
@@ -4284,9 +4285,6 @@ class FormulaAssetTests(unittest.TestCase):
             launcher = launcher_root or (tmp / "launcher")
             checks_dir = launcher / ".gc" / "scripts" / "checks"
             checks_dir.mkdir(parents=True, exist_ok=True)
-            staged_script = checks_dir / source_script.name
-            shutil.copy2(source_script, staged_script)
-            staged_script.chmod(0o755)
             report_stage_script = (
                 packs_root
                 / "gstack"
@@ -4295,9 +4293,18 @@ class FormulaAssetTests(unittest.TestCase):
                 / "checks"
                 / "gstack-report-stage-valid.sh"
             )
-            staged_report_stage = checks_dir / report_stage_script.name
-            shutil.copy2(report_stage_script, staged_report_stage)
-            staged_report_stage.chmod(0o755)
+            executable_script = source_script
+            if run_from_pack_source:
+                for pack_check in (source_script, report_stage_script):
+                    (checks_dir / pack_check.name).unlink(missing_ok=True)
+                self.assertTrue(os.access(report_stage_script, os.X_OK))
+            else:
+                executable_script = checks_dir / source_script.name
+                shutil.copy2(source_script, executable_script)
+                executable_script.chmod(0o755)
+                staged_report_stage = checks_dir / report_stage_script.name
+                shutil.copy2(report_stage_script, staged_report_stage)
+                staged_report_stage.chmod(0o755)
             base_check = checks_dir / "build-artifact-valid.sh"
             base_check.write_text(
                 "#!/usr/bin/env bash\nset -euo pipefail\necho 'base artifact valid'\n",
@@ -4358,7 +4365,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "GC_WORK_DIR": str(launcher),
             }
             return subprocess.run(
-                [str(staged_script)],
+                [str(executable_script)],
                 env=env,
                 text=True,
                 capture_output=True,
@@ -5574,6 +5581,7 @@ class FormulaAssetTests(unittest.TestCase):
                 convoys_by_id={"launch": launch, "implementation": implementation},
                 bead_id="finalize-step",
                 launcher_root=launcher,
+                run_from_pack_source=True,
             )
             self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
 
