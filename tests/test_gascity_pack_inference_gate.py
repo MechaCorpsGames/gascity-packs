@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -1571,6 +1572,263 @@ WEEKLY_PROVIDER_QUOTA_ERROR = (
     "API Error: Request rejected (429) · you (nightly-test) have reached your "
     "weekly usage limit, add extra usage: https://example.invalid/settings"
 )
+CLAUDE_FALLBACK_WORK_DIR = Path(
+    "/home/runner/work/_temp/supported-pack-nightly/superpowers/fixture/"
+    "fi-34t-prepare-build-context"
+)
+CLAUDE_FALLBACK_PROJECT_SLUG = (
+    "-home-runner-work--temp-supported-pack-nightly-superpowers-fixture-"
+    "fi-34t-prepare-build-context"
+)
+CLAUDE_FALLBACK_SESSION_STARTED_AT = "2026-07-16T22:49:18Z"
+
+
+def raw_claude_project_dir(
+    workspace: gascity_pack_inference_gate.GateWorkspace,
+) -> Path:
+    project_dir = (
+        workspace.claude_config_dir
+        / "projects"
+        / CLAUDE_FALLBACK_PROJECT_SLUG
+    )
+    project_dir.mkdir(parents=True, exist_ok=True)
+    return project_dir
+
+
+def write_raw_claude_transcript(
+    workspace: gascity_pack_inference_gate.GateWorkspace,
+    *,
+    conversation_id: str,
+    cwd: Path,
+    timestamp: str,
+    text: str = WEEKLY_PROVIDER_QUOTA_ERROR,
+    model: str = "<synthetic>",
+    project_slug: str = CLAUDE_FALLBACK_PROJECT_SLUG,
+) -> Path:
+    entry = provider_assistant_entry(
+        text,
+        uuid=f"{conversation_id}-tip",
+        model=model,
+    )
+    entry.update(
+        {
+            "timestamp": timestamp,
+            "cwd": str(cwd),
+            "sessionId": conversation_id,
+        }
+    )
+    project_dir = workspace.claude_config_dir / "projects" / project_slug
+    project_dir.mkdir(parents=True, exist_ok=True)
+    transcript = project_dir / f"{conversation_id}.jsonl"
+    transcript.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    return transcript
+
+
+def write_raw_claude_entries(
+    workspace: gascity_pack_inference_gate.GateWorkspace,
+    *,
+    conversation_id: str,
+    entries: list[dict],
+    project_slug: str = CLAUDE_FALLBACK_PROJECT_SLUG,
+) -> Path:
+    project_dir = workspace.claude_config_dir / "projects" / project_slug
+    project_dir.mkdir(parents=True, exist_ok=True)
+    transcript = project_dir / f"{conversation_id}.jsonl"
+    transcript.write_text(
+        "".join(json.dumps(entry) + "\n" for entry in entries),
+        encoding="utf-8",
+    )
+    return transcript
+
+
+def raw_claude_entry(
+    *,
+    conversation_id: str,
+    entry_id: str,
+    timestamp: str,
+    text: str,
+    model: str,
+    parent_id: str = "",
+    cwd: Path = CLAUDE_FALLBACK_WORK_DIR,
+) -> dict:
+    entry = provider_assistant_entry(text, uuid=entry_id, model=model)
+    entry.update(
+        {
+            "parentUuid": parent_id,
+            "timestamp": timestamp,
+            "cwd": str(cwd),
+            "sessionId": conversation_id,
+        }
+    )
+    return entry
+
+
+def default_raw_claude_tip(
+    workspace: gascity_pack_inference_gate.GateWorkspace,
+    *,
+    cache,
+):
+    session = {
+        "id": "spig-a4b",
+        "template": "fixture/gc.run-operator",
+        "state": "active",
+        "work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+    }
+    return gascity_pack_inference_gate.raw_claude_session_log_tip(
+        workspace,
+        session,
+        {
+            "id": "spig-a4b",
+            "issue_type": "session",
+            "created_at": CLAUDE_FALLBACK_SESSION_STARTED_AT,
+            "metadata": {
+                "provider": "claude",
+                "template": "fixture/gc.run-operator",
+                "gc.work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+                "work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+            },
+        },
+        sessions=[session],
+        cache=cache,
+    )
+
+
+def configure_raw_claude_fallback_watchdog(tmp_path, monkeypatch):
+    workspace = gate_workspace(tmp_path)
+    commands: list[list[str]] = []
+    session = {
+        "id": "spig-a4b",
+        "session_name": "gc__run-operator-spig-a4b",
+        "template": "fixture/gc.run-operator",
+        "state": "active",
+        "last_active": "2020-01-01T00:00:00Z",
+        "attached": False,
+        "work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+    }
+    session_bead = {
+        "id": "spig-a4b",
+        "issue_type": "session",
+        "created_at": CLAUDE_FALLBACK_SESSION_STARTED_AT,
+        "metadata": {
+            "provider": "claude",
+            "template": "fixture/gc.run-operator",
+            "gc.trigger_bead_id": "fi-work",
+            "gc.trigger_bead_store_ref": "rig:fixture",
+            "gc.work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+            "work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+            "creation_complete_at": CLAUDE_FALLBACK_SESSION_STARTED_AT,
+        },
+    }
+    beads = [
+        {
+            "id": "fi-work",
+            "status": "open",
+            "metadata": {
+                "gc.root_bead_id": "fi-root",
+                "gc.root_store_ref": "rig:fixture",
+                "gc.routed_to": "fixture/gc.run-operator",
+            },
+        }
+    ]
+
+    def run_checked(command, **kwargs):
+        argv = list(command)
+        commands.append(argv)
+        if "session" in argv:
+            operation = argv[argv.index("session") + 1]
+            if operation == "list":
+                return json.dumps({"_cache_age_s": 0.25, "sessions": [session]})
+            if operation == "logs":
+                raise subprocess.CalledProcessError(
+                    1,
+                    argv,
+                    stderr="no session file found",
+                )
+            if operation == "reset":
+                return '{"status":"reset_requested"}\n'
+        if "bd" in argv and argv[argv.index("bd") + 1] == "show":
+            return json.dumps([session_bead])
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+
+    def recover() -> None:
+        gascity_pack_inference_gate.recover_terminal_provider_sessions(
+            "gc",
+            workspace,
+            env={},
+            beads=beads,
+            root_id="fi-root",
+            resets={},
+            now=0.0,
+        )
+
+    return workspace, commands, recover
+
+
+def configure_claimed_raw_claude_watchdog(tmp_path, monkeypatch):
+    workspace = gate_workspace(tmp_path)
+    commands: list[list[str]] = []
+    session_name = "gc__run-operator-spig-a4b"
+    session = {
+        "id": "spig-a4b",
+        "session_name": session_name,
+        "template": "fixture/gc.run-operator",
+        "state": "active",
+        "last_active": "2020-01-01T00:00:00Z",
+        "attached": False,
+        "work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+    }
+    session_bead = {
+        "id": "spig-a4b",
+        "issue_type": "session",
+        "created_at": CLAUDE_FALLBACK_SESSION_STARTED_AT,
+        "metadata": {
+            "provider": "claude",
+            "template": "fixture/gc.run-operator",
+            "gc.work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+            "work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+        },
+    }
+    claim = workflow_claim(session_name)
+    cache_age = [0.25]
+
+    def run_checked(command, **kwargs):
+        argv = list(command)
+        commands.append(argv)
+        if "session" in argv:
+            operation = argv[argv.index("session") + 1]
+            if operation == "list":
+                return json.dumps(
+                    {"_cache_age_s": cache_age[0], "sessions": [session]}
+                )
+            if operation == "logs":
+                raise subprocess.CalledProcessError(
+                    1,
+                    argv,
+                    stderr="no session file found",
+                )
+            if operation == "reset":
+                return '{"status":"reset_requested"}\n'
+        if "bd" in argv and argv[argv.index("bd") + 1] == "show":
+            return json.dumps([session_bead])
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+
+    def recover(*, resets, now: float, cache) -> None:
+        gascity_pack_inference_gate.recover_terminal_provider_sessions(
+            "gc",
+            workspace,
+            env={},
+            beads=[claim],
+            root_id="fi-root",
+            resets=resets,
+            now=now,
+            raw_claude_cache=cache,
+        )
+
+    return workspace, commands, cache_age, recover
 
 
 def test_provider_log_tip_classifies_weekly_quota_as_fatal() -> None:
@@ -1902,6 +2160,495 @@ def test_terminal_provider_watchdog_fails_preclaim_weekly_quota(
 
     session_bead_command = next(command for command in commands if "bd" in command)
     assert "--rig" not in session_bead_command
+    assert not any("reset" in command for command in commands)
+
+
+def test_terminal_provider_watchdog_falls_back_to_raw_claude_transcript(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, commands, recover = configure_raw_claude_fallback_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    transcript = write_raw_claude_transcript(
+        workspace,
+        conversation_id="8c52cefd-dbf8-47c1-ba1a-cc9f46380216",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp="2026-07-16T22:52:36.070Z",
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="spig-a4b.*provider_quota_exhausted",
+    ):
+        recover()
+
+    assert "--temp" in str(transcript.parent)
+    assert "_temp" in str(CLAUDE_FALLBACK_WORK_DIR)
+    assert any("logs" in command for command in commands)
+    assert not any("reset" in command for command in commands)
+
+
+def test_terminal_provider_watchdog_rejects_raw_claude_transcript_for_other_cwd(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, commands, recover = configure_raw_claude_fallback_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="unrelated-conversation",
+        cwd=Path("/home/runner/work/_temp/another-workflow/fixture/fi-other"),
+        timestamp="2026-07-16T22:52:36.070Z",
+    )
+
+    recover()
+
+    assert not any("reset" in command for command in commands)
+
+
+def test_terminal_provider_watchdog_rejects_malformed_and_unreadable_raw_transcripts(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, commands, recover = configure_raw_claude_fallback_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    project_dir = raw_claude_project_dir(workspace)
+    (project_dir / "malformed.jsonl").write_text("{not-json\n", encoding="utf-8")
+    unreadable = project_dir / "unreadable.jsonl"
+    unreadable.write_text("{}\n", encoding="utf-8")
+    unreadable.chmod(0)
+
+    recover()
+
+    assert not any("reset" in command for command in commands)
+
+
+def test_terminal_provider_watchdog_rejects_raw_transcript_older_than_session(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, commands, recover = configure_raw_claude_fallback_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="old-conversation",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp="2026-07-16T22:49:17.999Z",
+    )
+
+    recover()
+
+    assert not any("reset" in command for command in commands)
+
+
+def test_terminal_provider_watchdog_rejects_ambiguous_newest_raw_transcripts(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, commands, recover = configure_raw_claude_fallback_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    for conversation_id in ("newest-first", "newest-second"):
+        write_raw_claude_transcript(
+            workspace,
+            conversation_id=conversation_id,
+            cwd=CLAUDE_FALLBACK_WORK_DIR,
+            timestamp="2026-07-16T22:52:36.070Z",
+        )
+
+    recover()
+
+    assert not any("reset" in command for command in commands)
+
+
+def test_terminal_provider_watchdog_leaves_raw_transient_429_nonfatal(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, commands, recover = configure_raw_claude_fallback_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="transient-rate-limit",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp="2026-07-16T22:52:36.070Z",
+        text="API Error: Request rejected (429) · provider is temporarily rate limited",
+    )
+
+    recover()
+
+    assert not any("reset" in command for command in commands)
+
+
+@pytest.mark.parametrize(
+    ("sibling_state", "sibling_closed"),
+    (
+        ("active", False),
+        ("awake", False),
+        ("start-pending", False),
+        ("creating", False),
+        ("draining", False),
+        ("asleep", False),
+        ("closed", True),
+    ),
+)
+def test_raw_claude_safety_handles_same_work_dir_session_lifecycle(
+    tmp_path, monkeypatch, sibling_state, sibling_closed
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    commands: list[list[str]] = []
+    session_ids = ("spig-first", "spig-second")
+    sessions = [
+        {
+            "id": session_id,
+            "session_name": f"gc__run-operator-{session_id}",
+            "template": "fixture/gc.run-operator",
+            "state": "active" if index == 0 else sibling_state,
+            "closed": False if index == 0 else sibling_closed,
+            "last_active": "2020-01-01T00:00:00Z",
+            "attached": False,
+            "work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+        }
+        for index, session_id in enumerate(session_ids)
+    ]
+    session_beads = {
+        session_id: {
+            "id": session_id,
+            "issue_type": "session",
+            "created_at": CLAUDE_FALLBACK_SESSION_STARTED_AT,
+            "metadata": {
+                "provider": "claude",
+                "template": "fixture/gc.run-operator",
+                "gc.trigger_bead_id": f"fi-work-{index}",
+                "gc.trigger_bead_store_ref": "rig:fixture",
+                "gc.work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+                "work_dir": str(CLAUDE_FALLBACK_WORK_DIR),
+            },
+        }
+        for index, session_id in enumerate(session_ids, start=1)
+    }
+    beads = [
+        {
+            "id": f"fi-work-{index}",
+            "status": "open",
+            "metadata": {
+                "gc.root_bead_id": "fi-root",
+                "gc.root_store_ref": "rig:fixture",
+                "gc.routed_to": "fixture/gc.run-operator",
+            },
+        }
+        for index in range(1, 3)
+    ]
+
+    def run_checked(command, **kwargs):
+        argv = list(command)
+        commands.append(argv)
+        if "session" in argv:
+            operation = argv[argv.index("session") + 1]
+            if operation == "list":
+                return json.dumps({"_cache_age_s": 0.25, "sessions": sessions})
+            if operation == "logs":
+                raise subprocess.CalledProcessError(1, argv)
+            if operation == "reset":
+                return '{"status":"reset_requested"}\n'
+        if "bd" in argv and argv[argv.index("bd") + 1] == "show":
+            session_id = argv[argv.index("show") + 1]
+            return json.dumps([session_beads[session_id]])
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="shared-work-dir-quota",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp="2026-07-16T22:52:36.070Z",
+    )
+
+    def recover() -> None:
+        gascity_pack_inference_gate.recover_terminal_provider_sessions(
+            "gc",
+            workspace,
+            env={},
+            beads=beads,
+            root_id="fi-root",
+            resets={},
+            now=0.0,
+        )
+
+    if sibling_closed:
+        with pytest.raises(
+            gascity_pack_inference_gate.GateError,
+            match="spig-first.*provider_quota_exhausted",
+        ):
+            recover()
+    else:
+        recover()
+
+    assert not any("reset" in command for command in commands)
+
+
+def test_raw_claude_safety_uses_active_dag_tip_not_last_appended_branch(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, commands, recover = configure_raw_claude_fallback_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    conversation_id = "forked-conversation"
+    root = {
+        "uuid": "root-prompt",
+        "parentUuid": "",
+        "type": "user",
+        "timestamp": "2026-07-16T22:50:00.000Z",
+        "cwd": str(CLAUDE_FALLBACK_WORK_DIR),
+        "sessionId": conversation_id,
+        "message": {"role": "user", "content": "continue"},
+    }
+    healthy_active_tip = raw_claude_entry(
+        conversation_id=conversation_id,
+        entry_id="healthy-active-tip",
+        parent_id="root-prompt",
+        timestamp="2026-07-16T22:52:00.000Z",
+        text="Current work completed normally.",
+        model="claude-sonnet",
+    )
+    abandoned_quota_tip = raw_claude_entry(
+        conversation_id=conversation_id,
+        entry_id="abandoned-quota-tip",
+        parent_id="root-prompt",
+        timestamp="2026-07-16T22:51:00.000Z",
+        text=WEEKLY_PROVIDER_QUOTA_ERROR,
+        model="<synthetic>",
+    )
+    write_raw_claude_entries(
+        workspace,
+        conversation_id=conversation_id,
+        entries=[root, healthy_active_tip, abandoned_quota_tip],
+    )
+
+    recover()
+
+    assert not any("reset" in command for command in commands)
+
+
+def test_raw_claude_safety_reset_rejects_preexisting_different_path(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, _, _, recover = configure_claimed_raw_claude_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    reset_boundary = datetime.now(timezone.utc)
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="source-terminal",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp=(reset_boundary - timedelta(minutes=2)).isoformat(),
+        text=TERMINAL_TOOL_USE_ERROR,
+    )
+    resets = {}
+    cache = {}
+
+    recover(resets=resets, now=0.0, cache=cache)
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="preexisting-healthy",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp=(reset_boundary - timedelta(seconds=1)).isoformat(),
+        text="Healthy conversation that already existed before reset.",
+        model="claude-sonnet",
+    )
+    recover(resets=resets, now=1.0, cache=cache)
+
+    assert resets["spig-a4b"].recovery_evidence == ""
+
+
+def test_raw_claude_safety_reset_accepts_conversation_started_after_reset(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, _, _, recover = configure_claimed_raw_claude_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    source_started_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="source-terminal",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp=source_started_at.isoformat(),
+        text=TERMINAL_TOOL_USE_ERROR,
+    )
+    resets = {}
+    cache = {}
+
+    recover(resets=resets, now=0.0, cache=cache)
+    fresh = write_raw_claude_transcript(
+        workspace,
+        conversation_id="post-reset-healthy",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        text="Healthy progress produced after reset.",
+        model="claude-sonnet",
+    )
+    recover(resets=resets, now=1.0, cache=cache)
+
+    assert resets["spig-a4b"].recovery_evidence == (
+        f"fresh provider transcript {fresh} at post-reset-healthy-tip"
+    )
+
+
+def test_raw_claude_safety_stale_session_cache_disables_reset_fallback(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, _, cache_age, recover = configure_claimed_raw_claude_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="source-terminal",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp=(datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
+        text=TERMINAL_TOOL_USE_ERROR,
+    )
+    resets = {}
+    cache = {}
+
+    recover(resets=resets, now=0.0, cache=cache)
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="fresh-but-unproven",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        text="Healthy progress seen only through a stale session listing.",
+        model="claude-sonnet",
+    )
+    cache_age[0] = gascity_pack_inference_gate.TERMINAL_PROVIDER_MAX_SESSION_CACHE_AGE + 1
+    recover(resets=resets, now=1.0, cache=cache)
+
+    assert resets["spig-a4b"].recovery_evidence == ""
+
+
+def test_raw_claude_safety_persistent_cache_invalidates_when_file_becomes_unreadable(
+    tmp_path,
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    transcript = write_raw_claude_transcript(
+        workspace,
+        conversation_id="cached-quota",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp="2026-07-16T22:52:36.070Z",
+    )
+    cache = {}
+    initial = default_raw_claude_tip(workspace, cache=cache)
+    assert initial is not None
+    assert initial.fatal_error == "provider_quota_exhausted"
+
+    transcript.chmod(0)
+    try:
+        assert default_raw_claude_tip(workspace, cache=cache) is None
+    finally:
+        transcript.chmod(0o600)
+
+
+def test_raw_claude_safety_persistent_cache_invalidates_on_append(tmp_path) -> None:
+    workspace = gate_workspace(tmp_path)
+    transcript = write_raw_claude_transcript(
+        workspace,
+        conversation_id="cached-conversation",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp="2026-07-16T22:52:00.000Z",
+        text="Healthy initial response.",
+        model="claude-sonnet",
+    )
+    cache = {}
+    initial = default_raw_claude_tip(workspace, cache=cache)
+    assert initial is not None
+    assert initial.fatal_error == ""
+
+    appended_quota = raw_claude_entry(
+        conversation_id="cached-conversation",
+        entry_id="appended-quota-tip",
+        parent_id="cached-conversation-tip",
+        timestamp="2026-07-16T22:53:00.000Z",
+        text=WEEKLY_PROVIDER_QUOTA_ERROR,
+        model="<synthetic>",
+    )
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(appended_quota) + "\n")
+
+    updated = default_raw_claude_tip(workspace, cache=cache)
+    assert updated is not None
+    assert updated.entry_id == "appended-quota-tip"
+    assert updated.fatal_error == "provider_quota_exhausted"
+
+
+def test_raw_claude_safety_torn_other_project_does_not_veto_valid_target(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, _, recover = configure_raw_claude_fallback_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="target-quota",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp="2026-07-16T22:52:00.000Z",
+    )
+    unrelated = write_raw_claude_transcript(
+        workspace,
+        conversation_id="unrelated-torn",
+        cwd=Path("/home/runner/work/_temp/unrelated/fixture/fi-other"),
+        timestamp="2026-07-16T22:53:00.000Z",
+        project_slug="unrelated-project",
+    )
+    with unrelated.open("a", encoding="utf-8") as handle:
+        handle.write('{"type":"assistant"')
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="spig-a4b.*provider_quota_exhausted",
+    ):
+        recover()
+
+
+def test_raw_claude_safety_torn_newer_target_conversation_fails_closed(
+    tmp_path, monkeypatch
+) -> None:
+    workspace, commands, recover = configure_raw_claude_fallback_watchdog(
+        tmp_path,
+        monkeypatch,
+    )
+    write_raw_claude_transcript(
+        workspace,
+        conversation_id="older-target-quota",
+        cwd=CLAUDE_FALLBACK_WORK_DIR,
+        timestamp="2026-07-16T22:52:00.000Z",
+    )
+    conversation_id = "newer-target-torn"
+    prefix = {
+        "uuid": "newer-target-root",
+        "parentUuid": "",
+        "type": "user",
+        "timestamp": "2026-07-16T22:53:00.000Z",
+        "cwd": str(CLAUDE_FALLBACK_WORK_DIR),
+        "sessionId": conversation_id,
+        "message": {"role": "user", "content": "continue"},
+    }
+    torn = raw_claude_project_dir(workspace) / f"{conversation_id}.jsonl"
+    torn.write_text(
+        json.dumps(prefix) + '\n{"type":"assistant"',
+        encoding="utf-8",
+    )
+
+    recover()
+
     assert not any("reset" in command for command in commands)
 
 

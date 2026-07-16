@@ -12,7 +12,7 @@ orchestration agents and runs a bounded review-leg workflow through polecat.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import json
@@ -599,6 +599,10 @@ TERMINAL_PROVIDER_SCAN_INTERVAL = 30.0
 TERMINAL_PROVIDER_STALE_AFTER = 60.0
 TERMINAL_PROVIDER_RECOVERY_TIMEOUT = 300.0
 TERMINAL_PROVIDER_MAX_SESSION_CACHE_AGE = 60.0
+RAW_CLAUDE_MAX_TRANSCRIPT_FILES = 128
+RAW_CLAUDE_MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+RAW_CLAUDE_MAX_SCAN_BYTES = 256 * 1024 * 1024
+RAW_CLAUDE_MAX_CLOCK_SKEW = 300.0
 TERMINAL_PROVIDER_ERROR_SIGNATURES = (
     "tool_use block missing required 'name' field",
 )
@@ -685,6 +689,8 @@ class TerminalProviderReset:
     claim_ids: tuple[str, ...]
     session_identities: tuple[str, ...]
     recovery_evidence: str = ""
+    requested_at_utc: datetime | None = None
+    source_conversation_started_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -694,6 +700,21 @@ class ProviderLogTip:
     synthetic: bool
     terminal_error: bool
     fatal_error: str
+    entry_at: datetime | None = None
+    conversation_started_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class RawClaudeTranscript:
+    work_dir: str
+    conversation_started_at: datetime
+    tip: ProviderLogTip | None
+
+
+RawClaudeTranscriptCache = dict[
+    Path,
+    tuple[tuple[int, int, int, int, int, int], RawClaudeTranscript | None],
+]
 
 
 def make_pack_specs() -> dict[str, PackSpec]:
@@ -2129,7 +2150,352 @@ def provider_log_tip(output: str) -> ProviderLogTip | None:
         synthetic=model == "<synthetic>",
         terminal_error=terminal_error,
         fatal_error=fatal_error,
+        entry_at=provider_timestamp(latest.get("timestamp")),
     )
+
+
+def provider_timestamp(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        observed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    return observed.astimezone(timezone.utc)
+
+
+def raw_claude_file_fingerprint(path: Path) -> tuple[int, int, int, int, int, int] | None:
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o444 == 0:
+        return None
+    if info.st_size <= 0 or info.st_size > RAW_CLAUDE_MAX_TRANSCRIPT_BYTES:
+        return None
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_mode,
+    )
+
+
+def raw_claude_active_branch(
+    entries: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]] | None:
+    nodes: dict[str, tuple[Mapping[str, Any], int]] = {}
+    children: dict[str, list[str]] = {}
+    for index, entry in enumerate(entries):
+        entry_id = str(entry.get("uuid") or "").strip()
+        if not entry_id:
+            continue
+        if entry_id in nodes:
+            return None
+        parent_value = entry.get("parentUuid")
+        logical_value = entry.get("logicalParentUuid")
+        if parent_value is not None and not isinstance(parent_value, str):
+            return None
+        if logical_value is not None and not isinstance(logical_value, str):
+            return None
+        nodes[entry_id] = (entry, index)
+        parent_id = str(parent_value or "").strip()
+        children.setdefault(parent_id, []).append(entry_id)
+    if not nodes:
+        return None
+
+    def next_id(entry: Mapping[str, Any]) -> str:
+        return str(entry.get("parentUuid") or entry.get("logicalParentUuid") or "").strip()
+
+    def fallback_parent(before_index: int, visited: set[str]) -> str:
+        eligible = [
+            (index, entry_id)
+            for entry_id, (_, index) in nodes.items()
+            if index < before_index and entry_id not in visited
+        ]
+        return max(eligible, default=(-1, ""))[1]
+
+    def branch_length(tip_id: str) -> int:
+        count = 0
+        visited: set[str] = set()
+        current_id = tip_id
+        while current_id and current_id not in visited:
+            visited.add(current_id)
+            node = nodes.get(current_id)
+            if node is None:
+                break
+            entry, index = node
+            if str(entry.get("type") or "").strip() in {"user", "assistant"}:
+                count += 1
+            parent_id = next_id(entry)
+            if parent_id and parent_id not in nodes and entry.get("logicalParentUuid"):
+                parent_id = fallback_parent(index, visited)
+            current_id = parent_id
+        return count
+
+    tips = [entry_id for entry_id in nodes if not children.get(entry_id)]
+    if not tips:
+        return None
+    tip_keys: list[tuple[datetime, int, int, str]] = []
+    for entry_id in tips:
+        entry, index = nodes[entry_id]
+        observed = provider_timestamp(entry.get("timestamp"))
+        if observed is None:
+            return None
+        tip_keys.append((observed, branch_length(entry_id), index, entry_id))
+    active_id = max(tip_keys)[3]
+
+    branch: list[Mapping[str, Any]] = []
+    visited: set[str] = set()
+    while active_id:
+        if active_id in visited:
+            return None
+        visited.add(active_id)
+        node = nodes.get(active_id)
+        if node is None:
+            break
+        entry, index = node
+        branch.append(entry)
+        parent_id = next_id(entry)
+        if parent_id and parent_id not in nodes and entry.get("logicalParentUuid"):
+            parent_id = fallback_parent(index, visited)
+        active_id = parent_id
+    branch.reverse()
+    return branch
+
+
+def read_raw_claude_transcript(
+    path: Path,
+    expected_fingerprint: tuple[int, int, int, int, int, int],
+) -> RawClaudeTranscript | None:
+    if raw_claude_file_fingerprint(path) != expected_fingerprint:
+        return None
+    try:
+        entries: list[Mapping[str, Any]] = []
+        with path.open("r", encoding="utf-8", errors="strict") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if not isinstance(entry, Mapping):
+                    return None
+                entries.append(entry)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not entries or raw_claude_file_fingerprint(path) != expected_fingerprint:
+        return None
+
+    expected_session_id = path.stem
+    session_ids = {
+        str(entry.get("sessionId") or "").strip()
+        for entry in entries
+        if str(entry.get("sessionId") or "").strip()
+    }
+    if session_ids != {expected_session_id}:
+        return None
+
+    work_dirs = {
+        str(entry.get("cwd") or "").strip()
+        for entry in entries
+        if str(entry.get("cwd") or "").strip()
+    }
+    if len(work_dirs) != 1:
+        return None
+    work_dir = next(iter(work_dirs))
+
+    conversation_timestamps = [
+        observed
+        for entry in entries
+        if str(entry.get("cwd") or "").strip() == work_dir
+        for observed in (provider_timestamp(entry.get("timestamp")),)
+        if observed is not None
+    ]
+    if not conversation_timestamps:
+        return None
+    conversation_started_at = min(conversation_timestamps)
+    if conversation_started_at > datetime.now(timezone.utc) + timedelta(
+        seconds=RAW_CLAUDE_MAX_CLOCK_SKEW
+    ):
+        return None
+
+    active_branch = raw_claude_active_branch(entries)
+    if active_branch is None:
+        return None
+    latest_assistant = next(
+        (
+            entry
+            for entry in reversed(active_branch)
+            if str(entry.get("type") or "").strip() == "assistant"
+        ),
+        None,
+    )
+    if latest_assistant is None:
+        return RawClaudeTranscript(
+            work_dir=work_dir,
+            conversation_started_at=conversation_started_at,
+            tip=None,
+        )
+    if str(latest_assistant.get("cwd") or "").strip() != work_dir:
+        return None
+    assistant_at = provider_timestamp(latest_assistant.get("timestamp"))
+    if assistant_at is None or assistant_at < conversation_started_at:
+        return None
+    if assistant_at > datetime.now(timezone.utc) + timedelta(
+        seconds=RAW_CLAUDE_MAX_CLOCK_SKEW
+    ):
+        return None
+    tip = provider_log_tip(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "transcript_path": str(path),
+                "entries": [latest_assistant],
+            }
+        )
+    )
+    if tip is None:
+        return None
+    return RawClaudeTranscript(
+        work_dir=work_dir,
+        conversation_started_at=conversation_started_at,
+        tip=replace(tip, conversation_started_at=conversation_started_at),
+    )
+
+
+def claude_project_slug(work_dir: str) -> str:
+    return re.sub(r"[^A-Za-z0-9-]", "-", work_dir)
+
+
+def raw_claude_transcript_paths(projects_root: Path, work_dir: str) -> list[Path] | None:
+    project_dir = projects_root / claude_project_slug(work_dir)
+    try:
+        project_info = project_dir.lstat()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    if not stat.S_ISDIR(project_info.st_mode) or project_dir.is_symlink():
+        return None
+
+    try:
+        entries = sorted(project_dir.iterdir(), key=lambda candidate: candidate.name)
+    except OSError:
+        return None
+    paths: list[Path] = []
+    total_bytes = 0
+    for path in entries:
+        if path.suffix != ".jsonl":
+            continue
+        fingerprint = raw_claude_file_fingerprint(path)
+        if fingerprint is None:
+            return None
+        total_bytes += fingerprint[2]
+        if total_bytes > RAW_CLAUDE_MAX_SCAN_BYTES:
+            return None
+        paths.append(path)
+        if len(paths) > RAW_CLAUDE_MAX_TRANSCRIPT_FILES:
+            return None
+    return paths
+
+
+def raw_claude_session_log_tip(
+    workspace: GateWorkspace,
+    session: Mapping[str, Any],
+    session_bead: Mapping[str, Any],
+    *,
+    sessions: Sequence[Mapping[str, Any]],
+    cache: RawClaudeTranscriptCache,
+    not_before: datetime | None = None,
+) -> ProviderLogTip | None:
+    if str(session_bead.get("issue_type") or "").strip() != "session":
+        return None
+    if metadata_value(session_bead, "provider").strip().lower() != "claude":
+        return None
+    session_template = str(session.get("template") or "").strip()
+    if not session_template or metadata_value(session_bead, "template").strip() != session_template:
+        return None
+
+    work_dirs = {
+        value
+        for key in ("gc.work_dir", "work_dir")
+        for value in (metadata_value(session_bead, key).strip(),)
+        if value
+    }
+    if len(work_dirs) != 1:
+        return None
+    work_dir = next(iter(work_dirs))
+    listed_work_dir = str(session.get("work_dir") or "").strip()
+    if not listed_work_dir or listed_work_dir != work_dir:
+        return None
+
+    normalized_work_dir = os.path.normpath(work_dir)
+    same_work_dir_sessions = [
+        candidate
+        for candidate in sessions
+        if candidate.get("closed") is not True
+        and str(candidate.get("state") or "").strip().lower() != "closed"
+        and os.path.normpath(str(candidate.get("work_dir") or "").strip())
+        == normalized_work_dir
+    ]
+    session_id = str(session.get("id") or "").strip()
+    if (
+        len(same_work_dir_sessions) != 1
+        or str(same_work_dir_sessions[0].get("id") or "").strip() != session_id
+    ):
+        return None
+
+    session_created_at = provider_timestamp(session_bead.get("created_at"))
+    if session_created_at is None:
+        return None
+    paths = raw_claude_transcript_paths(
+        workspace.claude_config_dir / "projects",
+        work_dir,
+    )
+    if paths is None:
+        return None
+
+    candidates: list[RawClaudeTranscript] = []
+    for path in paths:
+        try:
+            fingerprint = raw_claude_file_fingerprint(path)
+        except OSError:
+            return None
+        if fingerprint is None:
+            return None
+        cached = cache.get(path)
+        if cached is None or cached[0] != fingerprint:
+            transcript = read_raw_claude_transcript(path, fingerprint)
+            cache[path] = (fingerprint, transcript)
+        else:
+            transcript = cached[1]
+        if transcript is None:
+            return None
+        if (
+            transcript.work_dir == work_dir
+            and transcript.conversation_started_at >= session_created_at
+            and (not_before is None or transcript.conversation_started_at >= not_before)
+        ):
+            candidates.append(transcript)
+    if not candidates:
+        return None
+
+    newest_started_at = max(
+        transcript.conversation_started_at for transcript in candidates
+    )
+    newest = [
+        transcript
+        for transcript in candidates
+        if transcript.conversation_started_at == newest_started_at
+    ]
+    if len(newest) != 1:
+        return None
+    return newest[0].tip
 
 
 def workflow_lineage_root_ids(beads: Sequence[Mapping[str, Any]], root_id: str) -> set[str]:
@@ -2324,7 +2690,11 @@ def reconcile_terminal_provider_resets(
     sessions_by_id: Mapping[str, Mapping[str, Any]],
     resets: Mapping[str, TerminalProviderReset],
     now: float,
+    raw_claude_cache: RawClaudeTranscriptCache | None = None,
+    allow_raw_fallback: bool = True,
 ) -> None:
+    if raw_claude_cache is None:
+        raw_claude_cache = {}
     for session_id, reset in resets.items():
         if reset.recovery_evidence:
             continue
@@ -2339,7 +2709,36 @@ def reconcile_terminal_provider_resets(
             continue
 
         tip = session_log_tip(gc_bin, workspace, session_id, env=env)
-        if tip and tip.transcript_path != reset.source_transcript_path:
+        session = sessions_by_id.get(session_id)
+        if tip is None and session is not None and allow_raw_fallback:
+            session_bead = session_bead_snapshot(
+                gc_bin,
+                workspace,
+                session_id,
+                env=env,
+            )
+            if session_bead is not None:
+                tip = raw_claude_session_log_tip(
+                    workspace,
+                    session,
+                    session_bead,
+                    sessions=tuple(sessions_by_id.values()),
+                    cache=raw_claude_cache,
+                    not_before=reset.requested_at_utc,
+                )
+        observed_after_reset = tip and (
+            reset.requested_at_utc is None
+            or (
+                (tip.conversation_started_at or tip.entry_at) is not None
+                and (tip.conversation_started_at or tip.entry_at)
+                >= reset.requested_at_utc
+            )
+        )
+        if (
+            tip
+            and observed_after_reset
+            and tip.transcript_path != reset.source_transcript_path
+        ):
             if tip.fatal_error:
                 raise GateError(
                     f"session {session_id} hit fatal provider error {tip.fatal_error} "
@@ -2372,7 +2771,10 @@ def recover_terminal_provider_sessions(
     root_id: str,
     resets: dict[str, TerminalProviderReset],
     now: float,
+    raw_claude_cache: RawClaudeTranscriptCache | None = None,
 ) -> None:
+    if raw_claude_cache is None:
+        raw_claude_cache = {}
     workflow_roots = workflow_lineage_root_ids(beads, root_id)
     workflow_bead_ids = workflow_preclaim_bead_ids(beads, workflow_roots)
     sessions: list[Mapping[str, Any]] = []
@@ -2399,6 +2801,8 @@ def recover_terminal_provider_sessions(
         sessions_by_id=sessions_by_id,
         resets=resets,
         now=now,
+        raw_claude_cache=raw_claude_cache,
+        allow_raw_fallback=cache_age <= TERMINAL_PROVIDER_MAX_SESSION_CACHE_AGE,
     )
 
     if cache_age > TERMINAL_PROVIDER_MAX_SESSION_CACHE_AGE:
@@ -2440,6 +2844,7 @@ def recover_terminal_provider_sessions(
         age = provider_activity_age(last_active)
         if age is None or age < TERMINAL_PROVIDER_STALE_AFTER:
             continue
+        session_bead: Mapping[str, Any] | None = None
         if not claims:
             session_bead = session_bead_snapshot(
                 gc_bin,
@@ -2458,6 +2863,23 @@ def recover_terminal_provider_sessions(
                 continue
 
         tip = session_log_tip(gc_bin, workspace, session_id, env=env)
+        if tip is None:
+            if session_bead is None:
+                session_bead = session_bead_snapshot(
+                    gc_bin,
+                    workspace,
+                    session_id,
+                    env=env,
+                    event_beads_loader=load_event_beads_once,
+                )
+            if session_bead is not None:
+                tip = raw_claude_session_log_tip(
+                    workspace,
+                    session,
+                    session_bead,
+                    sessions=sessions,
+                    cache=raw_claude_cache,
+                )
         if tip is None:
             continue
         if tip.fatal_error:
@@ -2479,6 +2901,8 @@ def recover_terminal_provider_sessions(
             source_transcript_path=tip.transcript_path,
             claim_ids=tuple(str(bead.get("id") or "").strip() for bead in claims),
             session_identities=identities,
+            requested_at_utc=datetime.now(timezone.utc),
+            source_conversation_started_at=tip.conversation_started_at,
         )
         print(
             f"terminal-provider watchdog: requested one fresh reset for session {session_id}",
@@ -2498,6 +2922,7 @@ def wait_for_workflow_pass(
     deadline = time.monotonic() + timeout
     last_bead: dict[str, Any] | None = None
     terminal_provider_resets: dict[str, TerminalProviderReset] = {}
+    raw_claude_cache: RawClaudeTranscriptCache = {}
     next_terminal_provider_scan = 0.0
     while time.monotonic() < deadline:
         last_bead = show_bead(gc_bin, workspace, root_id, env=env)
@@ -2553,6 +2978,7 @@ def wait_for_workflow_pass(
                         root_id=root_id,
                         resets=terminal_provider_resets,
                         now=now,
+                        raw_claude_cache=raw_claude_cache,
                     )
                     next_terminal_provider_scan = now + TERMINAL_PROVIDER_SCAN_INTERVAL
                 time.sleep(poll_interval)
@@ -2571,6 +2997,7 @@ def wait_for_workflow_pass(
                 root_id=root_id,
                 resets=terminal_provider_resets,
                 now=now,
+                raw_claude_cache=raw_claude_cache,
             )
             next_terminal_provider_scan = now + TERMINAL_PROVIDER_SCAN_INTERVAL
         time.sleep(poll_interval)
