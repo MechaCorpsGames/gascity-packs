@@ -1543,6 +1543,436 @@ TERMINAL_TOOL_USE_ERROR = (
     "API Error: 400 {\"error\":{\"message\":"
     "\"tool_use block missing required 'name' field\"}}"
 )
+WEEKLY_PROVIDER_QUOTA_ERROR = (
+    "API Error: Request rejected (429) · you (nightly-test) have reached your "
+    "weekly usage limit, add extra usage: https://example.invalid/settings"
+)
+
+
+def test_provider_log_tip_classifies_weekly_quota_as_fatal() -> None:
+    tip = gascity_pack_inference_gate.provider_log_tip(
+        provider_log_snapshot(
+            provider_assistant_entry(WEEKLY_PROVIDER_QUOTA_ERROR, uuid="quota-error")
+        )
+    )
+
+    assert tip is not None
+    assert tip.fatal_error == "provider_quota_exhausted"
+
+
+def test_provider_log_tip_leaves_generic_synthetic_429_nonfatal() -> None:
+    tip = gascity_pack_inference_gate.provider_log_tip(
+        provider_log_snapshot(
+            provider_assistant_entry(
+                "API Error: Request rejected (429) · provider is temporarily rate limited",
+                uuid="transient-rate-limit",
+            )
+        )
+    )
+
+    assert tip is not None
+    assert tip.fatal_error == ""
+    assert not tip.terminal_error
+
+
+@pytest.mark.parametrize(
+    ("status", "error_class"),
+    (
+        (401, "provider_authentication_failed"),
+        (403, "provider_authorization_failed"),
+    ),
+)
+def test_provider_log_tip_classifies_terminal_provider_http_status(
+    status, error_class
+) -> None:
+    tip = gascity_pack_inference_gate.provider_log_tip(
+        provider_log_snapshot(
+            provider_assistant_entry(
+                f"API Error: Request rejected ({status}) · provider request failed",
+                uuid=f"http-{status}",
+            )
+        )
+    )
+
+    assert tip is not None
+    assert tip.fatal_error == error_class
+
+
+def test_session_bead_snapshot_falls_back_to_city_event_log(tmp_path, monkeypatch) -> None:
+    workspace = gate_workspace(tmp_path)
+    event_path = workspace.city_dir / ".gc" / "events.jsonl"
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    event_path.write_text(
+        json.dumps(
+            {
+                "type": "bead.updated",
+                "payload": {
+                    "id": "spig-a5x",
+                    "title": "fixture/gc.run-operator-1",
+                    "issue_type": "session",
+                    "metadata": {
+                        "provider": "claude",
+                        "template": "fixture/gc.run-operator",
+                        "gc.trigger_bead_id": "fi-work",
+                        "gc.trigger_bead_store_ref": "rig:fixture",
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "run_checked",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(1, ["gc", "bd", "show"])
+        ),
+    )
+
+    bead = gascity_pack_inference_gate.session_bead_snapshot(
+        "gc", workspace, "spig-a5x", env={}
+    )
+
+    assert bead is not None
+    assert bead["metadata"]["gc.trigger_bead_id"] == "fi-work"
+
+
+def test_terminal_provider_watchdog_reads_event_log_once_per_scan(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    session_ids = ("spig-first", "spig-second")
+    commands: list[list[str]] = []
+    event_log_reads = 0
+
+    def run_checked(command, **kwargs):
+        argv = list(command)
+        commands.append(argv)
+        if "session" in argv:
+            operation = argv[argv.index("session") + 1]
+            if operation == "list":
+                return json.dumps(
+                    {
+                        "sessions": [
+                            {
+                                "id": session_id,
+                                "session_name": f"gc__run-operator-{session_id}",
+                                "template": "fixture/gc.run-operator",
+                                "state": "active",
+                                "last_active": "2020-01-01T00:00:00Z",
+                                "attached": False,
+                            }
+                            for session_id in session_ids
+                        ]
+                    }
+                )
+            if operation == "logs":
+                session_id = argv[argv.index("logs") + 1]
+                return provider_log_snapshot(
+                    provider_assistant_entry(
+                        "Provider request completed normally.",
+                        uuid=f"progress-{session_id}",
+                        model="claude-sonnet",
+                    )
+                )
+        if "bd" in argv and argv[argv.index("bd") + 1] == "show":
+            raise subprocess.CalledProcessError(1, argv)
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    def list_beads_from_event_log(_workspace):
+        nonlocal event_log_reads
+        event_log_reads += 1
+        return [
+            {
+                "id": session_id,
+                "issue_type": "session",
+                "metadata": {
+                    "provider": "claude",
+                    "template": "fixture/gc.run-operator",
+                    "gc.trigger_bead_id": f"fi-work-{index}",
+                    "gc.trigger_bead_store_ref": "rig:fixture",
+                },
+            }
+            for index, session_id in enumerate(session_ids, start=1)
+        ]
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "list_beads_from_event_log",
+        list_beads_from_event_log,
+    )
+
+    gascity_pack_inference_gate.recover_terminal_provider_sessions(
+        "gc",
+        workspace,
+        env={},
+        beads=[
+            {
+                "id": f"fi-work-{index}",
+                "status": "open",
+                "metadata": {
+                    "gc.root_bead_id": "fi-root",
+                    "gc.root_store_ref": "rig:fixture",
+                    "gc.routed_to": "fixture/gc.run-operator",
+                },
+            }
+            for index in range(1, 3)
+        ],
+        root_id="fi-root",
+        resets={},
+        now=0.0,
+    )
+
+    assert event_log_reads == 1
+    inspected_sessions = {
+        command[command.index("logs") + 1]
+        for command in commands
+        if "logs" in command
+    }
+    assert inspected_sessions == set(session_ids)
+
+
+def test_terminal_provider_watchdog_ignores_unreadable_event_log_fallback(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    commands: list[list[str]] = []
+
+    def run_checked(command, **kwargs):
+        argv = list(command)
+        commands.append(argv)
+        if "session" in argv:
+            operation = argv[argv.index("session") + 1]
+            if operation == "list":
+                return json.dumps(
+                    {
+                        "sessions": [
+                            {
+                                "id": "spig-unreadable",
+                                "session_name": "gc__run-operator-spig-unreadable",
+                                "template": "fixture/gc.run-operator",
+                                "state": "active",
+                                "last_active": "2020-01-01T00:00:00Z",
+                                "attached": False,
+                            }
+                        ]
+                    }
+                )
+            if operation == "logs":
+                raise AssertionError(
+                    "session transcript must not be inspected without ownership evidence"
+                )
+        if "bd" in argv and argv[argv.index("bd") + 1] == "show":
+            raise subprocess.CalledProcessError(1, argv)
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    def unreadable_event_log(_workspace):
+        raise OSError("event log unavailable")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "list_beads_from_event_log",
+        unreadable_event_log,
+    )
+
+    gascity_pack_inference_gate.recover_terminal_provider_sessions(
+        "gc",
+        workspace,
+        env={},
+        beads=[
+            {
+                "id": "fi-work",
+                "status": "open",
+                "metadata": {
+                    "gc.root_bead_id": "fi-root",
+                    "gc.root_store_ref": "rig:fixture",
+                    "gc.routed_to": "fixture/gc.run-operator",
+                },
+            }
+        ],
+        root_id="fi-root",
+        resets={},
+        now=0.0,
+    )
+
+    assert "event log unavailable" in capsys.readouterr().err
+    assert not any("logs" in command for command in commands)
+
+
+def test_terminal_provider_watchdog_fails_preclaim_weekly_quota(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    commands: list[list[str]] = []
+
+    def run_checked(command, **kwargs):
+        argv = list(command)
+        commands.append(argv)
+        if "session" in argv:
+            operation = argv[argv.index("session") + 1]
+            if operation == "list":
+                return json.dumps(
+                    {
+                        "_cache_age_s": 0.25,
+                        "sessions": [
+                            {
+                                "id": "spig-a5x",
+                                "session_name": "gc__run-operator-spig-a5x",
+                                "template": "fixture/gc.run-operator",
+                                "state": "active",
+                                "last_active": "2020-01-01T00:00:00Z",
+                                "attached": False,
+                            }
+                        ],
+                    }
+                )
+            if operation == "logs":
+                return provider_log_snapshot(
+                    provider_assistant_entry(WEEKLY_PROVIDER_QUOTA_ERROR, uuid="quota-error")
+                )
+        if "bd" in argv and argv[argv.index("bd") + 1] == "show":
+            return json.dumps(
+                [
+                    {
+                        "id": "spig-a5x",
+                        "issue_type": "session",
+                        "metadata": {
+                            "provider": "claude",
+                            "template": "fixture/gc.run-operator",
+                            "gc.trigger_bead_id": "fi-work",
+                            "gc.trigger_bead_store_ref": "rig:fixture",
+                        },
+                    }
+                ]
+            )
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="spig-a5x.*provider_quota_exhausted",
+    ):
+        gascity_pack_inference_gate.recover_terminal_provider_sessions(
+            "gc",
+            workspace,
+            env={},
+            beads=[
+                {
+                    "id": "fi-work",
+                    "status": "open",
+                    "metadata": {
+                        "gc.root_bead_id": "fi-root",
+                        "gc.root_store_ref": "rig:fixture",
+                        "gc.routed_to": "fixture/gc.run-operator",
+                    },
+                }
+            ],
+            root_id="fi-root",
+            resets={},
+            now=0.0,
+        )
+
+    session_bead_command = next(command for command in commands if "bd" in command)
+    assert "--rig" not in session_bead_command
+    assert not any("reset" in command for command in commands)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        {"trigger_id": "fi-other-work", "root_id": "fi-other-root"},
+        {"trigger_store": "rig:other"},
+        {"trigger_status": "closed"},
+        {"session_provider": "other"},
+        {"session_template": "fixture/gc.other"},
+        {"trigger_route": "fixture/gc.other"},
+    ),
+    ids=(
+        "other-workflow",
+        "other-store",
+        "closed-trigger",
+        "other-provider",
+        "other-template",
+        "other-route",
+    ),
+)
+def test_terminal_provider_watchdog_ignores_unrelated_preclaim_weekly_quota(
+    tmp_path, monkeypatch, case
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    commands: list[list[str]] = []
+    session_template = case.get("session_template", "fixture/gc.run-operator")
+    trigger_id = case.get("trigger_id", "fi-work")
+    session_metadata = {
+        "provider": case.get("session_provider", "claude"),
+        "template": session_template,
+        "gc.trigger_bead_id": trigger_id,
+        "gc.trigger_bead_store_ref": case.get("trigger_store", "rig:fixture"),
+    }
+    beads = [
+        {
+            "id": trigger_id,
+            "status": case.get("trigger_status", "open"),
+            "metadata": {
+                "gc.root_bead_id": case.get("root_id", "fi-root"),
+                "gc.root_store_ref": "rig:fixture",
+                "gc.routed_to": case.get("trigger_route", "fixture/gc.run-operator"),
+            },
+        }
+    ]
+
+    def run_checked(command, **kwargs):
+        argv = list(command)
+        commands.append(argv)
+        if "session" in argv:
+            operation = argv[argv.index("session") + 1]
+            if operation == "list":
+                return json.dumps(
+                    {
+                        "sessions": [
+                            {
+                                "id": "spig-unrelated",
+                                "session_name": "gc__run-operator-spig-unrelated",
+                                "template": "fixture/gc.run-operator",
+                                "state": "active",
+                                "last_active": "2020-01-01T00:00:00Z",
+                                "attached": False,
+                            }
+                        ]
+                    }
+                )
+            if operation == "logs":
+                raise AssertionError("unrelated session transcript must not be inspected")
+        if "bd" in argv and argv[argv.index("bd") + 1] == "show":
+            return json.dumps(
+                [
+                    {
+                        "id": "spig-unrelated",
+                        "issue_type": "session",
+                        "metadata": session_metadata,
+                    }
+                ]
+            )
+        raise AssertionError(f"unexpected command: {argv!r}")
+
+    monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
+
+    gascity_pack_inference_gate.recover_terminal_provider_sessions(
+        "gc",
+        workspace,
+        env={},
+        beads=beads,
+        root_id="fi-root",
+        resets={},
+        now=0.0,
+    )
+
+    assert any("bd" in command and "spig-unrelated" in command for command in commands)
+    assert not any("logs" in command or "reset" in command for command in commands)
 
 
 def exercise_terminal_provider_watchdog(
@@ -1576,13 +2006,17 @@ def exercise_terminal_provider_watchdog(
     def run_checked(command, **kwargs):
         argv = list(command)
         commands.append(argv)
-        operation = argv[argv.index("session") + 1]
-        if operation == "list":
-            return json.dumps({"sessions": sessions})
-        if operation == "logs":
-            return logs
-        if operation == "reset":
-            return '{"status":"reset_requested"}\n'
+        if "session" in argv:
+            operation = argv[argv.index("session") + 1]
+            if operation == "list":
+                return json.dumps({"sessions": sessions})
+            if operation == "logs":
+                return logs
+            if operation == "reset":
+                return '{"status":"reset_requested"}\n'
+        if "bd" in argv and argv[argv.index("bd") + 1] == "show":
+            session_id = argv[argv.index("show") + 1]
+            return json.dumps([{"id": session_id, "metadata": {}}])
         raise AssertionError(f"unexpected command: {argv!r}")
 
     monkeypatch.setattr(gascity_pack_inference_gate, "run_checked", run_checked)
@@ -1843,6 +2277,44 @@ def test_terminal_provider_recovery_rejects_same_error_in_fresh_conversation(
             env={},
             beads=[workflow_claim("gc__implementation-worker-gpig-2y5")],
             root_id="fi-root",
+            resets={"gpig-2y5": reset},
+            now=1.0,
+        )
+
+
+def test_reconcile_terminal_provider_resets_fails_fresh_weekly_quota_immediately(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = gate_workspace(tmp_path)
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "session_log_tip",
+        lambda *args, **kwargs: gascity_pack_inference_gate.ProviderLogTip(
+            transcript_path="/tmp/fresh-provider-session.jsonl",
+            entry_id="fresh-quota-error",
+            synthetic=True,
+            terminal_error=False,
+            fatal_error="provider_quota_exhausted",
+        ),
+    )
+    reset = gascity_pack_inference_gate.TerminalProviderReset(
+        requested_at=0.0,
+        source_transcript_path="/tmp/source-provider-session.jsonl",
+        claim_ids=("fi-work",),
+        session_identities=("gc__implementation-worker-gpig-2y5",),
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match="gpig-2y5.*provider_quota_exhausted",
+    ):
+        gascity_pack_inference_gate.reconcile_terminal_provider_resets(
+            "gc",
+            workspace,
+            env={},
+            beads=[workflow_claim("gc__implementation-worker-gpig-2y5")],
+            workflow_roots={"fi-root"},
+            sessions_by_id={"gpig-2y5": {"state": "active"}},
             resets={"gpig-2y5": reset},
             now=1.0,
         )

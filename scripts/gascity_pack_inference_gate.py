@@ -31,7 +31,7 @@ import tomllib
 import yaml
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -593,13 +593,25 @@ DEFAULT_GATE = "all"
 DEFAULT_TIMEOUT = "75m"
 DEFAULT_POLL_INTERVAL = "5s"
 # Gas City's progress recycler intentionally excludes sessions with live claims.
-# Recover only the known non-resumable malformed-tool history, once and with proof.
+# Reset only known non-resumable malformed-tool history, and fail current-workflow
+# sessions promptly when their provider transcript proves a permanent outage.
 TERMINAL_PROVIDER_SCAN_INTERVAL = 30.0
 TERMINAL_PROVIDER_STALE_AFTER = 60.0
 TERMINAL_PROVIDER_RECOVERY_TIMEOUT = 300.0
 TERMINAL_PROVIDER_MAX_SESSION_CACHE_AGE = 60.0
 TERMINAL_PROVIDER_ERROR_SIGNATURES = (
     "tool_use block missing required 'name' field",
+)
+FATAL_PROVIDER_ERROR_SIGNATURES = (
+    ("provider_quota_exhausted", ("reached your weekly usage limit",)),
+    (
+        "provider_authentication_failed",
+        ("request rejected (401)", "api error: 401", "http 401", "status code 401"),
+    ),
+    (
+        "provider_authorization_failed",
+        ("request rejected (403)", "api error: 403", "http 403", "status code 403"),
+    ),
 )
 BD_LIST_LIMIT = "1000"
 INHERITED_ENV_KEYS = (
@@ -681,6 +693,7 @@ class ProviderLogTip:
     entry_id: str
     synthetic: bool
     terminal_error: bool
+    fatal_error: str
 
 
 def make_pack_specs() -> dict[str, PackSpec]:
@@ -2096,6 +2109,16 @@ def provider_log_tip(output: str) -> ProviderLogTip | None:
     terminal_error = model == "<synthetic>" and any(
         signature in serialized for signature in TERMINAL_PROVIDER_ERROR_SIGNATURES
     )
+    fatal_error = ""
+    if model == "<synthetic>":
+        fatal_error = next(
+            (
+                error_class
+                for error_class, signatures in FATAL_PROVIDER_ERROR_SIGNATURES
+                if any(signature in serialized for signature in signatures)
+            ),
+            "",
+        )
     entry_id = str(latest.get("uuid") or latest.get("timestamp") or "").strip()
     if not entry_id:
         entry_id = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -2104,6 +2127,7 @@ def provider_log_tip(output: str) -> ProviderLogTip | None:
         entry_id=entry_id,
         synthetic=model == "<synthetic>",
         terminal_error=terminal_error,
+        fatal_error=fatal_error,
     )
 
 
@@ -2130,6 +2154,21 @@ def workflow_lineage_root_ids(beads: Sequence[Mapping[str, Any]], root_id: str) 
                         roots.add(nested_id)
                         pending.append(nested_id)
     return roots
+
+
+def workflow_preclaim_bead_ids(
+    beads: Sequence[Mapping[str, Any]], workflow_roots: set[str]
+) -> set[str]:
+    bead_ids: set[str] = set()
+    for bead in beads:
+        bead_id = str(bead.get("id") or "").strip()
+        if not bead_id or str(bead.get("status") or "").strip() != "open":
+            continue
+        if str(bead.get("assignee") or "").strip():
+            continue
+        if bead_id in workflow_roots or metadata_value(bead, "gc.root_bead_id") in workflow_roots:
+            bead_ids.add(bead_id)
+    return bead_ids
 
 
 def session_assignment_identities(session: Mapping[str, Any]) -> tuple[str, ...]:
@@ -2193,6 +2232,87 @@ def session_log_tip(
     return provider_log_tip(output)
 
 
+def session_bead_snapshot(
+    gc_bin: str,
+    workspace: GateWorkspace,
+    session_id: str,
+    *,
+    env: Mapping[str, str],
+    event_beads_loader: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+) -> Mapping[str, Any] | None:
+    payload: Any | None = None
+    try:
+        output = run_checked(
+            [
+                gc_bin,
+                "--city",
+                str(workspace.city_dir),
+                "bd",
+                "show",
+                session_id,
+                "--json",
+            ],
+            env=env,
+            timeout=parse_duration("30s"),
+        )
+        payload = extract_json_payload(output)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+
+    candidates: Sequence[Any]
+    if isinstance(payload, Mapping):
+        candidates = (payload,)
+    elif isinstance(payload, list):
+        candidates = payload
+    else:
+        candidates = ()
+    matches = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, Mapping)
+        and str(candidate.get("id") or "").strip() == session_id
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    event_beads = (
+        event_beads_loader()
+        if event_beads_loader is not None
+        else list_beads_from_event_log(workspace)
+    )
+    return find_bead_by_id(event_beads, session_id)
+
+
+def session_has_current_preclaim_trigger(
+    session: Mapping[str, Any],
+    session_bead: Mapping[str, Any] | None,
+    beads: Sequence[Mapping[str, Any]],
+    workflow_bead_ids: set[str],
+    *,
+    expected_store_ref: str,
+) -> bool:
+    if session_bead is None or str(session_bead.get("issue_type") or "").strip() != "session":
+        return False
+    session_template = str(session.get("template") or "").strip()
+    if not session_template:
+        return False
+    if metadata_value(session_bead, "provider").strip().lower() != "claude":
+        return False
+    if metadata_value(session_bead, "template").strip() != session_template:
+        return False
+
+    trigger_bead_id = metadata_value(session_bead, "gc.trigger_bead_id").strip()
+    trigger_store_ref = metadata_value(session_bead, "gc.trigger_bead_store_ref").strip()
+    if trigger_store_ref != expected_store_ref or trigger_bead_id not in workflow_bead_ids:
+        return False
+    trigger = find_bead_by_id(beads, trigger_bead_id)
+    if trigger is None:
+        return False
+    return (
+        metadata_value(trigger, "gc.root_store_ref").strip() == expected_store_ref
+        and metadata_value(trigger, "gc.routed_to").strip() == session_template
+    )
+
+
 def reconcile_terminal_provider_resets(
     gc_bin: str,
     workspace: GateWorkspace,
@@ -2219,6 +2339,11 @@ def reconcile_terminal_provider_resets(
 
         tip = session_log_tip(gc_bin, workspace, session_id, env=env)
         if tip and tip.transcript_path != reset.source_transcript_path:
+            if tip.fatal_error:
+                raise GateError(
+                    f"session {session_id} hit fatal provider error {tip.fatal_error} "
+                    f"in its fresh conversation transcript {tip.transcript_path}"
+                )
             if tip.terminal_error:
                 raise GateError(
                     f"session {session_id} hit the same terminal provider error in its fresh conversation"
@@ -2248,6 +2373,7 @@ def recover_terminal_provider_sessions(
     now: float,
 ) -> None:
     workflow_roots = workflow_lineage_root_ids(beads, root_id)
+    workflow_bead_ids = workflow_preclaim_bead_ids(beads, workflow_roots)
     sessions: list[Mapping[str, Any]] = []
     cache_age = math.inf
     try:
@@ -2281,6 +2407,21 @@ def recover_terminal_provider_sessions(
         )
         return
 
+    event_beads: Sequence[Mapping[str, Any]] | None = None
+
+    def load_event_beads_once() -> Sequence[Mapping[str, Any]]:
+        nonlocal event_beads
+        if event_beads is None:
+            try:
+                event_beads = list_beads_from_event_log(workspace)
+            except OSError as exc:
+                print(
+                    f"terminal-provider watchdog could not read event-log session fallback: {exc}",
+                    file=sys.stderr,
+                )
+                event_beads = ()
+        return event_beads
+
     for session in sessions:
         session_id = str(session.get("id") or "").strip()
         state = str(session.get("state") or "").strip().lower()
@@ -2295,15 +2436,35 @@ def recover_terminal_provider_sessions(
 
         identities = session_assignment_identities(session)
         claims = workflow_claims_for_identities(beads, workflow_roots, identities)
-        if not claims:
-            continue
-
         age = provider_activity_age(last_active)
         if age is None or age < TERMINAL_PROVIDER_STALE_AFTER:
             continue
+        if not claims:
+            session_bead = session_bead_snapshot(
+                gc_bin,
+                workspace,
+                session_id,
+                env=env,
+                event_beads_loader=load_event_beads_once,
+            )
+            if not session_has_current_preclaim_trigger(
+                session,
+                session_bead,
+                beads,
+                workflow_bead_ids,
+                expected_store_ref=f"rig:{workspace.rig_name}",
+            ):
+                continue
 
         tip = session_log_tip(gc_bin, workspace, session_id, env=env)
-        if tip is None or not tip.terminal_error:
+        if tip is None:
+            continue
+        if tip.fatal_error:
+            raise GateError(
+                f"session {session_id} hit fatal provider error {tip.fatal_error} "
+                f"in transcript {tip.transcript_path}"
+            )
+        if not claims or not tip.terminal_error:
             continue
 
         try:
