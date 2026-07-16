@@ -968,6 +968,7 @@ def write_gate_workspace(
             "[daemon]",
             "formula_v2 = true",
             'patrol_interval = "1s"',
+            f"observe_paths = [{toml_string(claude_config_dir / 'projects')}]",
             "",
         ]
     )

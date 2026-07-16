@@ -9,6 +9,7 @@ import shutil
 import shlex
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -167,6 +168,29 @@ def lineage_drain(bead_id: str, root_id: str, nested_id: str, *, root_key: str =
             "gc.drain_manifest.v1": json.dumps(manifest),
         },
     )
+
+
+def test_write_gate_workspace_observes_isolated_claude_projects(tmp_path) -> None:
+    pack_source = tmp_path / "repo" / "gascity"
+    roles_source = pack_source / "roles"
+    pack_source.mkdir(parents=True)
+    roles_source.mkdir()
+
+    workspace = gascity_pack_inference_gate.write_gate_workspace(
+        tmp_path / "gate",
+        pack_source=pack_source,
+        roles_source=roles_source,
+        city_name="inference-city",
+        rig_name="fixture",
+    )
+
+    city_config = tomllib.loads(
+        (workspace.city_dir / "city.toml").read_text(encoding="utf-8")
+    )
+
+    assert city_config["daemon"]["observe_paths"] == [
+        str(workspace.claude_config_dir / "projects")
+    ]
 
 
 def test_write_gate_workspace_uses_city_and_rig_scope_imports(tmp_path) -> None:
