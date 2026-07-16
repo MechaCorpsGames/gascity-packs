@@ -748,7 +748,7 @@ if [ "$SCHEMA" = "gc.build.review.v1" ]; then
       fail "required internal review report metadata gc.build.code_review_report_path is missing"
     fi
   fi
-  if [ -n "$INTERNAL_RAW" ] && [ "$RESOLVED_KEY" != "gc.build.code_review_report_path" ]; then
+  if [ "$REQUIRE_INTERNAL" = "true" ] && [ -n "$INTERNAL_RAW" ] && [ "$RESOLVED_KEY" != "gc.build.code_review_report_path" ]; then
     INTERNAL_PATH="$(resolve_declared_path "$INTERNAL_RAW" "gc.build.code_review_report_path")"
     [ -f "$INTERNAL_PATH" ] || fail "internal review report does not exist: $INTERNAL_PATH"
     [ ! -L "$INTERNAL_PATH" ] || fail "internal review report must not be a symlink: $INTERNAL_PATH"

@@ -11702,6 +11702,246 @@ description = "Override sink that writes the base triage report contract."
                         "true",
                     )
 
+    def test_superpowers_gap_review_is_not_an_adapter_copy_of_implementation_review(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifact_root = pathlib.Path(td).resolve()
+            subject = artifact_root / "implementation-summary.md"
+            subject.write_text("# Current implementation\n", encoding="utf-8")
+            implementation_report = artifact_root / "implementation-review-report.md"
+            gap_report = artifact_root / "gap-analysis-report.md"
+
+            def write_reports(*, gap_stage: str = "gap-analysis-review") -> None:
+                implementation_report.write_text(
+                    self._valid_methodology_review_artifact(
+                        subject,
+                        workflow_id="root",
+                        workflow_formula="superpowers-build",
+                        pack="superpowers",
+                        methodology_name="superpowers-code-review",
+                        producer_formula="superpowers-code-review",
+                        producer_stage="request-code-review",
+                    ),
+                    encoding="utf-8",
+                )
+                gap_report.write_text(
+                    self._valid_methodology_review_artifact(
+                        subject,
+                        workflow_id="root",
+                        workflow_formula="superpowers-build",
+                        pack="superpowers",
+                        methodology_name="superpowers-code-review",
+                        producer_formula="superpowers-code-review",
+                        producer_stage=gap_stage,
+                    ),
+                    encoding="utf-8",
+                )
+
+            loop_step = "review.superpowers-code-review-loop"
+            implementation_step = "review.request-code-review"
+            gap_step = "review.gap-analysis-review"
+            implementation_control = "review.request-code-review-scope-check"
+            gap_control = "review.gap-analysis-review-scope-check"
+
+            def producer(
+                *,
+                step_id: str,
+                run_target: str,
+                path_key: str,
+                path: pathlib.Path,
+                verdict_key: str,
+                report_key: str,
+            ) -> dict[str, object]:
+                return {
+                    "id": step_id,
+                    "status": "closed",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "2",
+                        "gc.ralph_step_id": loop_step,
+                        "gc.scope_ref": f"{loop_step}.iteration.2",
+                        "gc.scope_role": "member",
+                        "gc.step_id": step_id,
+                        "gc.step_ref": f"{loop_step}.iteration.2.{step_id}",
+                        "gc.outcome": "pass",
+                        "gc.run_target": run_target,
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": path_key,
+                        verdict_key: "iterate",
+                        report_key: str(path),
+                        "code_review.output_path": str(path),
+                    },
+                }
+
+            def control(control_id: str, producer_id: str) -> dict[str, object]:
+                producer_step_ref = f"{loop_step}.iteration.2.{producer_id}"
+                return {
+                    "id": control_id,
+                    "status": "closed",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "2",
+                        "gc.ralph_step_id": loop_step,
+                        "gc.scope_ref": f"{loop_step}.iteration.2",
+                        "gc.scope_role": "control",
+                        "gc.kind": "scope-check",
+                        "gc.control_for": producer_step_ref,
+                        "gc.step_id": producer_id,
+                        "gc.outcome": "pass",
+                    },
+                    "dependencies": [
+                        {
+                            "issue_id": control_id,
+                            "depends_on_id": producer_id,
+                            "type": "blocks",
+                        },
+                        {
+                            "issue_id": control_id,
+                            "depends_on_id": "root",
+                            "type": "tracks",
+                        },
+                    ],
+                }
+
+            rows = [
+                producer(
+                    step_id=implementation_step,
+                    run_target="superpowers.code-reviewer",
+                    path_key="gc.build.code_review_report_path",
+                    path=implementation_report,
+                    verdict_key="code_review.review_verdict",
+                    report_key="code_review.review_report_path",
+                ),
+                producer(
+                    step_id=gap_step,
+                    run_target="superpowers.code-quality-reviewer",
+                    path_key="gc.build.gap_analysis_report_path",
+                    path=gap_report,
+                    verdict_key="code_review.gap_verdict",
+                    report_key="code_review.gap_report_path",
+                ),
+                control(implementation_control, implementation_step),
+                control(gap_control, gap_step),
+                {
+                    "id": "review.report-code-review-findings",
+                    "status": "closed",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": "2",
+                        "gc.ralph_step_id": loop_step,
+                        "gc.scope_ref": f"{loop_step}.iteration.2",
+                        "gc.scope_role": "member",
+                        "gc.step_id": "review.report-code-review-findings",
+                        "gc.outcome": "pass",
+                        "gc.review.report_terminal": "true",
+                        "code_review.verdict": "reported",
+                        "code_review.report_path": str(implementation_report),
+                        "code_review.output_path": str(implementation_report),
+                    },
+                    "dependencies": [
+                        {
+                            "issue_id": "review.report-code-review-findings",
+                            "depends_on_id": control_id,
+                            "type": "blocks",
+                        }
+                        for control_id in (implementation_control, gap_control)
+                    ],
+                },
+            ]
+            loop_json = json.dumps(
+                [
+                    {
+                        "id": "loop",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.step_id": loop_step,
+                            "gc.review.require_current_report_terminal": "true",
+                            "gc.review.require_artifact_producer_binding": "true",
+                        },
+                    }
+                ]
+            )
+            root_json = json.dumps(
+                [
+                    {
+                        "id": "root",
+                        "metadata": {
+                            "gc.formula_name": "superpowers-build",
+                            "gc.var.review_mode": "report",
+                            "gc.build.code_review_artifact_root": str(artifact_root),
+                            "gc.build.code_review_report_path": str(
+                                implementation_report
+                            ),
+                            "gc.build.gap_analysis_report_path": str(gap_report),
+                            "gc.build.review_subject_path": str(subject),
+                        },
+                    }
+                ]
+            )
+
+            write_reports()
+            self.assertNotEqual(
+                implementation_report.read_bytes(),
+                gap_report.read_bytes(),
+                "the two Superpowers review producers must retain distinct identities",
+            )
+            correct_producer = self._run_implementation_review_check(
+                show_json=loop_json,
+                parent_show_json=root_json,
+                list_json=json.dumps(rows),
+                extra_env={"GC_ITERATION": "2"},
+            )
+            self.assertEqual(
+                correct_producer.returncode,
+                0,
+                correct_producer.stdout + correct_producer.stderr,
+            )
+
+            write_reports(gap_stage="request-code-review")
+            wrong_producer = self._run_implementation_review_check(
+                show_json=loop_json,
+                parent_show_json=root_json,
+                list_json=json.dumps(rows),
+                extra_env={"GC_ITERATION": "2"},
+            )
+            self.assertNotEqual(
+                wrong_producer.returncode,
+                0,
+                wrong_producer.stdout + wrong_producer.stderr,
+            )
+            self.assertIn("producer.stage", wrong_producer.stderr)
+
+            write_reports()
+            gap_control_json = json.dumps(
+                [
+                    {
+                        "id": "gap-review",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.build.artifact_schema": "gc.build.review.v1",
+                            "gc.build.artifact_path_keys": (
+                                "gc.build.gap_analysis_report_path"
+                            ),
+                            "gc.build.require_review_status_coverage": "true",
+                        },
+                    }
+                ]
+            )
+            distinct_gap = self._run_build_artifact_check(
+                {"gap-review": gap_control_json, "root": root_json},
+                "gap-review",
+            )
+
+        self.assertEqual(
+            distinct_gap.returncode,
+            0,
+            "a valid gap-analysis producer report is not an adapter copy of the "
+            "implementation review report\n"
+            + distinct_gap.stdout
+            + distinct_gap.stderr,
+        )
+
     def test_methodology_review_fixes_refresh_authoritative_member_provenance(
         self,
     ) -> None:
@@ -13128,6 +13368,7 @@ description = "Override sink that writes the base triage report contract."
                         "gc.root_bead_id": "root",
                         "gc.build.artifact_schema": "gc.build.review.v1",
                         "gc.build.artifact_path_keys": "gc.var.report_path",
+                        "gc.build.require_internal_review_report": "true",
                     },
                 }]
             )
@@ -13165,6 +13406,7 @@ description = "Override sink that writes the base triage report contract."
                         "gc.root_bead_id": "root",
                         "gc.build.artifact_schema": "gc.build.review.v1",
                         "gc.build.artifact_path_keys": "gc.var.report_path",
+                        "gc.build.require_internal_review_report": "true",
                     },
                 }]
             )
