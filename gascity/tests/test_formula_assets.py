@@ -8986,7 +8986,10 @@ description = "Override sink that writes the base triage report contract."
             "gc.scope_ref": "review.build-basic-review-loop.iteration.1",
             "gc.scope_role": "member",
             "gc.outcome": "pass",
-            "code_review.reviewed_attempt": "1",
+            # Beads metadata preserves agent-written JSON numbers. The runtime
+            # loop attempt is a string, so exercise the mixed representation
+            # observed by the supported-pack nightly.
+            "code_review.reviewed_attempt": 1,
             "code_review.implementation_snapshot": snapshot,
             "code_review.review_input_snapshot": review_input_snapshot,
         }

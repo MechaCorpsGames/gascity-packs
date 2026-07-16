@@ -480,7 +480,8 @@ require_review_attempt_provenance() {
       (($rows | length) == 1) and
       (($rows[0].status // "") == "closed") and
       (($rows[0].metadata["gc.outcome"] // "") == "pass") and
-      (($rows[0].metadata["code_review.reviewed_attempt"] // "") == $attempt) and
+      ((($rows[0].metadata["code_review.reviewed_attempt"] // "") | tostring) ==
+        ($attempt | tostring)) and
       (($rows[0].metadata["code_review.implementation_snapshot"] // "") == $snapshot) and
       (($rows[0].metadata["code_review.review_input_snapshot"] // "") == $review_input);
     def lane_verdict_ok($rows; $key):
