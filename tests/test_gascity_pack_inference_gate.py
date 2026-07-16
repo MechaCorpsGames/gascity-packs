@@ -547,6 +547,79 @@ def test_supported_pack_nightly_primes_diagnostics_before_setup_and_fails_closed
         "pack_ref=pack-sha\n"
     )
 
+    step_by_name = {step.get("name"): step for step in steps}
+    prepare_name = "Prepare inference gate workdir"
+    restore_name = "Restore inference run context"
+    lifecycle_names = (
+        "Initialize inference diagnostics",
+        "Validate Ollama Claude configuration",
+        prepare_name,
+        "Run supported-pack nightly inference gate",
+        restore_name,
+        "Upload inference gate diagnostics",
+    )
+    lifecycle_violations = [
+        f"workflow is missing explicit step {name!r}"
+        for name in lifecycle_names
+        if name not in step_by_name
+    ]
+    if not lifecycle_violations:
+        positions = {
+            step.get("name"): index
+            for index, step in enumerate(steps)
+            if step.get("name") in lifecycle_names
+        }
+        if [positions[name] for name in lifecycle_names] != sorted(
+            positions[name] for name in lifecycle_names
+        ):
+            lifecycle_violations.append(
+                "workflow lifecycle must order Initialize < setup < Prepare < Run < Restore < Upload"
+            )
+    prepare = step_by_name.get(prepare_name)
+    restore = step_by_name.get(restore_name)
+    if prepare is not None and prepare.get("if") != selected_row_guard:
+        lifecycle_violations.append("Prepare must run only for selected inference rows")
+    if restore is not None and restore.get("if") != f"always() && {selected_row_guard}":
+        lifecycle_violations.append("Restore must use always() for selected inference rows")
+
+    assert not lifecycle_violations, "\n" + "\n".join(lifecycle_violations)
+    assert prepare is not None and restore is not None
+
+    lifecycle_env = {
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "MATRIX_PACK": "gascity",
+        "MATRIX_GATE": "build-basic",
+        "RUNTIME_REF": "runtime-sha",
+        "SETUP_REF": "setup-sha",
+        "PACK_REF": "pack-sha",
+    }
+    prepare_result, _ = run_workflow_script(prepare["run"], tmp_path, **lifecycle_env)
+    assert prepare_result.returncode == 0, prepare_result.stderr
+
+    gate_workdir = tmp_path / "supported-pack-nightly" / "gascity"
+    assert not gate_workdir.exists() or not any(gate_workdir.iterdir()), (
+        "Prepare must leave the exact inference gate workdir absent or empty"
+    )
+
+    gate_workdir.mkdir(parents=True, exist_ok=True)
+    gate_output = gate_workdir / "gate-output.txt"
+    gate_output.write_text("simulated gate diagnostics\n", encoding="utf-8")
+
+    restore_result, _ = run_workflow_script(restore["run"], tmp_path, **lifecycle_env)
+    assert restore_result.returncode == 0, restore_result.stderr
+    assert gate_output.read_text(encoding="utf-8") == "simulated gate diagnostics\n"
+    assert (gate_workdir / "run-context.txt").read_text(encoding="utf-8") == (
+        "run_id=123\n"
+        "run_attempt=2\n"
+        "pack=gascity\n"
+        "gate=build-basic\n"
+        "runtime_ref=runtime-sha\n"
+        "setup_ref=setup-sha\n"
+        "pack_ref=pack-sha\n"
+    )
+
 
 @pytest.mark.parametrize(
     ("selected_pack", "selected_gate", "expected"),

@@ -491,6 +491,17 @@ jobs:
           printf 'ANTHROPIC_DEFAULT_OPUS_MODEL=%s\n' "$ANTHROPIC_DEFAULT_OPUS_MODEL"
           printf 'CLAUDE_CODE_SUBAGENT_MODEL=%s\n' "$CLAUDE_CODE_SUBAGENT_MODEL"
 
+      - name: Prepare inference gate workdir
+        if: steps.subset.outputs.run_gate == 'true'
+        env:
+          MATRIX_PACK: ${{ matrix.pack }}
+        run: |
+          diagnostics_dir="$RUNNER_TEMP/supported-pack-nightly/$MATRIX_PACK"
+          staged_context_dir="$RUNNER_TEMP/supported-pack-nightly-run-context/$MATRIX_PACK"
+          mkdir -p "$staged_context_dir"
+          mv "$diagnostics_dir/run-context.txt" "$staged_context_dir/run-context.txt"
+          rmdir "$diagnostics_dir"
+
       - name: Run supported-pack nightly inference gate
         if: steps.subset.outputs.run_gate == 'true'
         env:
@@ -502,6 +513,23 @@ jobs:
             --pack "${{ matrix.pack }}" \
             --gate "${{ matrix.gate }}" \
             --timeout "$GATE_TIMEOUT"
+
+      - name: Restore inference run context
+        if: always() && steps.subset.outputs.run_gate == 'true'
+        env:
+          MATRIX_PACK: ${{ matrix.pack }}
+        run: |
+          diagnostics_dir="$RUNNER_TEMP/supported-pack-nightly/$MATRIX_PACK"
+          staged_context="$RUNNER_TEMP/supported-pack-nightly-run-context/$MATRIX_PACK/run-context.txt"
+          mkdir -p "$diagnostics_dir"
+          if [ -f "$staged_context" ]; then
+            mv "$staged_context" "$diagnostics_dir/run-context.txt"
+          else
+            test -f "$diagnostics_dir/run-context.txt" || {
+              echo "inference run context is missing" >&2
+              exit 1
+            }
+          fi
 
       - name: Upload inference gate diagnostics
         if: always() && steps.subset.outputs.run_gate == 'true'
