@@ -490,5 +490,6 @@ jobs:
           path: |
             ${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}
             !${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/gc-home/.dolt/eventsData/**
+            !${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/**/.beads/eventsData/**
           if-no-files-found: ignore
           include-hidden-files: true

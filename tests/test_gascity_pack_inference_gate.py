@@ -470,7 +470,7 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert "include-hidden-files: true" in workflow
 
 
-def test_supported_pack_nightly_excludes_volatile_dolt_telemetry_from_diagnostics() -> None:
+def test_supported_pack_nightly_excludes_volatile_database_telemetry_from_diagnostics() -> None:
     document = supported_pack_nightly_document()
     upload = next(
         step
@@ -481,6 +481,7 @@ def test_supported_pack_nightly_excludes_volatile_dolt_telemetry_from_diagnostic
     assert upload["with"]["path"].splitlines() == [
         "${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}",
         "!${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/gc-home/.dolt/eventsData/**",
+        "!${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/**/.beads/eventsData/**",
     ]
 
 
