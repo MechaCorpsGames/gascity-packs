@@ -36,9 +36,18 @@ plan accidentally includes lifecycle phases as `### Task N` sections, create
 beads only for actual source-code work from the original input task or convoy
 member and record the skipped lifecycle sections in the decomposition artifact.
 
-Create or update the implementation convoy with those beads and dependency
-edges. Record the implementation convoy ID on the workflow root under both the
-drain input and build provenance keys in one update:
+After creating every work-item bead, create the non-empty implementation convoy
+with all captured bead IDs in one command:
+
+```bash
+gc convoy create "superpowers implementation for <workflow-root-id>" <all-work-item-id...> --json
+```
+
+Do not pass `--owned`: owned convoys use a manual lifecycle and do not
+auto-close after their members close, which blocks the downstream build gate.
+Parse the implementation convoy ID from the JSON response. Record it on the
+workflow root under both the drain input and build provenance keys in one
+update:
 
 ```bash
 gc bd update "<workflow-root-id>" \

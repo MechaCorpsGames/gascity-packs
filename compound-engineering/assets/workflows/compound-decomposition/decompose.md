@@ -14,8 +14,16 @@ artificial horizontal split.
 Create the implementation work-item beads first. Each item must define one
 complete, independently verifiable product slice and preserve the actual
 requirement and plan identifiers it covers. Then create one new non-empty
-implementation convoy from those bead IDs. Do not reuse the launch convoy or
-the workflow root bead as the implementation convoy.
+implementation convoy from all captured bead IDs in one command:
+
+```bash
+gc convoy create "compound implementation for <workflow-root-id>" <all-work-item-id...> --json
+```
+
+Do not pass `--owned`: owned convoys use a manual lifecycle and do not
+auto-close after their members close, which blocks the downstream build gate.
+Parse the implementation convoy ID from the JSON response. Do not reuse the
+launch convoy or the workflow root bead as the implementation convoy.
 
 Record the new convoy ID on the workflow root bead as both
 `gc.input_convoy_id=<implementation-convoy-id>` and

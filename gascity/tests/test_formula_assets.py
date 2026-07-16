@@ -3169,6 +3169,31 @@ class FormulaAssetTests(unittest.TestCase):
                 with self.subTest(pack=pack_name, fragment=fragment):
                     self.assertIn(fragment, normalized)
 
+    def test_superpowers_and_compound_decomposition_create_auto_closing_convoys(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        prompts = {
+            "superpowers": packs_root
+            / "superpowers/assets/workflows/superpowers-build/decompose.md",
+            "compound-engineering": packs_root
+            / "compound-engineering/assets/workflows/compound-decomposition/decompose.md",
+        }
+
+        violations = []
+        for pack_name, prompt in prompts.items():
+            text = prompt.read_text(encoding="utf-8")
+            if not re.search(r"gc convoy create(?:(?!--owned).){0,240}--json", text, re.DOTALL):
+                violations.append(
+                    f"{pack_name} decomposition must prescribe an unowned "
+                    "gc convoy create ... --json command"
+                )
+            if not re.search(r"\b(?:do not|never)\b[^\n]*`--owned`", text, re.IGNORECASE):
+                violations.append(
+                    f"{pack_name} decomposition must explicitly prohibit --owned because owned "
+                    "convoys do not auto-close"
+                )
+
+        self.assertFalse(violations, "\n" + "\n".join(violations))
+
     def test_third_party_methodology_contract_wrappers_are_adapter_selectable(self) -> None:
         gascity_root = pathlib.Path(__file__).resolve().parents[1]
         packs_root = gascity_root.parent
