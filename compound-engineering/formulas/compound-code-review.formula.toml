@@ -270,7 +270,7 @@ description_file = "../assets/workflows/compound-code-review/report-review-findi
 id = "{target}"
 title = "Finalize approved Compound Engineering code review"
 needs = ["{target}.compound-code-review-loop"]
-metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "{artifact_path_keys}", "gc.build.require_internal_review_report" = "true", "gc.build.require_review_status_coverage" = "true" }
+metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "{artifact_path_keys}", "gc.build.require_internal_review_report" = "true", "gc.build.expected_internal_review_producer_stage" = "synthesize-code-review", "gc.build.expected_adapter_review_producer_stage" = "synthesize-code-review", "gc.build.require_review_status_coverage" = "true" }
 description_file = "../assets/workflows/compound-code-review/finalize-code-review.md"
 
 [template.check]

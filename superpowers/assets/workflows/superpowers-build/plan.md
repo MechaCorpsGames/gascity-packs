@@ -10,7 +10,9 @@ exactly `---` before the Markdown body. Its top-level YAML shape must be:
 - `schema: gc.build.plan.v1`
 - `workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}`
 - `methodology: {pack: superpowers, name: writing-plans}`
-- `producer: {formula: <producer-formula>, stage: plan, attempt: <positive integer>}`
+- `producer: {formula: superpowers-build, stage: plan, attempt: <positive integer>}`
+- Set `producer.attempt` to this stage's current positive `gc.attempt`; a retry
+  must update the canonical artifact to the retry's attempt before validation.
 - Use `status: draft` before plan approval. The plan-review lane changes it to
   `status: approved`; do not invent lifecycle values such as `ready`.
 - `trace: {upstream: [...], coverage: [...]}`

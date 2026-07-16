@@ -209,6 +209,137 @@ if expected_hash not in observed:
 PY
 }
 
+require_review_adapter_fidelity() {
+  internal_path="$1"
+  adapter_path="$2"
+  expected_internal_stage="$3"
+  expected_adapter_stage="$4"
+  expected_adapter_attempt="$5"
+  implementation_summary_path="$6"
+  python3 - \
+    "$internal_path" "$adapter_path" \
+    "$expected_internal_stage" "$expected_adapter_stage" \
+    "$expected_adapter_attempt" "$implementation_summary_path" <<'PY'
+import copy
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+import yaml
+
+
+def fail(message: str) -> None:
+    print(f"build-artifact-check: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def parse_report(path: Path) -> tuple[dict, str]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
+    if not match:
+        fail(f"review report has no parseable front matter: {path}")
+    front = yaml.safe_load(match.group("front")) or {}
+    if not isinstance(front, dict):
+        fail(f"review report front matter must be a mapping: {path}")
+    return front, text[match.end():]
+
+
+def producer_stage(front: dict) -> str:
+    producer = front.get("producer")
+    if not isinstance(producer, dict):
+        return ""
+    stage = producer.get("stage")
+    return stage.strip() if isinstance(stage, str) else ""
+
+
+def without_adapter_provenance(front: dict) -> dict:
+    normalized = copy.deepcopy(front)
+    producer = normalized.get("producer")
+    if isinstance(producer, dict):
+        producer.pop("stage", None)
+        producer.pop("attempt", None)
+    trace = normalized.get("trace")
+    if isinstance(trace, dict):
+        trace.pop("upstream", None)
+    return normalized
+
+
+internal_path = Path(sys.argv[1])
+adapter_path = Path(sys.argv[2])
+expected_internal_stage = sys.argv[3]
+expected_adapter_stage = sys.argv[4]
+expected_adapter_attempt = sys.argv[5]
+implementation_summary_path = Path(sys.argv[6]).resolve(strict=True)
+internal_front, internal_body = parse_report(internal_path)
+adapter_front, adapter_body = parse_report(adapter_path)
+
+observed_internal_stage = producer_stage(internal_front)
+observed_adapter_stage = producer_stage(adapter_front)
+if observed_internal_stage != expected_internal_stage:
+    fail(
+        "internal review report producer.stage mismatch: "
+        f"expected={expected_internal_stage!r} observed={observed_internal_stage!r} "
+        f"path={internal_path}"
+    )
+if observed_adapter_stage != expected_adapter_stage:
+    fail(
+        "adapter review report producer.stage mismatch: "
+        f"expected={expected_adapter_stage!r} observed={observed_adapter_stage!r} "
+        f"path={adapter_path}"
+    )
+adapter_producer = adapter_front.get("producer")
+observed_adapter_attempt = (
+    str(adapter_producer.get("attempt") or "")
+    if isinstance(adapter_producer, dict)
+    else ""
+)
+if observed_adapter_attempt != expected_adapter_attempt:
+    fail(
+        "adapter review report producer.attempt mismatch: "
+        f"expected producer.attempt={expected_adapter_attempt} "
+        f"observed={observed_adapter_attempt or '<missing>'} path={adapter_path}"
+    )
+
+adapter_trace = adapter_front.get("trace")
+adapter_upstream = (
+    adapter_trace.get("upstream") if isinstance(adapter_trace, dict) else None
+)
+expected_summary_hash = (
+    f"sha256:{hashlib.sha256(implementation_summary_path.read_bytes()).hexdigest()}"
+)
+if not isinstance(adapter_upstream, list) or len(adapter_upstream) != 1:
+    fail(
+        "adapter review report must trace exactly one current implementation summary: "
+        f"expected={implementation_summary_path} path={adapter_path}"
+    )
+summary_entry = adapter_upstream[0]
+raw_summary_path = summary_entry.get("path") if isinstance(summary_entry, dict) else None
+raw_summary_hash = summary_entry.get("hash") if isinstance(summary_entry, dict) else None
+if (
+    raw_summary_path != str(implementation_summary_path)
+    or raw_summary_hash != expected_summary_hash
+):
+    fail(
+        "adapter review report must trace the exact current implementation summary: "
+        f"expected_path={implementation_summary_path} "
+        f"expected_hash={expected_summary_hash} observed_path={raw_summary_path!r} "
+        f"observed_hash={raw_summary_hash!r} adapter={adapter_path}"
+    )
+
+if (
+    without_adapter_provenance(internal_front)
+    != without_adapter_provenance(adapter_front)
+    or internal_body != adapter_body
+):
+    fail(
+        "internal and adapter review reports must preserve identical semantic content "
+        "while allowing only adapter lifecycle provenance to differ: "
+        f"internal={internal_path} adapter={adapter_path}"
+    )
+PY
+}
+
 require_implementation_provenance() {
   artifact_path="$1"
   expected_snapshot="$2"
@@ -397,7 +528,7 @@ PY
 }
 
 current_producer_attempt() {
-  local control_epoch iteration_attempt ralph_step_id controls
+  local control_epoch iteration_attempt ralph_step_id control_for controls control_json control_label
   control_epoch="$(metadata_value "$SHOW_JSON" "gc.control_epoch")"
   if [ -n "$control_epoch" ]; then
     printf '%s\n' "$control_epoch"
@@ -406,36 +537,64 @@ current_producer_attempt() {
 
   iteration_attempt="$(metadata_value "$SHOW_JSON" "gc.attempt")"
   ralph_step_id="$(metadata_value "$SHOW_JSON" "gc.ralph_step_id")"
+  control_for="$(metadata_value "$SHOW_JSON" "gc.control_for")"
   case "$iteration_attempt" in
     ''|*[!0-9]*|0) fail "current producer attempt is invalid on $BEAD_ID: ${iteration_attempt:-<missing>}" ;;
   esac
   [ -n "$ROOT_ID" ] || fail "current producer iteration $BEAD_ID is missing gc.root_bead_id"
-  [ -n "$ralph_step_id" ] || fail "current producer iteration $BEAD_ID is missing gc.ralph_step_id"
-
-  controls="$(gc bd list --all --metadata-field \
-    "gc.root_bead_id=$ROOT_ID" --json --limit=0 2>/dev/null)" || \
-    fail "could not list current producer controls for workflow root $ROOT_ID"
-  if ! control_epoch="$(printf '%s\n' "$controls" | jq -er \
-    --arg root "$ROOT_ID" \
-    --arg step "$ralph_step_id" '
-      [.[] | select(
-        (.metadata["gc.root_bead_id"] // "") == $root and
-        (.metadata["gc.kind"] // "") == "ralph" and
-        (.metadata["gc.step_id"] // "") == $step
-      )] as $controls
-      | if ($controls | length) != 1 then
-          error("expected exactly one current producer control")
+  if [ -n "$ralph_step_id" ]; then
+    control_label="$ralph_step_id"
+    controls="$(gc bd list --all --metadata-field \
+      "gc.root_bead_id=$ROOT_ID" --json --limit=0 2>/dev/null)" || \
+      fail "could not list current producer controls for workflow root $ROOT_ID"
+    if ! control_epoch="$(printf '%s\n' "$controls" | jq -er \
+      --arg root "$ROOT_ID" \
+      --arg step "$ralph_step_id" '
+        [.[] | select(
+          (.metadata["gc.root_bead_id"] // "") == $root and
+          (.metadata["gc.kind"] // "") == "ralph" and
+          (.metadata["gc.step_id"] // "") == $step
+        )] as $controls
+        | if ($controls | length) != 1 then
+            error("expected exactly one current producer control")
+          else
+            ($controls[0].metadata["gc.control_epoch"] // "") | tostring
+          end
+      ' 2>/dev/null)"; then
+      fail "current producer iteration $BEAD_ID could not resolve exactly one logical control for $ralph_step_id"
+    fi
+  elif [ -n "$control_for" ]; then
+    control_label="$control_for"
+    control_json="$(gc bd show "$control_for" --json 2>/dev/null)" || \
+      fail "current producer iteration $BEAD_ID could not read control bead $control_for"
+    if ! control_epoch="$(printf '%s\n' "$control_json" | jq -er \
+      --arg id "$control_for" \
+      --arg root "$ROOT_ID" '
+        if type != "array" or length != 1 then
+          error("expected exactly one control bead")
         else
-          ($controls[0].metadata["gc.control_epoch"] // "") | tostring
+          .[0] as $control
+          | if (($control.id // "") | tostring) != $id then
+              error("control bead id mismatch")
+            elif ($control.metadata["gc.root_bead_id"] // "") != $root then
+              error("control bead root mismatch")
+            elif ($control.metadata["gc.kind"] // "") != "ralph" then
+              error("control bead kind mismatch")
+            else
+              ($control.metadata["gc.control_epoch"] // "") | tostring
+            end
         end
-    ' 2>/dev/null)"; then
-    fail "current producer iteration $BEAD_ID could not resolve exactly one logical control for $ralph_step_id"
+      ' 2>/dev/null)"; then
+      fail "current producer iteration $BEAD_ID could not resolve control bead $control_for for workflow root $ROOT_ID"
+    fi
+  else
+    fail "current producer iteration $BEAD_ID is missing gc.ralph_step_id and gc.control_for"
   fi
   case "$control_epoch" in
-    ''|*[!0-9]*|0) fail "current producer control epoch is invalid for $ralph_step_id: ${control_epoch:-<missing>}" ;;
+    ''|*[!0-9]*|0) fail "current producer control epoch is invalid for $control_label: ${control_epoch:-<missing>}" ;;
   esac
   [ "$iteration_attempt" = "$control_epoch" ] || fail \
-    "current producer iteration attempt $iteration_attempt does not match current control epoch $control_epoch for $ralph_step_id"
+    "current producer iteration attempt $iteration_attempt does not match current control epoch $control_epoch for $control_label"
   printf '%s\n' "$iteration_attempt"
 }
 
@@ -608,6 +767,22 @@ if [ "$(metadata_value "$SHOW_JSON" "gc.build.require_approved_status")" = "true
     "schema=$SCHEMA path=$ARTIFACT_PATH requires status=approved; observed=${ARTIFACT_STATUS:-<missing>}"
 fi
 
+EXPECTED_PRODUCER_FORMULA="$(metadata_value "$SHOW_JSON" "gc.build.expected_producer_formula")"
+if [ -n "$EXPECTED_PRODUCER_FORMULA" ]; then
+  ARTIFACT_PRODUCER_FORMULA="$(front_matter_value "$ARTIFACT_PATH" producer.formula)" || \
+    fail "artifact producer.formula is unreadable: $ARTIFACT_PATH"
+  [ "$ARTIFACT_PRODUCER_FORMULA" = "$EXPECTED_PRODUCER_FORMULA" ] || fail \
+    "schema=$SCHEMA path=$ARTIFACT_PATH requires producer.formula=$EXPECTED_PRODUCER_FORMULA; observed=${ARTIFACT_PRODUCER_FORMULA:-<missing>}"
+fi
+
+EXPECTED_PRODUCER_STAGE="$(metadata_value "$SHOW_JSON" "gc.build.expected_producer_stage")"
+if [ -n "$EXPECTED_PRODUCER_STAGE" ]; then
+  ARTIFACT_PRODUCER_STAGE="$(front_matter_value "$ARTIFACT_PATH" producer.stage)" || \
+    fail "artifact producer.stage is unreadable: $ARTIFACT_PATH"
+  [ "$ARTIFACT_PRODUCER_STAGE" = "$EXPECTED_PRODUCER_STAGE" ] || fail \
+    "schema=$SCHEMA path=$ARTIFACT_PATH requires producer.stage=$EXPECTED_PRODUCER_STAGE; observed=${ARTIFACT_PRODUCER_STAGE:-<missing>}"
+fi
+
 if [ "$(metadata_value "$SHOW_JSON" "gc.build.require_current_producer_attempt")" = "true" ]; then
   CURRENT_PRODUCER_ATTEMPT="$(current_producer_attempt)"
   case "$CURRENT_PRODUCER_ATTEMPT" in
@@ -766,7 +941,33 @@ if [ "$SCHEMA" = "gc.build.review.v1" ]; then
     if [ -n "$SUBJECT_PATH" ]; then
       require_subject_trace "$INTERNAL_PATH" "$SUBJECT_PATH" || exit 1
     fi
-    cmp -s "$INTERNAL_PATH" "$ARTIFACT_PATH" || fail "internal and adapter review reports must be byte-identical: internal=$INTERNAL_PATH adapter=$ARTIFACT_PATH"
+    EXPECTED_INTERNAL_STAGE="$(metadata_value "$SHOW_JSON" "gc.build.expected_internal_review_producer_stage")"
+    EXPECTED_ADAPTER_STAGE="$(metadata_value "$SHOW_JSON" "gc.build.expected_adapter_review_producer_stage")"
+    if [ "$RESOLVED_KEY" = "gc.build.review_report_path" ] && \
+      { [ -n "$EXPECTED_INTERNAL_STAGE" ] || [ -n "$EXPECTED_ADAPTER_STAGE" ]; }; then
+      if [ -z "$EXPECTED_INTERNAL_STAGE" ] || [ -z "$EXPECTED_ADAPTER_STAGE" ]; then
+        fail "internal adapter fidelity requires both expected producer stages"
+      fi
+      CURRENT_ADAPTER_ATTEMPT="$(current_producer_attempt)"
+      IMPLEMENTATION_SUMMARY_RAW="$(metadata_value "$ROOT_JSON" "gc.build.implementation_summary_path")"
+      [ -n "$IMPLEMENTATION_SUMMARY_RAW" ] || fail \
+        "review adapter fidelity requires gc.build.implementation_summary_path"
+      IMPLEMENTATION_SUMMARY_PATH="$(resolve_declared_path \
+        "$IMPLEMENTATION_SUMMARY_RAW" "gc.build.implementation_summary_path")"
+      [ -f "$IMPLEMENTATION_SUMMARY_PATH" ] || fail \
+        "current implementation summary does not exist: $IMPLEMENTATION_SUMMARY_PATH"
+      [ ! -L "$IMPLEMENTATION_SUMMARY_PATH" ] || fail \
+        "current implementation summary must not be a symlink: $IMPLEMENTATION_SUMMARY_PATH"
+      IMPLEMENTATION_SUMMARY_PATH="$(canonical_file_path "$IMPLEMENTATION_SUMMARY_PATH")" || fail \
+        "could not resolve current implementation summary: $IMPLEMENTATION_SUMMARY_PATH"
+      pin_file "$IMPLEMENTATION_SUMMARY_PATH"
+      require_review_adapter_fidelity \
+        "$INTERNAL_PATH" "$ARTIFACT_PATH" \
+        "$EXPECTED_INTERNAL_STAGE" "$EXPECTED_ADAPTER_STAGE" \
+        "$CURRENT_ADAPTER_ATTEMPT" "$IMPLEMENTATION_SUMMARY_PATH" || exit 1
+    else
+      cmp -s "$INTERNAL_PATH" "$ARTIFACT_PATH" || fail "internal and adapter review reports must be byte-identical: internal=$INTERNAL_PATH adapter=$ARTIFACT_PATH"
+    fi
   fi
 fi
 

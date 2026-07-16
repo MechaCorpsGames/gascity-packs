@@ -96,7 +96,7 @@ description_file = "../assets/workflows/superpowers-brainstorming/confirm-spec-a
 id = "{target}"
 title = "Finalize approved Superpowers requirements"
 needs = ["{target}.superpowers-written-spec-loop"]
-metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.requirements.v1", "gc.build.artifact_path_keys" = "gc.build.requirements_path,gc.var.requirements_path" }
+metadata = { "gc.run_target" = "gc.run-operator", "gc.build.artifact_schema" = "gc.build.requirements.v1", "gc.build.artifact_path_keys" = "gc.build.requirements_path,gc.var.requirements_path", "gc.build.require_approved_status" = "true", "gc.build.expected_producer_formula" = "superpowers-brainstorming", "gc.build.expected_producer_stage" = "requirements" }
 description_file = "../assets/workflows/superpowers-brainstorming/{target}.md"
 
 [template.check]

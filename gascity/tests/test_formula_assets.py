@@ -743,13 +743,33 @@ class FormulaAssetTests(unittest.TestCase):
     def test_methodology_review_terminals_require_internal_adapter_fidelity(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
         formulas = {
-            "superpowers": "superpowers-code-review",
-            "gstack": "gstack-code-review",
-            "compound-engineering": "compound-code-review",
-            "bmad": "bmad-code-review-flow",
+            "superpowers": (
+                "superpowers-code-review",
+                "request-code-review",
+                "adapter-report",
+                "assets/workflows/superpowers-code-review/finalize-code-review.md",
+            ),
+            "gstack": (
+                "gstack-code-review",
+                "synthesize-code-review",
+                "adapter-report",
+                "assets/workflows/gstack-code-review/finalize-code-review.md",
+            ),
+            "compound-engineering": (
+                "compound-code-review",
+                "synthesize-code-review",
+                "synthesize-code-review",
+                "assets/workflows/compound-code-review/finalize-code-review.md",
+            ),
+            "bmad": (
+                "bmad-code-review-flow",
+                "synthesize-bmad-review",
+                "synthesize-bmad-review",
+                "assets/workflows/bmad-code-review-flow/finalize-bmad-code-review.md",
+            ),
         }
 
-        for pack, formula in formulas.items():
+        for pack, (formula, internal_stage, adapter_stage, prompt_path) in formulas.items():
             with self.subTest(pack=pack):
                 document = tomllib.loads(
                     (packs_root / pack / "formulas" / f"{formula}.formula.toml").read_text(
@@ -765,6 +785,41 @@ class FormulaAssetTests(unittest.TestCase):
                     terminal["metadata"].get("gc.build.require_internal_review_report"),
                     "true",
                 )
+                self.assertEqual(
+                    terminal["metadata"].get(
+                        "gc.build.expected_internal_review_producer_stage"
+                    ),
+                    internal_stage,
+                )
+                self.assertEqual(
+                    terminal["metadata"].get(
+                        "gc.build.expected_adapter_review_producer_stage"
+                    ),
+                    adapter_stage,
+                )
+                terminal_prompt = " ".join(
+                    (packs_root / pack / prompt_path).read_text(encoding="utf-8").split()
+                )
+                for fragment in (
+                    "Treat `gc.build.code_review_report_path` as immutable",
+                    "Never write, rewrite, normalize, repair, or overwrite the internal report",
+                    "Only create or repair the selected adapter path",
+                    "`producer.stage`, `producer.attempt`, and `trace.upstream`",
+                    "schema, workflow, methodology, `producer.formula`, status, `trace.coverage`, and Markdown body",
+                    "Every other front-matter field must match exactly",
+                    "For a build adapter, start from a byte-for-byte copy of the internal report",
+                    "Do not reconstruct front matter, recompute status, IDs, or coverage, or edit the Markdown body",
+                ):
+                    with self.subTest(pack=pack, terminal_contract=fragment):
+                        self.assertIn(fragment, terminal_prompt)
+                if pack in {"superpowers", "gstack"}:
+                    for forbidden in (
+                        "front matter must be shaped like this",
+                        "Use `status: approved` only",
+                        "Include these exact second-level sections",
+                    ):
+                        with self.subTest(pack=pack, forbidden_reconstruction=forbidden):
+                            self.assertNotIn(forbidden, terminal_prompt)
 
     def test_expected_formula_set_is_convoy_first(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
@@ -6407,15 +6462,19 @@ class FormulaAssetTests(unittest.TestCase):
             "gc.build.review_report_path",
             "gc.var.report_path",
             "exact selected adapter path",
-            "Copy",
+            "copy the internal report byte-for-byte",
             "gc.attempt_log",
             "gc.build.review.v1",
-            "actual source IDs",
-            "coverage: []",
+            "Do not reconstruct front matter",
         ):
             with self.subTest(terminal_handoff=fragment):
-                self.assertIn(fragment, terminal)
+                self.assertIn(fragment, " ".join(terminal.split()))
         self.assertNotIn("SEC-001", terminal)
+        self.assertIn("workflow:\n  formula: gstack-review", terminal)
+        self.assertNotIn(
+            "workflow:\n  id: <workflow-root-id>\n  formula: gstack-code-review",
+            terminal,
+        )
 
     def test_compound_build_producers_define_schema_complete_artifacts(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
@@ -6560,6 +6619,13 @@ class FormulaAssetTests(unittest.TestCase):
         ):
             with self.subTest(review_handoff=fragment):
                 self.assertIn(fragment, review_terminal)
+        self.assertNotIn("the copies differ", review_terminal)
+
+        review_synthesis = (review_root / "synthesize-code-review.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("current positive `gc.attempt`", review_synthesis)
+        self.assertNotIn("attempt: 1", review_synthesis)
 
         setup = (review_root / "setup-compound-code-review.md").read_text(
             encoding="utf-8"
@@ -6857,15 +6923,17 @@ class FormulaAssetTests(unittest.TestCase):
             "copy",
             "byte-for-byte",
             "nearest ancestor containing",
-            "repair the complete internal report",
+            "repair only the selected adapter path",
             "gc.attempt_log",
             "gc.build.review.v1",
         ):
             with self.subTest(terminal_handoff=fragment):
-                if fragment == "repair the complete internal report":
+                if fragment == "repair only the selected adapter path":
                     self.assertIn(fragment, normalized_terminal.lower())
                 else:
                     self.assertIn(fragment, normalized_terminal)
+        self.assertNotIn("before copying it", terminal)
+        self.assertNotIn("cannot be selected, copied, or validated", terminal)
 
     def test_github_adapter_methodology_selector_matrix_covers_all_toolkits(self) -> None:
         gascity_root = pathlib.Path(__file__).resolve().parents[1]
@@ -7007,7 +7075,7 @@ class FormulaAssetTests(unittest.TestCase):
             "schema: gc.build.decomposition.v1",
             "workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}",
             "methodology: {pack: superpowers, name: superpowers-decomposition}",
-            "producer: {formula: <producer-formula>, stage: decompose, attempt: <positive integer>}",
+            "producer: {formula: superpowers-build, stage: decompose, attempt: <positive integer>}",
             "trace: {upstream: [...], coverage: [...]}",
             "Selected Downstream Formulas",
             "Implementation Convoy",
@@ -7042,7 +7110,7 @@ class FormulaAssetTests(unittest.TestCase):
             "schema: gc.build.plan.v1",
             "workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}",
             "methodology: {pack: superpowers, name: writing-plans}",
-            "producer: {formula: <producer-formula>, stage: plan, attempt: <positive integer>}",
+            "producer: {formula: superpowers-build, stage: plan, attempt: <positive integer>}",
             "trace: {upstream: [...], coverage: [...]}",
             "Current System",
             "Proposed Implementation",
@@ -7068,6 +7136,74 @@ class FormulaAssetTests(unittest.TestCase):
             [plan_text.index(section) for section in plan_sections],
             sorted(plan_text.index(section) for section in plan_sections),
         )
+
+        for step_id, expected_stage in (("plan", "plan"), ("decompose", "decompose")):
+            with self.subTest(step=step_id, contract="producer-identity"):
+                metadata = step_by_id[step_id]["metadata"]
+                self.assertEqual(
+                    metadata.get("gc.build.expected_producer_formula"),
+                    "superpowers-build",
+                )
+                self.assertEqual(
+                    metadata.get("gc.build.expected_producer_stage"),
+                    expected_stage,
+                )
+                self.assertEqual(
+                    metadata.get("gc.build.require_current_producer_attempt"),
+                    "true",
+                )
+        self.assertIn(
+            "producer.attempt` to this stage's current positive `gc.attempt`",
+            plan_text,
+        )
+        self.assertIn(
+            "producer.attempt` to this stage's current positive `gc.attempt`",
+            decompose_text,
+        )
+
+        brainstorming = load_formula(pack_root, "superpowers-brainstorming")
+        requirements_terminal = next(
+            template
+            for template in brainstorming["template"]
+            if template["id"] == "{target}"
+        )
+        self.assertEqual(
+            requirements_terminal["metadata"].get("gc.build.require_approved_status"),
+            "true",
+        )
+
+        plan_review = load_formula(pack_root, "superpowers-plan-review")
+        plan_review_terminal = next(
+            template
+            for template in plan_review["template"]
+            if template["id"] == "{target}"
+        )
+        self.assertEqual(
+            plan_review_terminal["metadata"].get("gc.build.artifact_schema"),
+            "gc.build.plan.v1",
+        )
+        self.assertEqual(
+            plan_review_terminal["metadata"].get("gc.build.artifact_path_keys"),
+            "gc.build.plan_path,gc.var.plan_path",
+        )
+        self.assertEqual(
+            plan_review_terminal["metadata"].get("gc.build.require_approved_status"),
+            "true",
+        )
+        self.assertEqual(
+            plan_review_terminal["check"]["check"]["path"],
+            ".gc/scripts/checks/build-artifact-valid.sh",
+        )
+        plan_review_terminal_prompt = (
+            pack_root
+            / "assets"
+            / "workflows"
+            / "superpowers-plan-review"
+            / "{target}.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("status: approved", plan_review_terminal_prompt)
+        self.assertIn("build-artifact-valid.sh", plan_review_terminal_prompt)
+        self.assertIn("approval metadata is not sufficient", plan_review_terminal_prompt)
 
         plan_review_text = (
             pack_root
@@ -7104,6 +7240,63 @@ class FormulaAssetTests(unittest.TestCase):
                 self.assertTrue(
                     all(group == "superpowers-task-{{issue}}" for group in continuation_groups)
                 )
+
+        write_test_text = (
+            " ".join(
+                (
+                    pack_root
+                    / "assets"
+                    / "workflows"
+                    / "superpowers-development"
+                    / "write-failing-test.md"
+                )
+                .read_text(encoding="utf-8")
+                .split()
+            )
+        )
+        for fragment in (
+            "approved task forbids test changes",
+            "existing focused test already fails",
+            "do not edit any test file",
+        ):
+            with self.subTest(prompt="write-failing-test", fragment=fragment):
+                self.assertIn(fragment, write_test_text)
+
+        verify_test_text = (
+            " ".join(
+                (
+                    pack_root
+                    / "assets"
+                    / "workflows"
+                    / "superpowers-development"
+                    / "verify-test-fails.md"
+                )
+                .read_text(encoding="utf-8")
+                .split()
+            )
+        )
+        self.assertIn("selected existing or newly written test", verify_test_text)
+
+        record_result_text = (
+            " ".join(
+                (
+                    pack_root
+                    / "assets"
+                    / "workflows"
+                    / "superpowers-development"
+                    / "record-item-result.md"
+                )
+                .read_text(encoding="utf-8")
+                .split()
+            )
+        )
+        for fragment in (
+            "git status --short",
+            "git diff --name-only HEAD",
+            "Never claim that a file was unchanged",
+        ):
+            with self.subTest(prompt="record-item-result", fragment=fragment):
+                self.assertIn(fragment, record_result_text)
 
     def test_superpowers_decompose_records_both_implementation_convoy_ids(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
@@ -7380,6 +7573,15 @@ class FormulaAssetTests(unittest.TestCase):
         self.assertIn('gc bd show "$CLAIMED_BEAD_ID" --json', spec_approval)
         self.assertIn("design_review.approval_mode=autonomous", spec_approval)
         self.assertIn("design_review.output_path=<approval-summary path>", spec_approval)
+        normalized_spec_approval = " ".join(spec_approval.split())
+        self.assertIn(
+            "edit the canonical requirements artifact's top-level `status` to `approved`",
+            normalized_spec_approval,
+        )
+        self.assertIn(
+            "verify the artifact now reports `status: approved` before writing approval metadata",
+            normalized_spec_approval,
+        )
         self.assertIn('if type == "array" then .[0] else . end', spec_approval)
         self.assertIn('design_review.verdict == "done"', spec_approval)
         self.assertIn("Do not pass `--metadata` or `--set-metadata` to `gc bd close`", spec_approval)
@@ -13082,6 +13284,83 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("requires status=approved", rejected.stderr)
         self.assertEqual(approved.returncode, 0, approved.stdout + approved.stderr)
 
+    def test_build_artifact_check_enforces_expected_producer_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            artifact = pathlib.Path(artifact_dir) / "requirements.md"
+            control = json.dumps(
+                [
+                    {
+                        "id": "loop",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.build.artifact_schema": "gc.build.requirements.v1",
+                            "gc.build.artifact_path_keys": "gc.build.requirements_path",
+                            "gc.build.expected_producer_formula": "superpowers-build",
+                            "gc.build.expected_producer_stage": "requirements",
+                        },
+                    }
+                ]
+            )
+            root_bead = json.dumps(
+                [
+                    {
+                        "id": "root",
+                        "metadata": {"gc.build.requirements_path": str(artifact)},
+                    }
+                ]
+            )
+
+            artifact.write_text(
+                self._valid_requirements_artifact(),
+                encoding="utf-8",
+            )
+            wrong_formula = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+            )
+
+            artifact.write_text(
+                self._valid_requirements_artifact()
+                .replace("  formula: planning-base", "  formula: superpowers-build", 1)
+                .replace("  stage: requirements", "  stage: plan", 1),
+                encoding="utf-8",
+            )
+            wrong_stage = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+            )
+
+            artifact.write_text(
+                self._valid_requirements_artifact().replace(
+                    "  formula: planning-base",
+                    "  formula: superpowers-build",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            exact_identity = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+            )
+
+        self.assertNotEqual(
+            wrong_formula.returncode,
+            0,
+            wrong_formula.stdout + wrong_formula.stderr,
+        )
+        self.assertIn("producer.formula=superpowers-build", wrong_formula.stderr)
+        self.assertNotEqual(
+            wrong_stage.returncode,
+            0,
+            wrong_stage.stdout + wrong_stage.stderr,
+        )
+        self.assertIn("producer.stage=requirements", wrong_stage.stderr)
+        self.assertEqual(
+            exact_identity.returncode,
+            0,
+            exact_identity.stdout + exact_identity.stderr,
+        )
+
     def test_build_artifact_check_binds_required_current_producer_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:
             artifact = pathlib.Path(artifact_dir) / "requirements.md"
@@ -13153,7 +13432,7 @@ description = "Override sink that writes the base triage report contract."
                         "metadata": {
                             "gc.root_bead_id": "root",
                             "gc.attempt": "2",
-                            "gc.ralph_step_id": "summarize-implementation",
+                            "gc.control_for": "summarize-control",
                             "gc.build.artifact_schema": "gc.build.requirements.v1",
                             "gc.build.artifact_path_keys": "gc.build.requirements_path",
                             "gc.build.require_current_producer_attempt": "true",
@@ -13186,10 +13465,10 @@ description = "Override sink that writes the base triage report contract."
             current = self._run_build_artifact_check(
                 {
                     "summarize.iteration.2": iteration,
+                    "summarize-control": current_control,
                     "root": root_bead,
                 },
                 "summarize.iteration.2",
-                list_json=current_control,
             )
 
             stale_control = current_control.replace(
@@ -13200,10 +13479,10 @@ description = "Override sink that writes the base triage report contract."
             stale = self._run_build_artifact_check(
                 {
                     "summarize.iteration.2": iteration,
+                    "summarize-control": stale_control,
                     "root": root_bead,
                 },
                 "summarize.iteration.2",
-                list_json=stale_control,
             )
 
         self.assertEqual(current.returncode, 0, current.stdout + current.stderr)
@@ -13389,7 +13668,9 @@ description = "Override sink that writes the base triage report contract."
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("internal review report", result.stderr)
 
-    def test_review_artifact_check_rejects_adapter_that_differs_from_internal(self) -> None:
+    def test_review_artifact_check_rejects_standalone_adapter_that_differs_from_internal(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:
             root = pathlib.Path(artifact_dir)
             subject = root / "review-subject.diff"
@@ -13397,8 +13678,15 @@ description = "Override sink that writes the base triage report contract."
             adapter = root / "review-report.md"
             internal = root / "internal-review-report.md"
             report = self._valid_review_artifact(subject)
-            internal.write_text(report, encoding="utf-8")
-            adapter.write_text(report + "\nAdapter-only rewrite.\n", encoding="utf-8")
+            internal.write_text(
+                report.replace("  stage: write-report", "  stage: request-code-review", 1),
+                encoding="utf-8",
+            )
+            adapter.write_text(
+                report.replace("  stage: write-report", "  stage: adapter-report", 1)
+                + "\nAdapter-only rewrite.\n",
+                encoding="utf-8",
+            )
             control = json.dumps(
                 [{
                     "id": "loop",
@@ -13426,6 +13714,60 @@ description = "Override sink that writes the base triage report contract."
 
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("byte-identical", result.stderr)
+
+    def test_build_review_artifact_check_rejects_semantic_drift_from_internal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "review-subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            internal = root / "internal-review-report.md"
+            report = self._valid_review_artifact(subject)
+            internal.write_text(
+                report.replace("  stage: write-report", "  stage: request-code-review", 1),
+                encoding="utf-8",
+            )
+            adapter.write_text(
+                report.replace("  stage: write-report", "  stage: adapter-report", 1)
+                + "\nAdapter-only rewrite.\n",
+                encoding="utf-8",
+            )
+            control = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.control_epoch": 1,
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.build.review_report_path",
+                        "gc.build.require_internal_review_report": "true",
+                        "gc.build.expected_internal_review_producer_stage": (
+                            "request-code-review"
+                        ),
+                        "gc.build.expected_adapter_review_producer_stage": (
+                            "adapter-report"
+                        ),
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.build.review_report_path": str(adapter),
+                        "gc.build.code_review_report_path": str(internal),
+                        "gc.build.implementation_summary_path": str(subject),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("semantic content", result.stderr)
 
     def test_review_artifact_check_rejects_required_internal_report_alias(self) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:
@@ -13713,23 +14055,46 @@ description = "Override sink that writes the base triage report contract."
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("build artifact valid", result.stdout)
 
-    def test_review_artifact_check_accepts_identical_reports_with_real_subject_digest(self) -> None:
+    def test_review_artifact_check_accepts_distinct_stage_reports_with_semantic_fidelity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:
             root = pathlib.Path(artifact_dir)
-            subject = root / "review-subject.diff"
-            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            internal_subject = root / "code-review-context.md"
+            internal_subject.write_text("internal review context\n", encoding="utf-8")
+            adapter_subject = root / "implementation-summary.md"
+            adapter_subject.write_text("current implementation summary\n", encoding="utf-8")
             adapter = root / "review-report.md"
             internal = root / "internal-review-report.md"
-            report = self._valid_review_artifact(subject)
-            adapter.write_text(report, encoding="utf-8")
-            internal.write_text(report, encoding="utf-8")
+            internal.write_text(
+                self._valid_review_artifact(internal_subject).replace(
+                    "  stage: write-report",
+                    "  stage: request-code-review",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            adapter.write_text(
+                self._valid_review_artifact(adapter_subject)
+                .replace("  stage: write-report", "  stage: adapter-report", 1)
+                .replace("  attempt: 1", "  attempt: 3", 1),
+                encoding="utf-8",
+            )
             control = json.dumps(
                 [{
                     "id": "loop",
                     "metadata": {
                         "gc.root_bead_id": "root",
+                        "gc.control_epoch": 3,
                         "gc.build.artifact_schema": "gc.build.review.v1",
-                        "gc.build.artifact_path_keys": "gc.var.report_path",
+                        "gc.build.artifact_path_keys": "gc.build.review_report_path",
+                        "gc.build.require_internal_review_report": "true",
+                        "gc.build.expected_internal_review_producer_stage": (
+                            "request-code-review"
+                        ),
+                        "gc.build.expected_adapter_review_producer_stage": (
+                            "adapter-report"
+                        ),
                     },
                 }]
             )
@@ -13737,9 +14102,9 @@ description = "Override sink that writes the base triage report contract."
                 [{
                     "id": "root",
                     "metadata": {
-                        "gc.var.report_path": str(adapter),
+                        "gc.build.review_report_path": str(adapter),
                         "gc.build.code_review_report_path": str(internal),
-                        "gc.build.review_subject_path": str(subject),
+                        "gc.build.implementation_summary_path": str(adapter_subject),
                     },
                 }]
             )
@@ -13749,6 +14114,169 @@ description = "Override sink that writes the base triage report contract."
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("build artifact valid", result.stdout)
+
+    def test_review_adapter_fidelity_binds_terminal_attempt_and_current_summary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            internal_subject = root / "code-review-context.md"
+            internal_subject.write_text("internal review context\n", encoding="utf-8")
+            summary = root / "implementation-summary.md"
+            summary.write_text("current implementation summary\n", encoding="utf-8")
+            summary_alias = root / "implementation-summary-alias.md"
+            summary_alias.symlink_to(summary)
+            unrelated = root / "unrelated-summary.md"
+            unrelated.write_text("stale implementation summary\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            internal = root / "internal-review-report.md"
+            internal.write_text(
+                self._valid_review_artifact(internal_subject).replace(
+                    "  stage: write-report", "  stage: request-code-review", 1
+                ),
+                encoding="utf-8",
+            )
+            control = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.control_epoch": 3,
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.build.review_report_path",
+                        "gc.build.require_internal_review_report": "true",
+                        "gc.build.expected_internal_review_producer_stage": (
+                            "request-code-review"
+                        ),
+                        "gc.build.expected_adapter_review_producer_stage": (
+                            "adapter-report"
+                        ),
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.build.review_report_path": str(adapter),
+                        "gc.build.code_review_report_path": str(internal),
+                        "gc.build.implementation_summary_path": str(summary),
+                    },
+                }]
+            )
+
+            adapter.write_text(
+                self._valid_review_artifact(summary)
+                .replace("  stage: write-report", "  stage: adapter-report", 1)
+                .replace("  attempt: 1", "  attempt: 99", 1),
+                encoding="utf-8",
+            )
+            stale_attempt = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+            adapter.write_text(
+                self._valid_review_artifact(unrelated)
+                .replace("  stage: write-report", "  stage: adapter-report", 1)
+                .replace("  attempt: 1", "  attempt: 3", 1),
+                encoding="utf-8",
+            )
+            stale_summary = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+            adapter.write_text(
+                self._valid_review_artifact(summary_alias)
+                .replace("  stage: write-report", "  stage: adapter-report", 1)
+                .replace("  attempt: 1", "  attempt: 3", 1),
+                encoding="utf-8",
+            )
+            noncanonical_summary = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+            adapter.write_text(
+                self._valid_review_artifact(summary)
+                .replace("  stage: write-report", "  stage: adapter-report", 1)
+                .replace("  attempt: 1", "  attempt: 3", 1),
+                encoding="utf-8",
+            )
+            current = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+        self.assertNotEqual(
+            stale_attempt.returncode,
+            0,
+            stale_attempt.stdout + stale_attempt.stderr,
+        )
+        self.assertIn("producer.attempt=3", stale_attempt.stderr)
+        self.assertNotEqual(
+            stale_summary.returncode,
+            0,
+            stale_summary.stdout + stale_summary.stderr,
+        )
+        self.assertIn("current implementation summary", stale_summary.stderr)
+        self.assertNotEqual(
+            noncanonical_summary.returncode,
+            0,
+            noncanonical_summary.stdout + noncanonical_summary.stderr,
+        )
+        self.assertIn("exact current implementation summary", noncanonical_summary.stderr)
+        self.assertEqual(current.returncode, 0, current.stdout + current.stderr)
+
+    def test_review_adapter_fidelity_rejects_extra_front_matter_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            root = pathlib.Path(artifact_dir)
+            subject = root / "implementation-summary.md"
+            subject.write_text("current implementation summary\n", encoding="utf-8")
+            adapter = root / "review-report.md"
+            internal = root / "internal-review-report.md"
+            report = self._valid_review_artifact(subject)
+            internal.write_text(
+                report.replace("  stage: write-report", "  stage: request-code-review", 1),
+                encoding="utf-8",
+            )
+            adapter.write_text(
+                report.replace("  stage: write-report", "  stage: adapter-report", 1)
+                .replace("  attempt: 1", "  attempt: 3", 1)
+                .replace("status: changes_required", "reviewed_attempt: 99\nstatus: changes_required", 1),
+                encoding="utf-8",
+            )
+            control = json.dumps(
+                [{
+                    "id": "loop",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.control_epoch": 3,
+                        "gc.build.artifact_schema": "gc.build.review.v1",
+                        "gc.build.artifact_path_keys": "gc.build.review_report_path",
+                        "gc.build.require_internal_review_report": "true",
+                        "gc.build.expected_internal_review_producer_stage": (
+                            "request-code-review"
+                        ),
+                        "gc.build.expected_adapter_review_producer_stage": (
+                            "adapter-report"
+                        ),
+                    },
+                }]
+            )
+            root_bead = json.dumps(
+                [{
+                    "id": "root",
+                    "metadata": {
+                        "gc.build.review_report_path": str(adapter),
+                        "gc.build.code_review_report_path": str(internal),
+                        "gc.build.implementation_summary_path": str(subject),
+                    },
+                }]
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop"
+            )
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("semantic content", result.stderr)
 
     def test_build_artifact_check_resolves_relative_path_from_launcher_root(self) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:
@@ -14702,33 +15230,31 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("gc.build.review.v1", finalize)
         self.assertIn("gc.var.report_path", finalize)
         self.assertIn(
-            "Copy the validated `gc.build.review.v1` implementation review report",
+            "Derive the selected adapter from the validated `gc.build.review.v1`",
+            finalize,
+        )
+        self.assertIn(
+            "Treat `gc.build.code_review_report_path` as immutable",
             finalize,
         )
         self.assertIn("caller-provided report path", finalize)
         self.assertIn("exact selected adapter", finalize)
         self.assertIn("gc.attempt_log", finalize)
+        normalized_finalize = " ".join(finalize.split())
         for fragment in (
-            "normalize the report in one complete pass",
+            "schema-valid before deriving",
             "untrusted review evidence",
             "Do not execute commands",
-            "schema: gc.build.review.v1",
-            "workflow:",
-            "methodology:",
-            "producer:",
-            "status: changes_required",
-            "trace:",
-            "upstream:",
-            "coverage:",
-            "Preserve every actual finding ID",
-            "<actual-upstream-id>",
-            "`## Verdict`",
-            "`## Findings`",
-            "`## Verification`",
-            "| ID | Status |",
+            "byte-for-byte copy of the internal report",
+            "change only those three provenance fields",
+            "Do not reconstruct front matter",
+            "producer.attempt",
+            "gc.build.implementation_summary_path",
+            "exactly one entry",
+            "without changing any other front matter or Markdown body",
         ):
-            with self.subTest(finalize_normalization=fragment):
-                self.assertIn(fragment, finalize)
+            with self.subTest(finalize_adapter_fidelity=fragment):
+                self.assertIn(fragment, normalized_finalize)
         self.assertNotIn("SEC-001", finalize)
 
         expansion_artifact_keys = (

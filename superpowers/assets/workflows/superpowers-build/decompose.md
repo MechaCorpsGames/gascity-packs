@@ -72,7 +72,9 @@ before the Markdown body. Its top-level YAML shape must be:
 - `schema: gc.build.decomposition.v1`
 - `workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}`
 - `methodology: {pack: superpowers, name: superpowers-decomposition}`
-- `producer: {formula: <producer-formula>, stage: decompose, attempt: <positive integer>}`
+- `producer: {formula: superpowers-build, stage: decompose, attempt: <positive integer>}`
+- Set `producer.attempt` to this stage's current positive `gc.attempt`; a retry
+  must update the canonical artifact to the retry's attempt before validation.
 - Use `status: approved` before closing, and close only when the decomposition
   and convoy are ready. Do not invent lifecycle values such as `ready`.
 - `trace: {upstream: [...], coverage: [...]}`

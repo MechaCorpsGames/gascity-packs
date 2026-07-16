@@ -53,7 +53,8 @@ Keep top-level review status and coverage mechanically coherent:
   use `coverage: []`. Record any concrete required finding in `## Findings`.
 
 Use this front matter shape exactly. Do not use dotted YAML keys such as
-`workflow.id`, and do not make `trace` a list:
+`workflow.id`, and do not make `trace` a list. Set `producer.attempt` to this
+synthesis bead's current positive `gc.attempt`:
 
 ```yaml
 ---
@@ -67,7 +68,7 @@ methodology:
 producer:
   formula: compound-code-review
   stage: synthesize-code-review
-  attempt: 1
+  attempt: <current positive gc.attempt>
 status: changes_required
 trace:
   upstream:

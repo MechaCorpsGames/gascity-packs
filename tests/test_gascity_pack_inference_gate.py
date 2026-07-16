@@ -3760,7 +3760,7 @@ PACK_BUILD_ARTIFACT_IDENTITIES = {
             "summarize-implementation",
         ),
         "gc.build.review_report_path": (
-            "gstack-code-review",
+            "gstack-review",
             "gstack",
             "gstack-review",
             "gstack-code-review",

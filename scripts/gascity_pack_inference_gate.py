@@ -535,7 +535,7 @@ BUILD_ARTIFACT_IDENTITY_PROFILES = {
             "gc.build.review_report_path": "gstack-review",
         },
         "workflow_formulas": {
-            "gc.build.review_report_path": "gstack-code-review",
+            "gc.build.review_report_path": "gstack-review",
         },
         "producer_formulas": {
             "gc.build.review_report_path": "gstack-code-review",
