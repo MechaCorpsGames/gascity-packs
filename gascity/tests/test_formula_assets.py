@@ -329,7 +329,7 @@ THIRD_PARTY_BUILD_PACKS = {
             "artifact_path_keys": "gc.var.report_path",
         },
         "gap_analysis_target": "compound-engineering.ce-coherence-reviewer",
-        "review_fix_asset": "assets/workflows/compound-code-review/{target}.apply-review-findings.md",
+        "review_fix_asset": "assets/workflows/compound-code-review/apply-review-findings.md",
         "persona_assets": {
             "ce-architecture-strategist.md",
             "ce-adversarial-reviewer.md",
@@ -386,7 +386,7 @@ THIRD_PARTY_BUILD_PACKS = {
             "artifact_path_keys": "gc.var.report_path",
         },
         "gap_analysis_target": "superpowers.code-quality-reviewer",
-        "review_fix_asset": "assets/workflows/superpowers-code-review/{target}.process-code-review.md",
+        "review_fix_asset": "assets/workflows/superpowers-code-review/process-code-review.md",
         "prompt_assets": {
             "skills/brainstorming/spec-document-reviewer-prompt.md",
             "skills/brainstorming/visual-companion.md",
@@ -430,7 +430,7 @@ THIRD_PARTY_BUILD_PACKS = {
             "artifact_path_keys": "gc.var.report_path",
         },
         "gap_analysis_target": "bmad.story-self-checker",
-        "review_fix_asset": "assets/workflows/bmad-code-review-flow/{target}.apply-bmad-review-findings.md",
+        "review_fix_asset": "assets/workflows/bmad-code-review-flow/apply-bmad-review-findings.md",
     },
     "gstack": {
         "formula": "gstack-build",
@@ -3328,6 +3328,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "{target}.gap-analysis-review",
                 "{target}.synthesize-code-review",
                 "{target}.apply-review-findings",
+                "{target}.report-review-findings",
             ],
         )
         for target in (
@@ -3351,12 +3352,13 @@ class FormulaAssetTests(unittest.TestCase):
             [
                 "{target}.browser-qa",
                 "{target}.regression-test-review",
-                "{target}.qa-fix-findings",
                 "{target}.synthesize-qa",
+                "{target}.qa-fix-findings",
+                "{target}.qa-report-findings",
             ],
         )
         self.assertEqual(
-            qa_loop["children"][2]["metadata"]["gc.continuation_group"],
+            qa_loop["children"][3]["metadata"]["gc.continuation_group"],
             "gstack-qa-fixes",
         )
 
@@ -3372,6 +3374,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "{target}.ship-readiness",
                 "{target}.deployment-readiness",
                 "{target}.synthesize-release-readiness",
+                "{target}.report-release-findings",
             ],
         )
 
@@ -3411,6 +3414,642 @@ class FormulaAssetTests(unittest.TestCase):
         ):
             with self.subTest(readme=fragment):
                 self.assertIn(fragment, readme)
+
+    def test_gstack_report_mode_uses_non_mutating_qa_terminal(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        pack_root = packs_root / "gstack"
+        build = load_formula(pack_root, "gstack-build")
+        code_review = load_formula(pack_root, "gstack-code-review")
+        qa = load_formula(pack_root, "gstack-qa-review")
+
+        code_loop = next(
+            template
+            for template in code_review["template"]
+            if template["id"] == "{target}.gstack-code-review-loop"
+        )
+        self.assertEqual(
+            code_loop["metadata"].get("gc.review.require_current_report_terminal"),
+            "true",
+        )
+        code_children = {child["id"]: child for child in code_loop["children"]}
+        apply_review = code_children["{target}.apply-review-findings"]
+        report_review = code_children["{target}.report-review-findings"]
+        self.assertEqual(apply_review.get("condition"), "{{review_mode}} != report")
+        self.assertEqual(report_review.get("condition"), "{{review_mode}} == report")
+        self.assertEqual(
+            report_review["metadata"].get("gc.review.report_terminal"),
+            "true",
+        )
+        code_report_prompt = " ".join(
+            node_description(pack_root, report_review).split()
+        )
+        for fragment in (
+            "Never edit, stage, or commit product source",
+            "code_review.verdict=reported",
+            "gc.build.code_review_report_path",
+        ):
+            with self.subTest(code_report_terminal=fragment):
+                self.assertIn(fragment, code_report_prompt)
+
+        qa_step = next(step for step in build["steps"] if step["id"] == "qa")
+        self.assertEqual(qa_step["expand_vars"].get("review_mode"), "{{review_mode}}")
+        self.assertIn("review_mode", qa.get("vars", {}))
+
+        qa_loop = next(
+            template
+            for template in qa["template"]
+            if template["id"] == "{target}.gstack-qa-loop"
+        )
+        self.assertEqual(
+            qa_loop["metadata"].get("gc.review.require_current_report_terminal"),
+            "true",
+        )
+        children = {child["id"]: child for child in qa_loop["children"]}
+        apply_findings = children["{target}.qa-fix-findings"]
+        report_findings = children["{target}.qa-report-findings"]
+
+        self.assertEqual(apply_findings.get("condition"), "{{review_mode}} != report")
+        self.assertEqual(report_findings.get("condition"), "{{review_mode}} == report")
+        self.assertEqual(
+            report_findings["metadata"].get("gc.review.report_terminal"),
+            "true",
+        )
+        self.assertNotEqual(
+            report_findings["metadata"]["gc.run_target"],
+            "{implementation_target}",
+        )
+
+        report_prompt = " ".join(node_description(pack_root, report_findings).split())
+        for fragment in (
+            "Never edit, stage, or commit product source",
+            "additional read-only proof commands",
+            "code_review.verdict=reported",
+            "gstack.qa.report_path",
+        ):
+            with self.subTest(report_terminal=fragment):
+                self.assertIn(fragment, report_prompt)
+
+        release = load_formula(pack_root, "gstack-release-readiness")
+        release_loop = next(
+            template
+            for template in release["template"]
+            if template["id"] == "{target}.gstack-release-readiness-loop"
+        )
+        self.assertEqual(
+            release_loop["metadata"].get("gc.review.require_current_report_terminal"),
+            "true",
+        )
+        release_children = {child["id"]: child for child in release_loop["children"]}
+        release_report = release_children["{target}.report-release-findings"]
+        self.assertEqual(release_report.get("condition"), "{{review_mode}} == report")
+        self.assertEqual(
+            release_report["metadata"].get("gc.review.report_terminal"),
+            "true",
+        )
+
+        report_stage_check = "../assets/scripts/checks/gstack-report-stage-valid.sh"
+        for formula, path_key, loop_id, contract in (
+            (
+                qa,
+                "gc.build.qa_summary_path",
+                "{target}.gstack-qa-loop",
+                {
+                    "gc.gstack.synthesis_step": "{target}.synthesize-qa",
+                    "gc.gstack.synthesis_schema": "gc.gstack.qa-summary.v1",
+                    "gc.gstack.report_schema": "gc.gstack.qa-report.v1",
+                },
+            ),
+            (
+                release,
+                "gc.build.release_readiness_summary_path",
+                "{target}.gstack-release-readiness-loop",
+                {
+                    "gc.gstack.synthesis_step": "{target}.synthesize-release-readiness",
+                    "gc.gstack.synthesis_schema": "gc.gstack.release-readiness-summary.v1",
+                    "gc.gstack.report_schema": "gc.gstack.release-readiness-report.v1",
+                },
+            ),
+        ):
+            finalizer = next(
+                template for template in formula["template"] if template["id"] == "{target}"
+            )
+            with self.subTest(report_stage_path=path_key):
+                self.assertEqual(
+                    finalizer["metadata"].get("gc.gstack.report_path_key"), path_key
+                )
+                self.assertEqual(
+                    finalizer["metadata"].get("gc.gstack.report_loop_step"), loop_id
+                )
+                for key, expected in contract.items():
+                    self.assertEqual(finalizer["metadata"].get(key), expected)
+                self.assertEqual(
+                    finalizer["check"]["check"].get("path"), report_stage_check
+                )
+
+        workflow_root = pack_root / "assets" / "workflows"
+        for relative_path in (
+            "gstack-qa-review/{target}.browser-qa.md",
+            "gstack-qa-review/{target}.regression-test-review.md",
+            "gstack-release-readiness/{target}.document-release.md",
+            "gstack-release-readiness/{target}.ship-readiness.md",
+            "gstack-release-readiness/{target}.deployment-readiness.md",
+        ):
+            lane_prompt = " ".join(
+                (workflow_root / relative_path).read_text(encoding="utf-8").split()
+            )
+            with self.subTest(report_lane=relative_path):
+                self.assertIn("Current review_mode is {{review_mode}}", lane_prompt)
+                self.assertIn("In report mode", lane_prompt)
+                self.assertIn("do not edit, stage, or commit", lane_prompt)
+
+    def test_gstack_report_stage_check_binds_root_path_to_current_terminal(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        script = (
+            packs_root
+            / "gstack"
+            / "assets"
+            / "scripts"
+            / "checks"
+            / "gstack-report-stage-valid.sh"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td).resolve()
+            artifact_root = tmp / "artifacts"
+            artifact_root.mkdir()
+            synthesis_path = artifact_root / "qa-synthesis.md"
+            current_report = artifact_root / "qa-report.md"
+            stale_report = artifact_root / "stale-qa-report.md"
+            stale_report.write_text("Stale QA report.\n", encoding="utf-8")
+
+            def synthesis_artifact(*, attempt: int = 2) -> str:
+                return (
+                    "---\n"
+                    "schema: gc.gstack.qa-summary.v1\n"
+                    "producer:\n"
+                    "  bead_id: qa-synthesis\n"
+                    "  stage: synthesize-qa\n"
+                    f"  attempt: {attempt}\n"
+                    "status: approved\n"
+                    "semantic_verdict: approve\n"
+                    "---\n\n"
+                    "## Summary\n\nCurrent QA evidence is approved.\n\n"
+                    "## Findings\n\nNo unresolved findings.\n\n"
+                    "## Evidence\n\nBrowser and regression lanes passed.\n"
+                )
+
+            def report_artifact(synthesis_digest: str, *, attempt: int = 2) -> str:
+                return (
+                    "---\n"
+                    "schema: gc.gstack.qa-report.v1\n"
+                    "producer:\n"
+                    "  bead_id: qa-report\n"
+                    "  stage: qa-report-findings\n"
+                    f"  attempt: {attempt}\n"
+                    "status: approved\n"
+                    "semantic_verdict: approve\n"
+                    "trace:\n"
+                    "  upstream:\n"
+                    f"    - path: {json.dumps(str(synthesis_path))}\n"
+                    f"      hash: {synthesis_digest}\n"
+                    "      ids: [qa-synthesis]\n"
+                    "---\n\n"
+                    "## Summary\n\nCurrent QA findings were recorded without mutation.\n\n"
+                    "## Findings\n\nNo unresolved findings.\n\n"
+                    "## Evidence\n\nThe current synthesis is traced above.\n\n"
+                    "## Next Action\n\nProceed to release readiness.\n"
+                )
+
+            control = {
+                "id": "qa-loop",
+                "status": "closed",
+                "metadata": {
+                    "gc.root_bead_id": "root",
+                    "gc.kind": "ralph",
+                    "gc.step_id": "qa.gstack-qa-loop",
+                    "gc.control_epoch": "2",
+                    "gc.outcome": "pass",
+                },
+            }
+
+            def terminal(
+                *,
+                bead_id: str = "qa-report",
+                attempt: str = "2",
+                report_path: pathlib.Path = current_report,
+                synthesis_digest: str,
+            ) -> dict[str, object]:
+                return {
+                    "id": bead_id,
+                    "status": "closed",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": attempt,
+                        "gc.ralph_step_id": "qa.gstack-qa-loop",
+                        "gc.review.report_terminal": "true",
+                        "gc.outcome": "pass",
+                        "code_review.verdict": "reported",
+                        "code_review.report_path": str(report_path),
+                        "code_review.output_path": str(report_path),
+                        "code_review.reviewed_attempt": attempt,
+                        "gstack.qa.report_path": str(report_path),
+                        "gstack.report.synthesis_bead_id": "qa-synthesis",
+                        "gstack.report.synthesis_path": str(synthesis_path),
+                        "gstack.report.synthesis_sha256": synthesis_digest,
+                        "gstack.report.semantic_verdict": "approve",
+                        "gstack.report.semantic_status": "approved",
+                    },
+                }
+
+            def synthesis(
+                *,
+                attempt: str = "2",
+                synthesis_digest: str,
+            ) -> dict[str, object]:
+                return {
+                    "id": "qa-synthesis",
+                    "status": "closed",
+                    "metadata": {
+                        "gc.root_bead_id": "root",
+                        "gc.attempt": attempt,
+                        "gc.ralph_step_id": "qa.gstack-qa-loop",
+                        "gc.step_id": "qa.synthesize-qa",
+                        "gc.scope_role": "member",
+                        "gc.outcome": "pass",
+                        "code_review.reviewed_attempt": attempt,
+                        "code_review.review_verdict": "approve",
+                        "code_review.report_path": str(synthesis_path),
+                        "code_review.output_path": str(synthesis_path),
+                        "gstack.qa.summary_path": str(synthesis_path),
+                        "gstack.synthesis.sha256": synthesis_digest,
+                    },
+                }
+
+            finalizer = {
+                "id": "qa-finalize",
+                "metadata": {
+                    "gc.root_bead_id": "root",
+                    "gc.gstack.report_loop_step": "qa.gstack-qa-loop",
+                    "gc.gstack.report_path_key": "gc.build.qa_summary_path",
+                    "gc.gstack.synthesis_step": "qa.synthesize-qa",
+                    "gc.gstack.synthesis_path_key": "gstack.qa.summary_path",
+                    "gc.gstack.synthesis_verdict_key": "code_review.review_verdict",
+                    "gc.gstack.synthesis_approved_verdict": "approve",
+                    "gc.gstack.synthesis_schema": "gc.gstack.qa-summary.v1",
+                    "gc.gstack.synthesis_stage": "synthesize-qa",
+                    "gc.gstack.terminal_path_key": "gstack.qa.report_path",
+                    "gc.gstack.report_schema": "gc.gstack.qa-report.v1",
+                    "gc.gstack.report_stage": "qa-report-findings",
+                },
+            }
+
+            def run_case(
+                *,
+                selected_path: pathlib.Path = current_report,
+                rows: list[dict[str, object]] | None = None,
+                review_mode: str = "report",
+                synthesis_text: str | None = None,
+                report_text: str | None = None,
+            ) -> subprocess.CompletedProcess:
+                current_synthesis_text = (
+                    synthesis_artifact()
+                    if synthesis_text is None
+                    else synthesis_text
+                )
+                synthesis_path.write_text(
+                    current_synthesis_text,
+                    encoding="utf-8",
+                )
+                synthesis_digest = (
+                    "sha256:"
+                    + hashlib.sha256(synthesis_path.read_bytes()).hexdigest()
+                )
+                current_report.write_text(
+                    report_artifact(synthesis_digest)
+                    if report_text is None
+                    else report_text,
+                    encoding="utf-8",
+                )
+                root = {
+                    "id": "root",
+                    "metadata": {
+                        "gc.var.review_mode": review_mode,
+                        "gc.build.artifact_root": str(artifact_root),
+                        "gc.build.qa_summary_path": str(selected_path),
+                    },
+                }
+                bin_dir = tmp / "bin"
+                show_dir = tmp / "show"
+                bin_dir.mkdir(exist_ok=True)
+                show_dir.mkdir(exist_ok=True)
+                (show_dir / "qa-finalize.json").write_text(
+                    json.dumps(finalizer), encoding="utf-8"
+                )
+                (show_dir / "root.json").write_text(
+                    json.dumps(root), encoding="utf-8"
+                )
+                list_path = tmp / "list.json"
+                list_path.write_text(
+                    json.dumps(
+                        rows
+                        if rows is not None
+                        else [
+                            control,
+                            synthesis(synthesis_digest=synthesis_digest),
+                            terminal(synthesis_digest=synthesis_digest),
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                fake_gc = bin_dir / "gc"
+                fake_gc.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "set -euo pipefail\n"
+                    "case \"${1:-}:${2:-}\" in\n"
+                    "  bd:show) cat \"$BD_SHOW_DIR/$3.json\" ;;\n"
+                    "  bd:list) cat \"$BD_LIST_JSON\" ;;\n"
+                    "  *) exit 2 ;;\n"
+                    "esac\n",
+                    encoding="utf-8",
+                )
+                fake_gc.chmod(0o755)
+                return subprocess.run(
+                    [str(script)],
+                    env={
+                        **os.environ,
+                        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                        "BD_SHOW_DIR": str(show_dir),
+                        "BD_LIST_JSON": str(list_path),
+                        "GC_BEAD_ID": "qa-finalize",
+                    },
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            valid = run_case()
+            self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+            self.assertIn("current report stage valid", valid.stdout)
+
+            stale_root = run_case(selected_path=stale_report)
+            self.assertNotEqual(
+                stale_root.returncode, 0, stale_root.stdout + stale_root.stderr
+            )
+            self.assertIn("does not match current report terminal", stale_root.stderr)
+
+            digest = "sha256:" + hashlib.sha256(
+                synthesis_artifact().encode("utf-8")
+            ).hexdigest()
+            stale_attempt = run_case(
+                rows=[
+                    control,
+                    synthesis(attempt="1", synthesis_digest=digest),
+                    terminal(attempt="1", synthesis_digest=digest),
+                ]
+            )
+            self.assertNotEqual(
+                stale_attempt.returncode,
+                0,
+                stale_attempt.stdout + stale_attempt.stderr,
+            )
+            self.assertIn("exactly one current synthesis", stale_attempt.stderr)
+
+            duplicate = run_case(
+                rows=[
+                    control,
+                    synthesis(synthesis_digest=digest),
+                    terminal(synthesis_digest=digest),
+                    terminal(
+                        bead_id="qa-report-duplicate",
+                        synthesis_digest=digest,
+                    ),
+                ]
+            )
+            self.assertNotEqual(
+                duplicate.returncode, 0, duplicate.stdout + duplicate.stderr
+            )
+            self.assertIn("exactly one current report terminal", duplicate.stderr)
+
+            agent_mode = run_case(selected_path=stale_report, rows=[], review_mode="agent")
+            self.assertEqual(
+                agent_mode.returncode, 0, agent_mode.stdout + agent_mode.stderr
+            )
+
+            missing_mode = run_case(
+                selected_path=stale_report, rows=[], review_mode=""
+            )
+            self.assertNotEqual(
+                missing_mode.returncode, 0, missing_mode.stdout + missing_mode.stderr
+            )
+            self.assertIn("unsupported review mode", missing_mode.stderr)
+
+            missing_synthesis = run_case(
+                rows=[control, terminal(synthesis_digest=digest)]
+            )
+            self.assertNotEqual(
+                missing_synthesis.returncode,
+                0,
+                missing_synthesis.stdout + missing_synthesis.stderr,
+            )
+            self.assertIn("exactly one current synthesis", missing_synthesis.stderr)
+
+            stale_synthesis_attempt = run_case(
+                rows=[
+                    control,
+                    synthesis(attempt="1", synthesis_digest=digest),
+                    terminal(synthesis_digest=digest),
+                ]
+            )
+            self.assertNotEqual(
+                stale_synthesis_attempt.returncode,
+                0,
+                stale_synthesis_attempt.stdout + stale_synthesis_attempt.stderr,
+            )
+            self.assertIn("exactly one current synthesis", stale_synthesis_attempt.stderr)
+
+            minimal_reused_report = run_case(
+                report_text="---\nstatus: approved\n---\nOld QA approval.\n"
+            )
+            self.assertNotEqual(
+                minimal_reused_report.returncode,
+                0,
+                minimal_reused_report.stdout + minimal_reused_report.stderr,
+            )
+            self.assertIn("report artifact schema mismatch", minimal_reused_report.stderr)
+
+    def test_gstack_report_loops_require_current_terminal_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td).resolve()
+            artifact_root = tmp / "artifacts"
+            artifact_root.mkdir()
+            report_path = artifact_root / "qa-report.md"
+            report_path.write_text("QA findings recorded.\n", encoding="utf-8")
+            stale_path = artifact_root / "stale-code-review.md"
+            stale_path.write_text("Old code review.\n", encoding="utf-8")
+
+            show_json = json.dumps(
+                [
+                    {
+                        "id": "qa-loop",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.step_id": "qa.gstack-qa-loop",
+                            "gc.review.require_current_report_terminal": "true",
+                        },
+                    }
+                ]
+            )
+            parent_show_json = json.dumps(
+                [
+                    {
+                        "id": "root",
+                        "metadata": {
+                            "gc.var.review_mode": "report",
+                            "gc.build.artifact_root": str(artifact_root),
+                            "gc.build.code_review_report_path": str(stale_path),
+                        },
+                    }
+                ]
+            )
+
+            def terminal_row(
+                *,
+                verdict: str = "reported",
+                report: pathlib.Path = report_path,
+                output: pathlib.Path = report_path,
+            ) -> str:
+                return json.dumps(
+                    [
+                        {
+                            "id": "qa-report",
+                            "status": "closed",
+                            "metadata": {
+                                "gc.root_bead_id": "root",
+                                "gc.attempt": "1",
+                                "gc.ralph_step_id": "qa.gstack-qa-loop",
+                                "gc.review.report_terminal": "true",
+                                "gc.outcome": "pass",
+                                "code_review.verdict": verdict,
+                                "code_review.report_path": str(report),
+                                "code_review.output_path": str(output),
+                            },
+                        }
+                    ]
+                )
+
+            valid = self._run_implementation_review_check(
+                show_json=show_json,
+                parent_show_json=parent_show_json,
+                list_json=terminal_row(),
+            )
+            self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+            self.assertIn("current report terminal", valid.stdout)
+
+            missing = self._run_implementation_review_check(
+                show_json=show_json,
+                parent_show_json=parent_show_json,
+                list_json="[]",
+            )
+            self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+            self.assertIn("exactly one current report terminal", missing.stderr)
+
+            wrong_verdict = self._run_implementation_review_check(
+                show_json=show_json,
+                parent_show_json=parent_show_json,
+                list_json=terminal_row(verdict="iterate"),
+            )
+            self.assertNotEqual(
+                wrong_verdict.returncode,
+                0,
+                wrong_verdict.stdout + wrong_verdict.stderr,
+            )
+            self.assertIn("code_review.verdict=reported", wrong_verdict.stderr)
+
+            outside = tmp / "outside-qa-report.md"
+            outside.write_text("Outside report.\n", encoding="utf-8")
+            noncanonical = self._run_implementation_review_check(
+                show_json=show_json,
+                parent_show_json=parent_show_json,
+                list_json=terminal_row(report=outside, output=outside),
+            )
+            self.assertNotEqual(
+                noncanonical.returncode,
+                0,
+                noncanonical.stdout + noncanonical.stderr,
+            )
+            self.assertIn("canonical artifact root", noncanonical.stderr)
+
+            mismatched_paths = self._run_implementation_review_check(
+                show_json=show_json,
+                parent_show_json=parent_show_json,
+                list_json=terminal_row(output=stale_path),
+            )
+            self.assertNotEqual(
+                mismatched_paths.returncode,
+                0,
+                mismatched_paths.stdout + mismatched_paths.stderr,
+            )
+            self.assertIn("report/output paths disagree", mismatched_paths.stderr)
+
+            agent_parent = json.dumps(
+                [{"id": "root", "metadata": {"gc.var.review_mode": "agent"}}]
+            )
+            agent_done = self._run_implementation_review_check(
+                show_json=show_json,
+                parent_show_json=agent_parent,
+                list_json=terminal_row(verdict="done"),
+            )
+            self.assertEqual(
+                agent_done.returncode,
+                0,
+                agent_done.stdout + agent_done.stderr,
+            )
+            agent_iterate = self._run_implementation_review_check(
+                show_json=show_json,
+                parent_show_json=agent_parent,
+                list_json=terminal_row(verdict="iterate"),
+            )
+            self.assertNotEqual(
+                agent_iterate.returncode,
+                0,
+                agent_iterate.stdout + agent_iterate.stderr,
+            )
+            self.assertIn("another iteration: iterate", agent_iterate.stdout)
+
+    def test_gstack_report_findings_finalize_as_blocked_failure(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        finalize = " ".join(
+            (
+                packs_root
+                / "gstack"
+                / "assets"
+                / "workflows"
+                / "gstack-build"
+                / "finalize.md"
+            )
+            .read_text(encoding="utf-8")
+            .split()
+        )
+
+        for fragment in (
+            "mutually exclusive terminal branches",
+            "status: changes_required",
+            "status: blocked",
+            "gc.outcome=fail",
+            "gc.build.status=blocked",
+            "gc.build.finalize_status=failed",
+            "gc.build.finalize_outcome=failure",
+            "gc.build.repair_status=repairable",
+            "gc.restart.entrypoint=build-from-review",
+            "gc.restart.reason=review_changes_required",
+            "gc.restart.review_report_path=<canonical review report path>",
+            "gc.blocked_reason=code_review_changes_required",
+            "gc.failure_class=review_iteration_needed",
+            "must not set `gc.outcome=pass`",
+            "must not set `gc.build.finalize_outcome=success`",
+        ):
+            with self.subTest(blocked_finalization=fragment):
+                self.assertIn(fragment, finalize)
 
     def test_gstack_build_producers_define_schema_complete_artifacts(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
@@ -3648,6 +4287,17 @@ class FormulaAssetTests(unittest.TestCase):
             staged_script = checks_dir / source_script.name
             shutil.copy2(source_script, staged_script)
             staged_script.chmod(0o755)
+            report_stage_script = (
+                packs_root
+                / "gstack"
+                / "assets"
+                / "scripts"
+                / "checks"
+                / "gstack-report-stage-valid.sh"
+            )
+            staged_report_stage = checks_dir / report_stage_script.name
+            shutil.copy2(report_stage_script, staged_report_stage)
+            staged_report_stage.chmod(0o755)
             base_check = checks_dir / "build-artifact-valid.sh"
             base_check.write_text(
                 "#!/usr/bin/env bash\nset -euo pipefail\necho 'base artifact valid'\n",
@@ -3674,6 +4324,11 @@ class FormulaAssetTests(unittest.TestCase):
                 (show_dir / f"{current_id}.json").write_text(
                     json.dumps(payload), encoding="utf-8"
                 )
+            list_path = tmp / "beads.json"
+            list_path.write_text(
+                json.dumps(list(beads_by_id.values())),
+                encoding="utf-8",
+            )
             for current_id, payload in convoys_by_id.items():
                 (convoy_dir / f"{current_id}.json").write_text(
                     json.dumps(payload), encoding="utf-8"
@@ -3685,6 +4340,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "set -euo pipefail\n"
                 "case \"${1:-}:${2:-}\" in\n"
                 "  bd:show) cat \"$BD_SHOW_DIR/$3.json\" ;;\n"
+                "  bd:list) cat \"$BD_LIST_JSON\" ;;\n"
                 "  convoy:status) cat \"$CONVOY_STATUS_DIR/$3.json\" ;;\n"
                 "  *) exit 2 ;;\n"
                 "esac\n",
@@ -3696,6 +4352,7 @@ class FormulaAssetTests(unittest.TestCase):
                 **os.environ,
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                 "BD_SHOW_DIR": str(show_dir),
+                "BD_LIST_JSON": str(list_path),
                 "CONVOY_STATUS_DIR": str(convoy_dir),
                 "GC_BEAD_ID": bead_id,
                 "GC_WORK_DIR": str(launcher),
@@ -3913,6 +4570,70 @@ class FormulaAssetTests(unittest.TestCase):
             self.assertNotEqual(duplicate.returncode, 0, duplicate.stdout + duplicate.stderr)
             self.assertIn("duplicate launch source trace", duplicate.stderr)
             self.assertIn("source-1", duplicate.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n"
+                "    - path: files/invented-out-of-convoy\n"
+                "      hash: bead:invented-out-of-convoy\n---\n",
+                encoding="utf-8",
+            )
+            malformed_inverse = self._run_gstack_build_state_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(
+                malformed_inverse.returncode,
+                0,
+                malformed_inverse.stdout + malformed_inverse.stderr,
+            )
+            self.assertIn("malformed launch source trace", malformed_inverse.stderr)
+            self.assertIn("invented-out-of-convoy", malformed_inverse.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n"
+                "    - path: beads/invented-out-of-convoy\n"
+                "      hash: bead:invented-out-of-convoy\n---\n",
+                encoding="utf-8",
+            )
+            unexpected = self._run_gstack_build_state_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(
+                unexpected.returncode,
+                0,
+                unexpected.stdout + unexpected.stderr,
+            )
+            self.assertIn("unexpected launch source trace", unexpected.stderr)
+            self.assertIn("invented-out-of-convoy", unexpected.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n"
+                "    - path: beads/malformed-out-of-convoy\n"
+                "      hash: sha256:"
+                f"{'0' * 64}\n---\n",
+                encoding="utf-8",
+            )
+            malformed = self._run_gstack_build_state_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(
+                malformed.returncode,
+                0,
+                malformed.stdout + malformed.stderr,
+            )
+            self.assertIn("malformed launch source trace", malformed.stderr)
+            self.assertIn("malformed-out-of-convoy", malformed.stderr)
 
             requirements.write_text(
                 "---\ntrace:\n  upstream:\n"
@@ -4492,6 +5213,243 @@ class FormulaAssetTests(unittest.TestCase):
             root_summary = launcher / "implementation-summary.md"
             summary_one = worktree / "work-1-summary.md"
             summary_two = worktree / "work-2-summary.md"
+            review_report = launcher / "review-report.md"
+            qa_synthesis = launcher / "qa-synthesis.md"
+            qa_summary = launcher / "qa-summary.md"
+            release_synthesis = launcher / "release-readiness-synthesis.md"
+            release_summary = launcher / "release-readiness-summary.md"
+            final_report = launcher / "final-report.md"
+
+            def write_stage_status(path: pathlib.Path, status: str) -> None:
+                path.write_text(f"---\nstatus: {status}\n---\n", encoding="utf-8")
+
+            for status_path in (review_report, final_report):
+                write_stage_status(status_path, "approved")
+
+            report_stage_beads: dict[str, object] = {}
+
+            def write_report_stage(
+                *,
+                prefix: str,
+                status: str,
+                synthesis_path: pathlib.Path,
+                report_path: pathlib.Path,
+            ) -> dict[str, object]:
+                is_qa = prefix == "qa"
+                loop_step = (
+                    "qa.gstack-qa-loop"
+                    if is_qa
+                    else "release-readiness.gstack-release-readiness-loop"
+                )
+                synthesis_step = (
+                    "qa.synthesize-qa"
+                    if is_qa
+                    else "release-readiness.synthesize-release-readiness"
+                )
+                synthesis_stage = (
+                    "synthesize-qa" if is_qa else "synthesize-release-readiness"
+                )
+                report_stage = (
+                    "qa-report-findings" if is_qa else "report-release-findings"
+                )
+                synthesis_schema = (
+                    "gc.gstack.qa-summary.v1"
+                    if is_qa
+                    else "gc.gstack.release-readiness-summary.v1"
+                )
+                report_schema = (
+                    "gc.gstack.qa-report.v1"
+                    if is_qa
+                    else "gc.gstack.release-readiness-report.v1"
+                )
+                approved_verdict = "approve" if is_qa else "done"
+                semantic_verdict = (
+                    approved_verdict if status == "approved" else "iterate"
+                )
+                synthesis_id = f"{prefix}-synthesis"
+                terminal_id = f"{prefix}-report"
+                synthesis_path_key = (
+                    "gstack.qa.summary_path"
+                    if is_qa
+                    else "gstack.release.summary_path"
+                )
+                synthesis_verdict_key = (
+                    "code_review.review_verdict"
+                    if is_qa
+                    else "code_review.verdict"
+                )
+                terminal_path_key = (
+                    "gstack.qa.report_path"
+                    if is_qa
+                    else "gstack.release.report_path"
+                )
+                root_path_key = (
+                    "gc.build.qa_summary_path"
+                    if is_qa
+                    else "gc.build.release_readiness_summary_path"
+                )
+                synthesis_path.write_text(
+                    "---\n"
+                    f"schema: {synthesis_schema}\n"
+                    "producer:\n"
+                    f"  bead_id: {synthesis_id}\n"
+                    f"  stage: {synthesis_stage}\n"
+                    "  attempt: 1\n"
+                    f"status: {status}\n"
+                    f"semantic_verdict: {semantic_verdict}\n"
+                    "---\n\n"
+                    "## Summary\n\nCurrent evidence was synthesized.\n\n"
+                    "## Findings\n\nThe semantic status is preserved.\n\n"
+                    "## Evidence\n\nCurrent lane outputs were inspected.\n",
+                    encoding="utf-8",
+                )
+                digest = (
+                    "sha256:"
+                    + hashlib.sha256(synthesis_path.read_bytes()).hexdigest()
+                )
+                report_path.write_text(
+                    "---\n"
+                    f"schema: {report_schema}\n"
+                    "producer:\n"
+                    f"  bead_id: {terminal_id}\n"
+                    f"  stage: {report_stage}\n"
+                    "  attempt: 1\n"
+                    f"status: {status}\n"
+                    f"semantic_verdict: {semantic_verdict}\n"
+                    "trace:\n"
+                    "  upstream:\n"
+                    f"    - path: {json.dumps(str(synthesis_path.resolve()))}\n"
+                    f"      hash: {digest}\n"
+                    f"      ids: [{synthesis_id}]\n"
+                    "---\n\n"
+                    "## Summary\n\nCurrent findings were recorded without mutation.\n\n"
+                    "## Findings\n\nThe synthesis status is preserved.\n\n"
+                    "## Evidence\n\nThe current synthesis is traced above.\n\n"
+                    "## Next Action\n\nFollow the recorded semantic status.\n",
+                    encoding="utf-8",
+                )
+                finalizer_step = "qa" if is_qa else "release-readiness"
+                finalizer_contract = {
+                    "gc.root_bead_id": "root",
+                    "gc.gstack.report_loop_step": loop_step,
+                    "gc.gstack.report_path_key": root_path_key,
+                    "gc.gstack.synthesis_step": synthesis_step,
+                    "gc.gstack.synthesis_path_key": synthesis_path_key,
+                    "gc.gstack.synthesis_verdict_key": synthesis_verdict_key,
+                    "gc.gstack.synthesis_approved_verdict": approved_verdict,
+                    "gc.gstack.synthesis_schema": synthesis_schema,
+                    "gc.gstack.synthesis_stage": synthesis_stage,
+                    "gc.gstack.terminal_path_key": terminal_path_key,
+                    "gc.gstack.report_schema": report_schema,
+                    "gc.gstack.report_stage": report_stage,
+                }
+                return {
+                    f"{prefix}-loop": {
+                        "id": f"{prefix}-loop",
+                        "status": "closed",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.kind": "ralph",
+                            "gc.step_id": loop_step,
+                            "gc.control_epoch": "1",
+                            "gc.outcome": "pass",
+                        },
+                    },
+                    synthesis_id: {
+                        "id": synthesis_id,
+                        "status": "closed",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.ralph_step_id": loop_step,
+                            "gc.step_id": synthesis_step,
+                            "gc.scope_role": "member",
+                            "gc.attempt": "1",
+                            "gc.outcome": "pass",
+                            "code_review.reviewed_attempt": "1",
+                            synthesis_verdict_key: semantic_verdict,
+                            "code_review.report_path": str(synthesis_path.resolve()),
+                            "code_review.output_path": str(synthesis_path.resolve()),
+                            synthesis_path_key: str(synthesis_path.resolve()),
+                            "gstack.synthesis.sha256": digest,
+                        },
+                    },
+                    terminal_id: {
+                        "id": terminal_id,
+                        "status": "closed",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.ralph_step_id": loop_step,
+                            "gc.attempt": "1",
+                            "gc.review.report_terminal": "true",
+                            "gc.outcome": "pass",
+                            "code_review.verdict": "reported",
+                            "code_review.reviewed_attempt": "1",
+                            "code_review.report_path": str(report_path.resolve()),
+                            "code_review.output_path": str(report_path.resolve()),
+                            terminal_path_key: str(report_path.resolve()),
+                            "gstack.report.synthesis_bead_id": synthesis_id,
+                            "gstack.report.synthesis_path": str(synthesis_path.resolve()),
+                            "gstack.report.synthesis_sha256": digest,
+                            "gstack.report.semantic_verdict": semantic_verdict,
+                            "gstack.report.semantic_status": status,
+                        },
+                    },
+                    f"{prefix}-finalizer": {
+                        "id": f"{prefix}-finalizer",
+                        "status": "closed",
+                        "metadata": {
+                            **finalizer_contract,
+                            "gc.kind": "ralph",
+                            "gc.step_id": finalizer_step,
+                            "gc.control_epoch": "2",
+                            "gc.outcome": "pass",
+                        },
+                    },
+                    f"{prefix}-finalizer.iteration.1": {
+                        "id": f"{prefix}-finalizer.iteration.1",
+                        "status": "closed",
+                        "metadata": {
+                            **finalizer_contract,
+                            "gc.attempt": "1",
+                            "gc.ralph_step_id": finalizer_step,
+                            "gc.outcome": "fail",
+                        },
+                    },
+                    f"{prefix}-finalizer.iteration.2": {
+                        "id": f"{prefix}-finalizer.iteration.2",
+                        "status": "closed",
+                        "metadata": {
+                            **finalizer_contract,
+                            "gc.attempt": "2",
+                            "gc.ralph_step_id": finalizer_step,
+                            "gc.outcome": "pass",
+                        },
+                    },
+                }
+
+            def write_report_stages(
+                qa_status: str = "approved",
+                release_status: str = "approved",
+            ) -> None:
+                report_stage_beads.clear()
+                report_stage_beads.update(
+                    write_report_stage(
+                        prefix="qa",
+                        status=qa_status,
+                        synthesis_path=qa_synthesis,
+                        report_path=qa_summary,
+                    )
+                )
+                report_stage_beads.update(
+                    write_report_stage(
+                        prefix="release",
+                        status=release_status,
+                        synthesis_path=release_synthesis,
+                        report_path=release_summary,
+                    )
+                )
+
+            write_report_stages()
 
             def write_summary(path: pathlib.Path, member_id: str, commit: str) -> None:
                 self._write_gstack_item_summary(path, member_id, worktree, commit)
@@ -4521,9 +5479,15 @@ class FormulaAssetTests(unittest.TestCase):
                     "gc.build.requirements_path": str(requirements),
                     "gc.build.decomposition_path": str(decomposition),
                     "gc.build.implementation_summary_path": str(root_summary),
+                    "gc.build.review_report_path": str(review_report),
+                    "gc.build.qa_summary_path": str(qa_summary),
+                    "gc.build.release_readiness_summary_path": str(release_summary),
+                    "gc.build.final_report_path": str(final_report),
+                    "gc.build.artifact_root": str(launcher.resolve()),
                     "gc.input_convoy_id": "implementation",
                     "gc.build.implementation_convoy_id": "implementation",
                     "gc.build.implementation_member_ids": "work-1,work-2",
+                    "gc.var.review_mode": "report",
                 },
             }
 
@@ -4580,6 +5544,7 @@ class FormulaAssetTests(unittest.TestCase):
                 beads_by_id={
                     "finalize-step": finalize_control,
                     "root": root,
+                    **report_stage_beads,
                     "work-1": member("work-1", member_one_commit, summary_one),
                     "work-2": member("work-2", member_two_commit, summary_two),
                 },
@@ -4602,6 +5567,7 @@ class FormulaAssetTests(unittest.TestCase):
                 beads_by_id={
                     "finalize-step": finalize_control,
                     "root": root,
+                    **report_stage_beads,
                     "work-1": member("work-1", member_one_commit, summary_one),
                     "work-2": member("work-2", member_two_commit, summary_two),
                 },
@@ -4610,6 +5576,112 @@ class FormulaAssetTests(unittest.TestCase):
                 launcher_root=launcher,
             )
             self.assertEqual(valid.returncode, 0, valid.stdout + valid.stderr)
+
+            qa_summary.write_text(
+                "---\nstatus: approved\n---\nOld self-attested QA approval.\n",
+                encoding="utf-8",
+            )
+            stale_report_evidence = self._run_gstack_build_state_check(
+                beads_by_id={
+                    "finalize-step": finalize_control,
+                    "root": root,
+                    **report_stage_beads,
+                    "work-1": member("work-1", member_one_commit, summary_one),
+                    "work-2": member("work-2", member_two_commit, summary_two),
+                },
+                convoys_by_id={"launch": launch, "implementation": implementation},
+                bead_id="finalize-step",
+                launcher_root=launcher,
+            )
+            self.assertNotEqual(
+                stale_report_evidence.returncode,
+                0,
+                stale_report_evidence.stdout + stale_report_evidence.stderr,
+            )
+            self.assertIn(
+                "current report-stage evidence failed for gc.build.qa_summary_path",
+                stale_report_evidence.stderr,
+            )
+            self.assertIn("report artifact schema mismatch", stale_report_evidence.stderr)
+            write_report_stages()
+
+            def run_final_status_case(
+                *,
+                review_status: str = "approved",
+                qa_status: str = "approved",
+                release_status: str = "approved",
+                final_status: str,
+                review_mode: str = "report",
+            ) -> subprocess.CompletedProcess:
+                write_stage_status(review_report, review_status)
+                write_report_stages(qa_status, release_status)
+                write_stage_status(final_report, final_status)
+                root["metadata"]["gc.var.review_mode"] = review_mode
+                return self._run_gstack_build_state_check(
+                    beads_by_id={
+                        "finalize-step": finalize_control,
+                        "root": root,
+                        **report_stage_beads,
+                        "work-1": member("work-1", member_one_commit, summary_one),
+                        "work-2": member("work-2", member_two_commit, summary_two),
+                    },
+                    convoys_by_id={"launch": launch, "implementation": implementation},
+                    bead_id="finalize-step",
+                    launcher_root=launcher,
+                )
+
+            for stage_status in ("changes_required", "blocked"):
+                for status_key in ("review_status", "qa_status", "release_status"):
+                    with self.subTest(
+                        final_status_mapping=status_key,
+                        upstream_status=stage_status,
+                    ):
+                        statuses = {status_key: stage_status}
+                        contradictory = run_final_status_case(
+                            **statuses,
+                            final_status="approved",
+                        )
+                        self.assertNotEqual(
+                            contradictory.returncode,
+                            0,
+                            contradictory.stdout + contradictory.stderr,
+                        )
+                        self.assertIn("final report status mismatch", contradictory.stderr)
+
+                        blocked = run_final_status_case(
+                            **statuses,
+                            final_status="blocked",
+                        )
+                        self.assertEqual(
+                            blocked.returncode,
+                            0,
+                            blocked.stdout + blocked.stderr,
+                        )
+
+            non_report = run_final_status_case(
+                review_status="changes_required",
+                final_status="blocked",
+                review_mode="agent",
+            )
+            self.assertNotEqual(
+                non_report.returncode,
+                0,
+                non_report.stdout + non_report.stderr,
+            )
+            self.assertIn("cannot finalize unresolved evidence", non_report.stderr)
+
+            contradictory_block = run_final_status_case(final_status="blocked")
+            self.assertNotEqual(
+                contradictory_block.returncode,
+                0,
+                contradictory_block.stdout + contradictory_block.stderr,
+            )
+            self.assertIn("final report status mismatch", contradictory_block.stderr)
+
+            for status_path in (review_report, final_report):
+                write_stage_status(status_path, "approved")
+            write_report_stages()
+            root["metadata"]["gc.var.review_mode"] = "report"
 
             stale_absolute_trace = (
                 "    - path: "
@@ -4635,6 +5707,7 @@ class FormulaAssetTests(unittest.TestCase):
                 beads_by_id={
                     "finalize-step": finalize_control,
                     "root": root,
+                    **report_stage_beads,
                     "work-1": member("work-1", member_one_commit, summary_one),
                     "work-2": member("work-2", member_two_commit, summary_two),
                 },
@@ -4668,6 +5741,7 @@ class FormulaAssetTests(unittest.TestCase):
                 beads_by_id={
                     "finalize-step": finalize_control,
                     "root": root,
+                    **report_stage_beads,
                     "work-1": member("work-1", member_one_commit, summary_one),
                     "work-2": member("work-2", member_two_commit, summary_two),
                 },
@@ -4702,6 +5776,7 @@ class FormulaAssetTests(unittest.TestCase):
                 beads_by_id={
                     "finalize-step": finalize_control,
                     "root": root,
+                    **report_stage_beads,
                     "work-1": member("work-1", member_one_commit, summary_one),
                     "work-2": member("work-2", member_two_commit, summary_two),
                 },
@@ -4767,6 +5842,7 @@ class FormulaAssetTests(unittest.TestCase):
                 beads_by_id={
                     "finalize-step": finalize_control,
                     "root": root,
+                    **report_stage_beads,
                     "work-1": member("work-1", member_one_commit, summary_one),
                     "work-2": member(
                         "work-2",
@@ -4806,6 +5882,7 @@ class FormulaAssetTests(unittest.TestCase):
                 beads_by_id={
                     "finalize-step": finalize_control,
                     "root": root,
+                    **report_stage_beads,
                     "work-1": member("work-1", member_one_commit, summary_one),
                     "work-2": member("work-2", member_two_commit, summary_two),
                 },
@@ -4829,6 +5906,7 @@ class FormulaAssetTests(unittest.TestCase):
                 beads_by_id={
                     "finalize-step": finalize_control,
                     "root": root,
+                    **report_stage_beads,
                     "work-1": member("work-1", member_one_commit, summary_one),
                     "work-2": member("work-2", member_two_commit, summary_two),
                 },
@@ -4926,6 +6004,49 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(prompt=relative_path):
                 self.assertIn("Use `status: approved` before closing", prompt)
                 self.assertNotIn("or another schema-allowed status", prompt)
+
+    def test_build_basic_pre_review_producers_require_approved_artifacts(self) -> None:
+        gascity_root = pathlib.Path(__file__).resolve().parents[1]
+        resolved = resolve_formula_from_dirs(
+            [gascity_root / "formulas"],
+            "build-basic",
+        )
+        steps = {step["id"]: step for step in resolved["steps"]}
+        for step_id in (
+            "requirements",
+            "plan",
+            "decompose",
+            "summarize-implementation",
+        ):
+            with self.subTest(step=step_id):
+                self.assertEqual(
+                    steps[step_id]["metadata"].get(
+                        "gc.build.require_approved_status"
+                    ),
+                    "true",
+                )
+                self.assertEqual(
+                    steps[step_id]["metadata"].get(
+                        "gc.build.require_current_producer_attempt"
+                    ),
+                    "true",
+                )
+
+        workflows = gascity_root / "assets" / "workflows"
+        for relative_path in (
+            "build-basic/requirements.md",
+            "build-basic/plan.md",
+            "build-basic/decompose.md",
+            "build-base/summarize-implementation.md",
+        ):
+            prompt = (workflows / relative_path).read_text(encoding="utf-8")
+            with self.subTest(prompt=relative_path):
+                self.assertIn("Use `status: approved` before closing", prompt)
+                self.assertNotIn("or another schema-allowed status", prompt)
+                self.assertIn(
+                    "producer.attempt` to the current `gc.attempt`",
+                    prompt,
+                )
 
     def test_separate_session_adapter_summaries_hash_every_exact_member_artifact(
         self,
@@ -5393,7 +6514,7 @@ class FormulaAssetTests(unittest.TestCase):
         )
 
         review_terminal = (
-            workflow_root / "compound-code-review" / "{target}.md"
+            workflow_root / "compound-code-review" / "finalize-code-review.md"
         ).read_text(encoding="utf-8")
         for fragment in (
             "gc.build.artifact_path_keys",
@@ -5439,7 +6560,7 @@ class FormulaAssetTests(unittest.TestCase):
             "{target}.deployment-verification.md",
             "{target}.gap-analysis-review.md",
             "synthesize-code-review.md",
-            "{target}.apply-review-findings.md",
+            "apply-review-findings.md",
         )
         for filename in canonical_handoff_files:
             text = (review_root / filename).read_text(encoding="utf-8")
@@ -5667,7 +6788,7 @@ class FormulaAssetTests(unittest.TestCase):
             "{target}.edge-case-review.md",
             "{target}.gap-analysis-review.md",
             "synthesize-bmad-review.md",
-            "{target}.apply-bmad-review-findings.md",
+            "apply-bmad-review-findings.md",
         )
         for filename in canonical_handoff_files:
             text = (workflow_root / filename).read_text(encoding="utf-8")
@@ -5690,7 +6811,9 @@ class FormulaAssetTests(unittest.TestCase):
         self.assertIn("status: approved", synthesis)
         self.assertIn("status: changes_required", synthesis)
 
-        terminal = (workflow_root / "{target}.md").read_text(encoding="utf-8")
+        terminal = (workflow_root / "finalize-bmad-code-review.md").read_text(
+            encoding="utf-8"
+        )
         normalized_terminal = " ".join(terminal.split())
         for fragment in (
             "gc.build.artifact_path_keys",
@@ -7215,20 +8338,55 @@ description = "Override sink that writes the base triage report contract."
         )
 
         repo_root = gascity_root.parent
-        bmad = tomllib.loads(
-            (repo_root / "bmad/formulas/bmad-code-review-flow.formula.toml").read_text(
-                encoding="utf-8"
-            )
-        )
-        affected = {
-            "{target}.synthesize-bmad-review",
-            "{target}",
+        affected_review_nodes = {
+            "bmad": (
+                "bmad-code-review-flow",
+                {"{target}.synthesize-bmad-review", "{target}"},
+            ),
+            "compound-engineering": (
+                "compound-code-review",
+                {"{target}.synthesize-code-review", "{target}"},
+            ),
+            "gstack": (
+                "gstack-code-review",
+                {"{target}.synthesize-code-review", "{target}"},
+            ),
+            "superpowers": (
+                "superpowers-code-review",
+                {
+                    "{target}.request-code-review",
+                    "{target}.gap-analysis-review",
+                    "{target}",
+                },
+            ),
         }
-        for node in bmad["template"]:
-            if node["id"] in affected:
-                with self.subTest(node=node["id"]):
+        for pack, (formula_name, required_ids) in affected_review_nodes.items():
+            formula = tomllib.loads(
+                (
+                    repo_root
+                    / pack
+                    / "formulas"
+                    / f"{formula_name}.formula.toml"
+                ).read_text(encoding="utf-8")
+            )
+            nodes = {
+                node["id"]: node
+                for template in formula["template"]
+                for node in (template, *template.get("children", []))
+            }
+            self.assertTrue(
+                required_ids <= nodes.keys(),
+                (pack, required_ids - nodes.keys()),
+            )
+            for node_id in required_ids:
+                with self.subTest(pack=pack, node=node_id):
+                    metadata = nodes[node_id]["metadata"]
                     self.assertEqual(
-                        node["metadata"]["gc.build.require_review_status_coverage"],
+                        metadata["gc.build.artifact_schema"],
+                        "gc.build.review.v1",
+                    )
+                    self.assertEqual(
+                        metadata["gc.build.require_review_status_coverage"],
                         "true",
                     )
 
@@ -7237,6 +8395,29 @@ description = "Override sink that writes the base triage report contract."
         ).read_text(encoding="utf-8")
         self.assertIn("gc.build.require_review_status_coverage", script)
         self.assertIn("--enforce-review-status-coverage", script)
+
+    def test_compound_review_prompt_keeps_status_and_coverage_coherent(self) -> None:
+        prompt = " ".join(
+            (
+                pathlib.Path(__file__).resolve().parents[2]
+                / "compound-engineering"
+                / "assets"
+                / "workflows"
+                / "compound-code-review"
+                / "synthesize-code-review.md"
+            )
+            .read_text(encoding="utf-8")
+            .split()
+        )
+
+        for fragment in (
+            "`status: changes_required` or `status: blocked` requires at least one "
+            "`blocked` coverage row",
+            "`status: approved` requires no `blocked` coverage rows",
+            "status: blocked rationale: <why the finding remains unresolved>",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, prompt)
 
     def _run_build_requirements_source_check(
         self,
@@ -7371,6 +8552,27 @@ description = "Override sink that writes the base triage report contract."
             requirements.write_text(
                 "---\ntrace:\n  upstream:\n"
                 "    - path: beads/source-1\n      hash: bead:source-1\n"
+                "    - path: beads/source-2\n      hash: bead:source-2\n"
+                "    - path: files/invented-out-of-convoy\n"
+                "      hash: bead:invented-out-of-convoy\n---\n",
+                encoding="utf-8",
+            )
+            malformed_inverse = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root, **source_beads},
+                convoys_by_id={"launch": launch},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(
+                malformed_inverse.returncode,
+                0,
+                malformed_inverse.stdout + malformed_inverse.stderr,
+            )
+            self.assertIn("malformed launch source trace", malformed_inverse.stderr)
+            self.assertIn("invented-out-of-convoy", malformed_inverse.stderr)
+
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                "    - path: beads/source-1\n      hash: bead:source-1\n"
                 "    - path: beads/source-2\n      hash: bead:source-2\n---\n",
                 encoding="utf-8",
             )
@@ -7448,6 +8650,28 @@ description = "Override sink that writes the base triage report contract."
             )
             self.assertNotEqual(duplicate.returncode, 0, duplicate.stdout + duplicate.stderr)
             self.assertIn("duplicate internal planning context trace", duplicate.stderr)
+
+            unrelated = root_dir / "unrelated.md"
+            unrelated.write_text("Invented planning input.\n", encoding="utf-8")
+            unrelated_digest = hashlib.sha256(unrelated.read_bytes()).hexdigest()
+            requirements.write_text(
+                "---\ntrace:\n  upstream:\n"
+                f"    - path: {context}\n      hash: sha256:{context_digest}\n"
+                f"    - path: {unrelated}\n      hash: sha256:{unrelated_digest}\n"
+                "  coverage: []\n---\n",
+                encoding="utf-8",
+            )
+            unexpected = self._run_build_requirements_source_check(
+                beads_by_id={"requirements-step": control, "root": root},
+                convoys_by_id={},
+                bead_id="requirements-step",
+            )
+            self.assertNotEqual(
+                unexpected.returncode,
+                0,
+                unexpected.stdout + unexpected.stderr,
+            )
+            self.assertIn("unexpected internal planning source trace", unexpected.stderr)
 
             requirements.write_text(
                 "---\ntrace:\n  upstream:\n"
@@ -9524,7 +10748,7 @@ description = "Override sink that writes the base triage report contract."
                 "expansion": "bmad-code-review-flow",
                 "fix_child": "{target}.apply-bmad-review-findings",
                 "synthesis": "bmad-code-review-flow/synthesize-bmad-review.md",
-                "finalize": "bmad-code-review-flow/{target}.md",
+                "finalize": "bmad-code-review-flow/finalize-bmad-code-review.md",
             },
             "compound-engineering": {
                 "pack_dir": repo / "compound-engineering",
@@ -9533,7 +10757,7 @@ description = "Override sink that writes the base triage report contract."
                 "expansion": "compound-code-review",
                 "fix_child": "{target}.apply-review-findings",
                 "synthesis": "compound-code-review/synthesize-code-review.md",
-                "finalize": "compound-code-review/{target}.md",
+                "finalize": "compound-code-review/finalize-code-review.md",
             },
             "gstack": {
                 "pack_dir": repo / "gstack",
@@ -9626,6 +10850,912 @@ description = "Override sink that writes the base triage report contract."
         self.assertIn("Do not require the `report_path` file to exist before review", context_prompt)
         self.assertIn("Do not require", context_prompt)
         self.assertIn("review-config.yaml", context_prompt)
+
+    def test_methodology_report_loops_require_current_terminal_evidence(self) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        cases = {
+            "bmad": {
+                "formula": "bmad-code-review-flow",
+                "loop": "{target}.bmad-code-review-loop",
+                "terminal": "{target}.report-bmad-review-findings",
+                "root_formula": "bmad-review",
+                "workflow_formula": "bmad-review",
+                "methodology": "bmad-review",
+                "producer_formula": "bmad-code-review-flow",
+            },
+            "compound-engineering": {
+                "formula": "compound-code-review",
+                "loop": "{target}.compound-code-review-loop",
+                "terminal": "{target}.report-review-findings",
+                "root_formula": "compound-review",
+                "workflow_formula": "compound-review",
+                "methodology": "compound-review",
+                "producer_formula": "compound-code-review",
+            },
+            "superpowers": {
+                "formula": "superpowers-code-review",
+                "loop": "{target}.superpowers-code-review-loop",
+                "terminal": "{target}.report-code-review-findings",
+                "root_formula": "superpowers-review",
+                "workflow_formula": "superpowers-review",
+                "methodology": "superpowers-code-review",
+                "producer_formula": "superpowers-code-review",
+            },
+        }
+        path_contracts = {
+            "gc.build.code_review_report_path": (
+                "code_review.review_report_path",
+                "code_review.review_verdict",
+            ),
+            "gc.build.gap_analysis_report_path": (
+                "code_review.gap_report_path",
+                "code_review.gap_verdict",
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            artifact_root = pathlib.Path(td).resolve()
+            for pack, case in cases.items():
+                formula = tomllib.loads(
+                    (
+                        repo
+                        / pack
+                        / "formulas"
+                        / f"{case['formula']}.formula.toml"
+                    ).read_text(encoding="utf-8")
+                )
+                loop = next(
+                    template
+                    for template in formula["template"]
+                    if template["id"] == case["loop"]
+                )
+                children = {child["id"]: child for child in loop["children"]}
+                report_terminal = children[case["terminal"]]
+                producer_ids: dict[str, str] = {}
+                for producer_id in report_terminal["needs"]:
+                    path_keys = {
+                        key.strip()
+                        for key in children[producer_id]["metadata"].get(
+                            "gc.build.artifact_path_keys", ""
+                        ).split(",")
+                    }
+                    for path_key in path_contracts:
+                        if path_key in path_keys:
+                            producer_ids[path_key] = producer_id
+                self.assertIn("gc.build.code_review_report_path", producer_ids)
+                self.assertEqual(
+                    "gc.build.gap_analysis_report_path" in producer_ids,
+                    pack == "superpowers",
+                )
+                with self.subTest(pack=pack, contract="formula"):
+                    self.assertEqual(
+                        loop["metadata"].get(
+                            "gc.review.require_current_report_terminal"
+                        ),
+                        "true",
+                    )
+                    self.assertEqual(
+                        report_terminal.get("condition"), "{{review_mode}} == report"
+                    )
+                    self.assertEqual(
+                        report_terminal["metadata"].get("gc.review.report_terminal"),
+                        "true",
+                    )
+                    report_prompt = (
+                        repo
+                        / pack
+                        / "formulas"
+                        / report_terminal["description_file"]
+                    ).resolve().read_text(encoding="utf-8")
+                    for fragment in (
+                        "current attempt",
+                        "metadata-only",
+                        "Do not edit product source",
+                        "gc.build.code_review_artifact_root",
+                        "code_review.verdict=reported",
+                    ):
+                        self.assertIn(fragment, report_prompt)
+
+                runtime_loop_id = case["loop"].replace("{target}", "review")
+                runtime_report_id = case["terminal"].replace(
+                    "{target}", "review"
+                )
+                runtime_producer_ids = {
+                    path_key: producer_id.replace("{target}", "review")
+                    for path_key, producer_id in producer_ids.items()
+                }
+                runtime_control_ids = {
+                    path_key: f"{producer_id}-scope-check"
+                    for path_key, producer_id in runtime_producer_ids.items()
+                }
+                pack_root = artifact_root / pack
+                pack_root.mkdir()
+                subject_path = pack_root / "subject.md"
+                subject_path.write_text("# Review subject\n", encoding="utf-8")
+                artifact_paths = {
+                    "gc.build.code_review_report_path": pack_root
+                    / "current-review.md",
+                    **(
+                        {
+                            "gc.build.gap_analysis_report_path": pack_root
+                            / "current-gap-review.md"
+                        }
+                        if pack == "superpowers"
+                        else {}
+                    ),
+                }
+                for path_key, artifact_path in artifact_paths.items():
+                    producer_stage = runtime_producer_ids[path_key].rsplit(
+                        ".", 1
+                    )[-1]
+                    artifact_path.write_text(
+                        self._valid_methodology_review_artifact(
+                            subject_path,
+                            workflow_id="root",
+                            workflow_formula=case["workflow_formula"],
+                            pack=pack,
+                            methodology_name=case["methodology"],
+                            producer_formula=case["producer_formula"],
+                            producer_stage=producer_stage,
+                        ),
+                        encoding="utf-8",
+                    )
+                show_json = json.dumps(
+                    [
+                        {
+                            "id": "loop",
+                            "metadata": {
+                                **loop["metadata"],
+                                "gc.root_bead_id": "root",
+                                "gc.step_id": runtime_loop_id,
+                            },
+                        }
+                    ]
+                )
+                parent_show_json = json.dumps(
+                    [
+                        {
+                            "id": "root",
+                            "metadata": {
+                                "gc.formula_name": case["root_formula"],
+                                "gc.var.review_mode": "report",
+                                "gc.build.code_review_artifact_root": str(
+                                    pack_root
+                                ),
+                                **{
+                                    path_key: str(path)
+                                    for path_key, path in artifact_paths.items()
+                                },
+                            },
+                        }
+                    ]
+                )
+
+                def producer_row(
+                    path_key: str, attempt: str
+                ) -> dict[str, object]:
+                    producer_id = producer_ids[path_key]
+                    runtime_producer_id = runtime_producer_ids[path_key]
+                    report_metadata, verdict_metadata = path_contracts[path_key]
+                    report_path = artifact_paths[path_key]
+                    return {
+                        "id": runtime_producer_id,
+                        "status": "closed",
+                        "metadata": {
+                            **children[producer_id]["metadata"],
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": attempt,
+                            "gc.ralph_step_id": runtime_loop_id,
+                            "gc.scope_ref": f"{runtime_loop_id}.iteration.{attempt}",
+                            "gc.scope_role": "member",
+                            "gc.step_id": runtime_producer_id,
+                            "gc.step_ref": (
+                                f"{runtime_loop_id}.iteration.{attempt}."
+                                f"{runtime_producer_id}"
+                            ),
+                            "gc.outcome": "pass",
+                            verdict_metadata: "iterate",
+                            report_metadata: str(report_path),
+                            "code_review.output_path": str(report_path),
+                        },
+                    }
+
+                def control_row(
+                    path_key: str, attempt: str
+                ) -> dict[str, object]:
+                    producer_id = runtime_producer_ids[path_key]
+                    control_id = runtime_control_ids[path_key]
+                    producer_ref = (
+                        f"{runtime_loop_id}.iteration.{attempt}.{producer_id}"
+                    )
+                    return {
+                        "id": control_id,
+                        "status": "closed",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": attempt,
+                            "gc.ralph_step_id": runtime_loop_id,
+                            "gc.scope_ref": f"{runtime_loop_id}.iteration.{attempt}",
+                            "gc.scope_role": "control",
+                            "gc.kind": "scope-check",
+                            "gc.control_for": producer_ref,
+                            "gc.step_id": producer_id,
+                            "gc.outcome": "pass",
+                        },
+                        "dependencies": [
+                            {
+                                "issue_id": control_id,
+                                "depends_on_id": producer_id,
+                                "type": "blocks",
+                            }
+                        ],
+                    }
+
+                def terminal_row(attempt: str) -> dict[str, object]:
+                    report_path = artifact_paths[
+                        "gc.build.code_review_report_path"
+                    ]
+                    return {
+                        "id": runtime_report_id,
+                        "status": "closed",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": attempt,
+                            "gc.ralph_step_id": runtime_loop_id,
+                            "gc.scope_ref": f"{runtime_loop_id}.iteration.{attempt}",
+                            "gc.scope_role": "member",
+                            "gc.step_id": runtime_report_id,
+                            "gc.outcome": "pass",
+                            "gc.review.report_terminal": "true",
+                            "code_review.verdict": "reported",
+                            "code_review.report_path": str(report_path),
+                            "code_review.output_path": str(report_path),
+                        },
+                        "dependencies": [
+                            {
+                                "issue_id": runtime_report_id,
+                                "depends_on_id": control_id,
+                                "type": "blocks",
+                            }
+                            for control_id in runtime_control_ids.values()
+                        ],
+                    }
+
+                def rows_for(attempt: str) -> list[dict[str, object]]:
+                    return [
+                        *(producer_row(path_key, attempt) for path_key in artifact_paths),
+                        *(control_row(path_key, attempt) for path_key in artifact_paths),
+                        terminal_row(attempt),
+                    ]
+
+                missing = self._run_implementation_review_check(
+                    show_json=show_json,
+                    parent_show_json=parent_show_json,
+                    list_json="[]",
+                    extra_env={"GC_ITERATION": "2"},
+                )
+                stale = self._run_implementation_review_check(
+                    show_json=show_json,
+                    parent_show_json=parent_show_json,
+                    list_json=json.dumps(rows_for("1")),
+                    extra_env={"GC_ITERATION": "2"},
+                )
+                current = self._run_implementation_review_check(
+                    show_json=show_json,
+                    parent_show_json=parent_show_json,
+                    list_json=json.dumps(rows_for("2")),
+                    extra_env={"GC_ITERATION": "2"},
+                )
+
+                for scenario, result in (("missing", missing), ("stale", stale)):
+                    with self.subTest(pack=pack, scenario=scenario):
+                        self.assertNotEqual(
+                            result.returncode, 0, result.stdout + result.stderr
+                        )
+                        self.assertIn(
+                            "expected exactly one current report terminal",
+                            result.stderr,
+                        )
+                with self.subTest(pack=pack, scenario="current"):
+                    self.assertEqual(
+                        current.returncode, 0, current.stdout + current.stderr
+                    )
+                    self.assertIn("current report terminal satisfied", current.stdout)
+
+    def test_methodology_report_terminal_binds_current_producer_and_artifact(
+        self,
+    ) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        cases = {
+            "bmad": {
+                "formula": "bmad-code-review-flow",
+                "loop": "{target}.bmad-code-review-loop",
+                "terminal": "{target}.report-bmad-review-findings",
+                "root_formula": "bmad-build",
+                "workflow_formula": "bmad-review",
+                "methodology": "bmad-review",
+                "producer_formula": "bmad-code-review-flow",
+            },
+            "compound-engineering": {
+                "formula": "compound-code-review",
+                "loop": "{target}.compound-code-review-loop",
+                "terminal": "{target}.report-review-findings",
+                "root_formula": "compound-build",
+                "workflow_formula": "compound-review",
+                "methodology": "compound-review",
+                "producer_formula": "compound-code-review",
+            },
+            "superpowers": {
+                "formula": "superpowers-code-review",
+                "loop": "{target}.superpowers-code-review-loop",
+                "terminal": "{target}.report-code-review-findings",
+                "root_formula": "superpowers-build",
+                "workflow_formula": "superpowers-build",
+                "methodology": "superpowers-code-review",
+                "producer_formula": "superpowers-code-review",
+            },
+            "gstack": {
+                "formula": "gstack-code-review",
+                "loop": "{target}.gstack-code-review-loop",
+                "terminal": "{target}.report-review-findings",
+                "root_formula": "gstack-build",
+                "workflow_formula": "gstack-review",
+                "methodology": "gstack-review",
+                "producer_formula": "gstack-code-review",
+            },
+        }
+        path_contracts = {
+            "gc.build.code_review_report_path": (
+                "code_review.review_report_path",
+                "code_review.review_verdict",
+            ),
+            "gc.build.gap_analysis_report_path": (
+                "code_review.gap_report_path",
+                "code_review.gap_verdict",
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            artifact_root = pathlib.Path(td).resolve()
+            for pack, case in cases.items():
+                formula = tomllib.loads(
+                    (
+                        repo
+                        / pack
+                        / "formulas"
+                        / f"{case['formula']}.formula.toml"
+                    ).read_text(encoding="utf-8")
+                )
+                loop = next(
+                    template
+                    for template in formula["template"]
+                    if template["id"] == case["loop"]
+                )
+                children = {child["id"]: child for child in loop["children"]}
+                report_terminal = children[case["terminal"]]
+                producer_ids: dict[str, str] = {}
+                for producer_id in report_terminal["needs"]:
+                    path_keys = {
+                        key.strip()
+                        for key in children[producer_id]["metadata"].get(
+                            "gc.build.artifact_path_keys", ""
+                        ).split(",")
+                    }
+                    for path_key in path_contracts:
+                        if path_key in path_keys:
+                            self.assertNotIn(path_key, producer_ids)
+                            producer_ids[path_key] = producer_id
+                self.assertIn("gc.build.code_review_report_path", producer_ids)
+                self.assertEqual(
+                    "gc.build.gap_analysis_report_path" in producer_ids,
+                    pack == "superpowers",
+                )
+
+                runtime_loop_id = case["loop"].replace("{target}", "review")
+                runtime_report_id = case["terminal"].replace(
+                    "{target}", "review"
+                )
+                runtime_producer_ids = {
+                    path_key: producer_id.replace("{target}", "review")
+                    for path_key, producer_id in producer_ids.items()
+                }
+                runtime_control_ids = {
+                    path_key: f"{producer_id}-scope-check"
+                    for path_key, producer_id in runtime_producer_ids.items()
+                }
+                pack_root = artifact_root / pack
+                pack_root.mkdir()
+                subject_path = pack_root / "review-subject.md"
+                artifact_paths = {
+                    "gc.build.code_review_report_path": pack_root
+                    / "implementation-review-report.md",
+                    **(
+                        {
+                            "gc.build.gap_analysis_report_path": pack_root
+                            / "gap-analysis-report.md"
+                        }
+                        if pack == "superpowers"
+                        else {}
+                    ),
+                }
+
+                show_json = json.dumps(
+                    [
+                        {
+                            "id": "loop",
+                            "metadata": {
+                                **loop["metadata"],
+                                "gc.root_bead_id": "root",
+                                "gc.step_id": runtime_loop_id,
+                            },
+                        }
+                    ]
+                )
+
+                def producer_row(
+                    path_key: str,
+                    *,
+                    attempt: str = "2",
+                    verdict: str = "iterate",
+                ) -> dict[str, object]:
+                    producer_id = producer_ids[path_key]
+                    runtime_producer_id = runtime_producer_ids[path_key]
+                    report_path_key, verdict_key = path_contracts[path_key]
+                    report_path = artifact_paths[path_key]
+                    return {
+                        "id": runtime_producer_id,
+                        "status": "closed",
+                        "metadata": {
+                            **children[producer_id]["metadata"],
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": attempt,
+                            "gc.ralph_step_id": runtime_loop_id,
+                            "gc.scope_ref": (
+                                f"{runtime_loop_id}.iteration.{attempt}"
+                            ),
+                            "gc.scope_role": "member",
+                            "gc.step_id": runtime_producer_id,
+                            "gc.step_ref": (
+                                f"{runtime_loop_id}.iteration.{attempt}."
+                                f"{runtime_producer_id}"
+                            ),
+                            "gc.outcome": "pass",
+                            verdict_key: verdict,
+                            report_path_key: str(report_path),
+                            "code_review.output_path": str(report_path),
+                        },
+                    }
+
+                def scope_control_row(
+                    path_key: str,
+                    *,
+                    attempt: str = "2",
+                    control_for: str | None = None,
+                ) -> dict[str, object]:
+                    runtime_producer_id = runtime_producer_ids[path_key]
+                    runtime_control_id = runtime_control_ids[path_key]
+                    producer_step_ref = (
+                        f"{runtime_loop_id}.iteration.{attempt}."
+                        f"{runtime_producer_id}"
+                    )
+                    return {
+                        "id": runtime_control_id,
+                        "status": "closed",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": attempt,
+                            "gc.ralph_step_id": runtime_loop_id,
+                            "gc.scope_ref": (
+                                f"{runtime_loop_id}.iteration.{attempt}"
+                            ),
+                            "gc.scope_role": "control",
+                            "gc.kind": "scope-check",
+                            "gc.control_for": control_for or producer_step_ref,
+                            "gc.step_id": runtime_producer_id,
+                            "gc.step_ref": (
+                                f"{case['root_formula']}.{producer_step_ref}"
+                                "-scope-check"
+                            ),
+                            "gc.outcome": "pass",
+                        },
+                        "dependencies": [
+                            {
+                                "issue_id": runtime_control_id,
+                                "depends_on_id": runtime_producer_id,
+                                "type": "blocks",
+                            },
+                            {
+                                "issue_id": runtime_control_id,
+                                "depends_on_id": "root",
+                                "type": "tracks",
+                            },
+                        ],
+                    }
+
+                def terminal_row(
+                    dependency_ids: list[str] | None = None,
+                ) -> dict[str, object]:
+                    report_path = artifact_paths[
+                        "gc.build.code_review_report_path"
+                    ]
+                    return {
+                        "id": runtime_report_id,
+                        "status": "closed",
+                        "metadata": {
+                            **report_terminal["metadata"],
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": "2",
+                            "gc.ralph_step_id": runtime_loop_id,
+                            "gc.scope_ref": f"{runtime_loop_id}.iteration.2",
+                            "gc.scope_role": "member",
+                            "gc.step_id": runtime_report_id,
+                            "gc.outcome": "pass",
+                            "code_review.verdict": "reported",
+                            "code_review.report_path": str(report_path),
+                            "code_review.output_path": str(report_path),
+                        },
+                        "dependencies": [
+                            {
+                                "issue_id": runtime_report_id,
+                                "depends_on_id": dependency_id,
+                                "type": "blocks",
+                            }
+                            for dependency_id in (
+                                list(runtime_control_ids.values())
+                                if dependency_ids is None
+                                else dependency_ids
+                            )
+                        ],
+                    }
+
+                def run_case(
+                    *,
+                    artifact_overrides: dict[str, dict[str, object]] | None = None,
+                    producer_attempts: dict[str, str] | None = None,
+                    producer_verdicts: dict[str, str] | None = None,
+                    control_attempts: dict[str, str] | None = None,
+                    control_for_overrides: dict[str, str] | None = None,
+                    omitted_producers: set[str] | None = None,
+                    dependency_ids: list[str] | None = None,
+                    omit_root_artifact_paths: bool = False,
+                    mutate_upstream: bool = False,
+                ) -> subprocess.CompletedProcess:
+                    artifact_overrides = artifact_overrides or {}
+                    producer_attempts = producer_attempts or {}
+                    producer_verdicts = producer_verdicts or {}
+                    control_attempts = control_attempts or {}
+                    control_for_overrides = control_for_overrides or {}
+                    omitted_producers = omitted_producers or set()
+                    subject_path.write_text(
+                        "# Current review subject\n", encoding="utf-8"
+                    )
+                    for path_key, artifact_path in artifact_paths.items():
+                        producer_stage = runtime_producer_ids[path_key].rsplit(
+                            ".", 1
+                        )[-1]
+                        overrides = artifact_overrides.get(path_key, {})
+                        artifact_path.write_text(
+                            self._valid_methodology_review_artifact(
+                                subject_path,
+                                workflow_id=str(
+                                    overrides.get("workflow_id", "root")
+                                ),
+                                workflow_formula=str(
+                                    overrides.get(
+                                        "workflow_formula",
+                                        case["workflow_formula"],
+                                    )
+                                ),
+                                pack=str(overrides.get("pack", pack)),
+                                methodology_name=str(
+                                    overrides.get(
+                                        "methodology_name", case["methodology"]
+                                    )
+                                ),
+                                producer_formula=str(
+                                    overrides.get(
+                                        "producer_formula",
+                                        case["producer_formula"],
+                                    )
+                                ),
+                                producer_stage=str(
+                                    overrides.get("producer_stage", producer_stage)
+                                ),
+                                attempt=int(overrides.get("attempt", 2)),
+                                status=str(
+                                    overrides.get("status", "changes_required")
+                                ),
+                            ),
+                            encoding="utf-8",
+                        )
+                    if mutate_upstream:
+                        subject_path.write_text(
+                            "# Mutated review subject\n", encoding="utf-8"
+                        )
+
+                    parent_metadata = {
+                        "gc.formula_name": case["root_formula"],
+                        "gc.var.review_mode": "report",
+                        "gc.build.code_review_artifact_root": str(pack_root),
+                        **(
+                            {}
+                            if omit_root_artifact_paths
+                            else {
+                                path_key: str(path)
+                                for path_key, path in artifact_paths.items()
+                            }
+                        ),
+                    }
+                    rows = [
+                        producer_row(
+                            path_key,
+                            attempt=producer_attempts.get(path_key, "2"),
+                            verdict=producer_verdicts.get(path_key, "iterate"),
+                        )
+                        for path_key in artifact_paths
+                        if path_key not in omitted_producers
+                    ]
+                    rows.extend(
+                        scope_control_row(
+                            path_key,
+                            attempt=control_attempts.get(path_key, "2"),
+                            control_for=control_for_overrides.get(path_key),
+                        )
+                        for path_key in artifact_paths
+                    )
+                    rows.append(terminal_row(dependency_ids))
+                    return self._run_implementation_review_check(
+                        show_json=show_json,
+                        parent_show_json=json.dumps(
+                            [{"id": "root", "metadata": parent_metadata}]
+                        ),
+                        list_json=json.dumps(rows),
+                        extra_env={"GC_ITERATION": "2"},
+                    )
+
+                valid = run_case()
+                stale_artifact = run_case(
+                    artifact_overrides={
+                        "gc.build.code_review_report_path": {"attempt": 1}
+                    }
+                )
+                detached_terminal = run_case(
+                    dependency_ids=[
+                        control_id
+                        for path_key, control_id in runtime_control_ids.items()
+                        if path_key != "gc.build.code_review_report_path"
+                    ]
+                    + ["other-producer"]
+                )
+                disconnected_without_root_paths = run_case(
+                    dependency_ids=["other-producer"],
+                    omit_root_artifact_paths=True,
+                )
+
+                with self.subTest(pack=pack, scenario="valid-current"):
+                    self.assertEqual(
+                        valid.returncode, 0, valid.stdout + valid.stderr
+                    )
+                    self.assertIn("current report terminal satisfied", valid.stdout)
+                with self.subTest(pack=pack, scenario="stale-artifact-attempt"):
+                    self.assertNotEqual(
+                        stale_artifact.returncode,
+                        0,
+                        stale_artifact.stdout + stale_artifact.stderr,
+                    )
+                    self.assertIn("artifact producer.attempt", stale_artifact.stderr)
+                with self.subTest(pack=pack, scenario="detached-terminal"):
+                    self.assertNotEqual(
+                        detached_terminal.returncode,
+                        0,
+                        detached_terminal.stdout + detached_terminal.stderr,
+                    )
+                    self.assertIn("current code-review producer", detached_terminal.stderr)
+                with self.subTest(
+                    pack=pack,
+                    scenario="disconnected-terminal-without-root-paths",
+                ):
+                    self.assertNotEqual(
+                        disconnected_without_root_paths.returncode,
+                        0,
+                        disconnected_without_root_paths.stdout
+                        + disconnected_without_root_paths.stderr,
+                    )
+                    self.assertIn(
+                        "expected exactly one current code-review producer",
+                        disconnected_without_root_paths.stderr,
+                    )
+
+                if pack == "bmad":
+                    code_key = "gc.build.code_review_report_path"
+                    misbound_control = run_case(
+                        control_for_overrides={
+                            code_key: "review.foreign-producer"
+                        }
+                    )
+                    foreign_identity = run_case(
+                        artifact_overrides={
+                            code_key: {
+                                "workflow_id": "foreign-root",
+                                "pack": "gascity",
+                            }
+                        }
+                    )
+                    mutated_upstream = run_case(mutate_upstream=True)
+                    contradictory = run_case(
+                        artifact_overrides={
+                            code_key: {
+                                "status": "approved"
+                            }
+                        }
+                    )
+                    disallowed_status = run_case(
+                        artifact_overrides={
+                            code_key: {"status": "draft"}
+                        },
+                        producer_verdicts={
+                            code_key: "approve"
+                        },
+                    )
+                    with self.subTest(pack=pack, scenario="misbound-scope-check"):
+                        self.assertNotEqual(
+                            misbound_control.returncode,
+                            0,
+                            misbound_control.stdout + misbound_control.stderr,
+                        )
+                        self.assertIn("scope-check", misbound_control.stderr)
+                    with self.subTest(pack=pack, scenario="foreign-identity"):
+                        self.assertNotEqual(
+                            foreign_identity.returncode,
+                            0,
+                            foreign_identity.stdout + foreign_identity.stderr,
+                        )
+                        self.assertIn("artifact identity", foreign_identity.stderr)
+                    with self.subTest(pack=pack, scenario="mutated-upstream"):
+                        self.assertNotEqual(
+                            mutated_upstream.returncode,
+                            0,
+                            mutated_upstream.stdout + mutated_upstream.stderr,
+                        )
+                        self.assertIn("sha256 digest", mutated_upstream.stderr)
+                    with self.subTest(pack=pack, scenario="contradictory-verdict"):
+                        self.assertNotEqual(
+                            contradictory.returncode,
+                            0,
+                            contradictory.stdout + contradictory.stderr,
+                        )
+                        self.assertIn("status/verdict", contradictory.stderr)
+                    with self.subTest(pack=pack, scenario="disallowed-status"):
+                        self.assertNotEqual(
+                            disallowed_status.returncode,
+                            0,
+                            disallowed_status.stdout + disallowed_status.stderr,
+                        )
+                        self.assertIn("terminal status", disallowed_status.stderr)
+
+                if pack == "superpowers":
+                    gap_key = "gc.build.gap_analysis_report_path"
+                    missing_gap = run_case(omitted_producers={gap_key})
+                    stale_gap = run_case(
+                        artifact_overrides={gap_key: {"attempt": 1}}
+                    )
+                    with self.subTest(pack=pack, scenario="missing-gap"):
+                        self.assertNotEqual(
+                            missing_gap.returncode,
+                            0,
+                            missing_gap.stdout + missing_gap.stderr,
+                        )
+                        self.assertIn("gap-analysis producer", missing_gap.stderr)
+                    with self.subTest(pack=pack, scenario="stale-gap"):
+                        self.assertNotEqual(
+                            stale_gap.returncode,
+                            0,
+                            stale_gap.stdout + stale_gap.stderr,
+                        )
+                        self.assertIn("gap-analysis producer", stale_gap.stderr)
+                        self.assertIn("artifact producer.attempt", stale_gap.stderr)
+
+                with self.subTest(
+                    pack=pack,
+                    scenario="requires-artifact-producer-binding",
+                ):
+                    self.assertEqual(
+                        loop["metadata"].get(
+                            "gc.review.require_artifact_producer_binding"
+                        ),
+                        "true",
+                    )
+
+    def test_methodology_review_fixes_refresh_authoritative_member_provenance(
+        self,
+    ) -> None:
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        cases = {
+            "bmad": (
+                "bmad-code-review-flow",
+                "{target}.apply-bmad-review-findings",
+                "bmad-code-review-flow/apply-bmad-review-findings.md",
+            ),
+            "compound-engineering": (
+                "compound-code-review",
+                "{target}.apply-review-findings",
+                "compound-code-review/apply-review-findings.md",
+            ),
+            "superpowers": (
+                "superpowers-code-review",
+                "{target}.process-code-review",
+                "superpowers-code-review/process-code-review.md",
+            ),
+        }
+
+        for pack, (formula_name, child_id, prompt_path) in cases.items():
+            pack_root = repo / pack
+            formula = tomllib.loads(
+                (
+                    pack_root / "formulas" / f"{formula_name}.formula.toml"
+                ).read_text(encoding="utf-8")
+            )
+            child = next(
+                child
+                for template in formula["template"]
+                for child in template.get("children", [])
+                if child["id"] == child_id
+            )
+            with self.subTest(pack=pack, contract="report-mode-exclusion"):
+                self.assertEqual(child.get("condition"), "{{review_mode}} != report")
+
+            prompt = (
+                pack_root / "assets" / "workflows" / prompt_path
+            ).read_text(encoding="utf-8")
+            normalized = " ".join(prompt.split())
+            for fragment in (
+                "gc.build.implementation_convoy_id",
+                "exact implementation convoy member",
+                "gc.implementation.worktree_path",
+                "Verify `pwd -P`",
+                "Never edit, test, stage, or commit product source in the launcher rig root",
+                "gc.implementation.summary_path",
+                "gc.implementation.commit=<current full HEAD>",
+                "gc.build.implementation_summary_path",
+                "every exact implementation convoy member",
+                "each current absolute per-member summary path exactly once",
+                "`sha256` digest of its current bytes",
+                "never the workflow root or current review-fix bead",
+                "Only a subsequent unchanged review iteration may set `done`",
+            ):
+                with self.subTest(pack=pack, fragment=fragment):
+                    self.assertIn(fragment, normalized)
+
+            member_update = re.search(
+                r'`(gc bd update "<implementation-member-id>"[^`]+)`',
+                normalized,
+            )
+            with self.subTest(pack=pack, contract="member-update-command"):
+                self.assertIsNotNone(member_update)
+                command = member_update.group(1)
+                self.assertIn(
+                    "gc.implementation.commit=<current full HEAD>", command
+                )
+                self.assertIn(
+                    "gc.implementation.summary_path=<current absolute member summary>",
+                    command,
+                )
+                self.assertNotIn("gc.verified_commit", command)
+
+            ordered_actions = [
+                normalized.index("Resolve the exact implementation convoy member"),
+                normalized.index("Verify `pwd -P`"),
+                normalized.index("Rewrite and validate the per-member summary"),
+                normalized.index(
+                    "commit all tracked source-worktree bytes, including the per-member summary"
+                ),
+                normalized.index("capture the current full `HEAD`"),
+                normalized.index('gc bd update "<implementation-member-id>"'),
+                normalized.index("Regenerate the canonical root summary"),
+                normalized.index("Force `code_review.verdict=iterate`"),
+            ]
+            with self.subTest(pack=pack, contract="mutation-order"):
+                self.assertEqual(ordered_actions, sorted(ordered_actions))
 
     def test_bmad_review_and_finalization_keep_blocked_outcomes_coherent(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
@@ -9838,6 +11968,61 @@ description = "Override sink that writes the base triage report contract."
             "| SEC-001 | blocked |\n\n"
             "## Findings\n\nShell injection through subprocess shell=True.\n\n"
             "## Verification\n\nUse an argument vector with shell=False.\n"
+        )
+
+    @staticmethod
+    def _valid_methodology_review_artifact(
+        subject: pathlib.Path,
+        *,
+        workflow_id: str,
+        workflow_formula: str,
+        pack: str,
+        methodology_name: str,
+        producer_formula: str,
+        producer_stage: str,
+        attempt: int = 2,
+        status: str = "changes_required",
+        hash_value: str = "",
+    ) -> str:
+        digest = hash_value or f"sha256:{hashlib.sha256(subject.read_bytes()).hexdigest()}"
+        coverage_status = (
+            "blocked" if status in {"changes_required", "blocked"} else "covered"
+        )
+        rationale = (
+            "      rationale: A required finding remains unresolved.\n"
+            if coverage_status == "blocked"
+            else ""
+        )
+        return (
+            "---\n"
+            "schema: gc.build.review.v1\n"
+            "workflow:\n"
+            f"  id: {workflow_id}\n"
+            f"  formula: {workflow_formula}\n"
+            "methodology:\n"
+            f"  pack: {pack}\n"
+            f"  name: {methodology_name}\n"
+            "producer:\n"
+            f"  formula: {producer_formula}\n"
+            f"  stage: {producer_stage}\n"
+            f"  attempt: {attempt}\n"
+            f"status: {status}\n"
+            "trace:\n"
+            "  upstream:\n"
+            f"    - path: {json.dumps(str(subject))}\n"
+            f"      hash: {digest}\n"
+            "      ids: [REVIEW-001]\n"
+            "  coverage:\n"
+            "    - id: REVIEW-001\n"
+            f"      status: {coverage_status}\n"
+            f"{rationale}"
+            "---\n\n"
+            f"## Verdict\n\n{status}.\n\n"
+            "| ID | Status |\n"
+            "| --- | --- |\n"
+            f"| REVIEW-001 | {coverage_status} |\n\n"
+            "## Findings\n\nReview evidence recorded.\n\n"
+            "## Verification\n\nThe traced input was verified.\n"
         )
 
     def test_build_artifact_check_binds_build_basic_review_and_final_report_provenance(
@@ -10565,6 +12750,298 @@ description = "Override sink that writes the base triage report contract."
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("build artifact valid", result.stdout)
+
+    def test_build_artifact_check_enforces_required_approved_status(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            artifact = pathlib.Path(artifact_dir) / "requirements.md"
+            control = json.dumps(
+                [
+                    {
+                        "id": "loop",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.build.artifact_schema": "gc.build.requirements.v1",
+                            "gc.build.artifact_path_keys": "gc.build.requirements_path",
+                            "gc.build.require_approved_status": "true",
+                        },
+                    }
+                ]
+            )
+            root_bead = json.dumps(
+                [
+                    {
+                        "id": "root",
+                        "metadata": {"gc.build.requirements_path": str(artifact)},
+                    }
+                ]
+            )
+
+            artifact.write_text(
+                self._valid_requirements_artifact().replace(
+                    "status: approved",
+                    "status: questions",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            rejected = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+            )
+
+            artifact.write_text(
+                self._valid_requirements_artifact(),
+                encoding="utf-8",
+            )
+            approved = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+            )
+
+        self.assertNotEqual(
+            rejected.returncode,
+            0,
+            rejected.stdout + rejected.stderr,
+        )
+        self.assertIn("requires status=approved", rejected.stderr)
+        self.assertEqual(approved.returncode, 0, approved.stdout + approved.stderr)
+
+    def test_build_artifact_check_binds_required_current_producer_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            artifact = pathlib.Path(artifact_dir) / "requirements.md"
+            control = json.dumps(
+                [
+                    {
+                        "id": "loop",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.control_epoch": 2,
+                            "gc.build.artifact_schema": "gc.build.requirements.v1",
+                            "gc.build.artifact_path_keys": "gc.build.requirements_path",
+                            "gc.build.require_current_producer_attempt": "true",
+                        },
+                    }
+                ]
+            )
+            root_bead = json.dumps(
+                [
+                    {
+                        "id": "root",
+                        "metadata": {"gc.build.requirements_path": str(artifact)},
+                    }
+                ]
+            )
+            artifact.write_text(
+                self._valid_requirements_artifact(),
+                encoding="utf-8",
+            )
+            stale = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+            )
+
+            artifact.write_text(
+                self._valid_requirements_artifact().replace(
+                    "  attempt: 1",
+                    "  attempt: 2",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            current = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead},
+                "loop",
+            )
+
+        self.assertNotEqual(stale.returncode, 0, stale.stdout + stale.stderr)
+        self.assertIn("producer.attempt=2", stale.stderr)
+        self.assertEqual(current.returncode, 0, current.stdout + current.stderr)
+
+    def test_build_artifact_check_binds_iteration_attempt_to_current_control_epoch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            artifact = pathlib.Path(artifact_dir) / "requirements.md"
+            artifact.write_text(
+                self._valid_requirements_artifact().replace(
+                    "  attempt: 1",
+                    "  attempt: 2",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            iteration = json.dumps(
+                [
+                    {
+                        "id": "summarize.iteration.2",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.attempt": "2",
+                            "gc.ralph_step_id": "summarize-implementation",
+                            "gc.build.artifact_schema": "gc.build.requirements.v1",
+                            "gc.build.artifact_path_keys": "gc.build.requirements_path",
+                            "gc.build.require_current_producer_attempt": "true",
+                        },
+                    }
+                ]
+            )
+            root_bead = json.dumps(
+                [
+                    {
+                        "id": "root",
+                        "metadata": {"gc.build.requirements_path": str(artifact)},
+                    }
+                ]
+            )
+
+            current_control = json.dumps(
+                [
+                    {
+                        "id": "summarize-control",
+                        "metadata": {
+                            "gc.root_bead_id": "root",
+                            "gc.kind": "ralph",
+                            "gc.step_id": "summarize-implementation",
+                            "gc.control_epoch": "2",
+                        },
+                    }
+                ]
+            )
+            current = self._run_build_artifact_check(
+                {
+                    "summarize.iteration.2": iteration,
+                    "root": root_bead,
+                },
+                "summarize.iteration.2",
+                list_json=current_control,
+            )
+
+            stale_control = current_control.replace(
+                '"gc.control_epoch": "2"',
+                '"gc.control_epoch": "3"',
+                1,
+            )
+            stale = self._run_build_artifact_check(
+                {
+                    "summarize.iteration.2": iteration,
+                    "root": root_bead,
+                },
+                "summarize.iteration.2",
+                list_json=stale_control,
+            )
+
+        self.assertEqual(current.returncode, 0, current.stdout + current.stderr)
+        self.assertNotEqual(stale.returncode, 0, stale.stdout + stale.stderr)
+        self.assertIn("does not match current control epoch 3", stale.stderr)
+
+    def test_cross_pack_review_nodes_reject_incoherent_status_and_coverage(
+        self,
+    ) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        affected_review_nodes = {
+            "compound-engineering": (
+                "compound-code-review",
+                {"{target}.synthesize-code-review", "{target}"},
+            ),
+            "gstack": (
+                "gstack-code-review",
+                {"{target}.synthesize-code-review", "{target}"},
+            ),
+            "superpowers": (
+                "superpowers-code-review",
+                {
+                    "{target}.request-code-review",
+                    "{target}.gap-analysis-review",
+                    "{target}",
+                },
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            artifact_root = pathlib.Path(artifact_dir)
+            subject = artifact_root / "subject.diff"
+            subject.write_text("diff --git a/a.py b/a.py\n", encoding="utf-8")
+            changes_required = self._valid_review_artifact(subject)
+            incoherent_reports = (
+                (
+                    "approved_with_blocked_coverage",
+                    changes_required.replace(
+                        "status: changes_required\n", "status: approved\n", 1
+                    ),
+                    "approved review must not include blocked coverage",
+                ),
+                (
+                    "changes_required_without_blocked_coverage",
+                    changes_required.replace(
+                        "      status: blocked\n", "      status: covered\n", 1
+                    ).replace("| SEC-001 | blocked |", "| SEC-001 | covered |", 1),
+                    "requires at least one blocked coverage entry",
+                ),
+            )
+
+            case_index = 0
+            for pack, (formula_name, required_ids) in affected_review_nodes.items():
+                formula = tomllib.loads(
+                    (
+                        packs_root
+                        / pack
+                        / "formulas"
+                        / f"{formula_name}.formula.toml"
+                    ).read_text(encoding="utf-8")
+                )
+                nodes = {
+                    node["id"]: node
+                    for template in formula["template"]
+                    for node in (template, *template.get("children", []))
+                }
+                for node_id in sorted(required_ids):
+                    for scenario, report_text, expected_error in incoherent_reports:
+                        case_index += 1
+                        artifact = artifact_root / f"review-{case_index}.md"
+                        artifact.write_text(report_text, encoding="utf-8")
+
+                        metadata = dict(nodes[node_id]["metadata"])
+                        path_key = metadata["gc.build.artifact_path_keys"]
+                        if path_key == "{artifact_path_keys}":
+                            path_key = "gc.build.review_report_path"
+                            metadata["gc.build.artifact_path_keys"] = path_key
+                        metadata["gc.root_bead_id"] = "root"
+
+                        root_metadata = {path_key: str(artifact)}
+                        if (
+                            metadata.get("gc.build.require_internal_review_report")
+                            == "true"
+                        ):
+                            internal = (
+                                artifact_root / f"internal-review-{case_index}.md"
+                            )
+                            internal.write_text(report_text, encoding="utf-8")
+                            root_metadata["gc.build.code_review_report_path"] = str(
+                                internal
+                            )
+
+                        control = json.dumps(
+                            [{"id": "review-node", "metadata": metadata}]
+                        )
+                        root_bead = json.dumps(
+                            [{"id": "root", "metadata": root_metadata}]
+                        )
+                        result = self._run_build_artifact_check(
+                            {"review-node": control, "root": root_bead},
+                            "review-node",
+                        )
+
+                        with self.subTest(
+                            pack=pack,
+                            node=node_id,
+                            scenario=scenario,
+                        ):
+                            self.assertNotEqual(
+                                result.returncode,
+                                0,
+                                result.stdout + result.stderr,
+                            )
+                            self.assertIn(expected_error, result.stderr)
 
     def test_build_artifact_check_ignores_worker_validator_shadow(self) -> None:
         with tempfile.TemporaryDirectory() as artifact_dir:
@@ -11787,7 +14264,7 @@ description = "Override sink that writes the base triage report contract."
         gap = (workflow_dir / "gap-analysis-review.md").read_text(
             encoding="utf-8"
         )
-        process = (workflow_dir / "{target}.process-code-review.md").read_text(
+        process = (workflow_dir / "process-code-review.md").read_text(
             encoding="utf-8"
         )
         finalize = (workflow_dir / "finalize-code-review.md").read_text(encoding="utf-8")

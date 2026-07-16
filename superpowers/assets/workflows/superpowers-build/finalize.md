@@ -18,11 +18,18 @@ not a schema-allowed top-level status. Include mapping objects for workflow,
 methodology, and producer. The front matter must include the exact nested
 fields `workflow.id`, `workflow.formula`, `methodology.pack`,
 `methodology.name`, `producer.formula`, `producer.stage`, and a positive
-integer `producer.attempt`. Include both `trace.upstream` and
+integer `producer.attempt`; it must equal the claimed finalize stage's current
+positive `gc.attempt`. Include both `trace.upstream` and
 `trace.coverage`. Every upstream ID must appear once in `trace.coverage`; use
 schema coverage statuses such as `covered`, not artifact statuses such as
 `approved` or `completed`. If coverage is non-empty, include one Markdown
 table whose `ID` and `Status` pairs exactly match `trace.coverage`.
+
+Trace the canonical absolute `gc.build.implementation_summary_path` and
+`gc.build.review_report_path` exactly once each, using a freshly computed
+`sha256:<digest>` of each exact file. An earlier artifact, a byte-identical copy
+at another path, or a path without its current digest is stale and must block
+finalization.
 
 Use these required second-level sections, in this order:
 

@@ -28,7 +28,7 @@ methodology:
 producer:
   formula: gstack-build
   stage: finalize
-  attempt: <positive integer>
+  attempt: <current positive gc.attempt for this finalize stage>
 status: approved
 trace:
   upstream:
@@ -41,10 +41,55 @@ trace:
 ---
 ```
 
+Trace the canonical absolute `gc.build.implementation_summary_path` and
+`gc.build.review_report_path` exactly once each, using a freshly computed
+`sha256:<digest>` of each exact file. An earlier artifact, a byte-identical copy
+at another path, or a path without its current digest is stale and must block
+finalization.
+
 Use `status: approved` only when the canonical requirements, plan,
 decomposition, implementation summary, review, QA, and release-readiness
 evidence support a successful build. Use `status: blocked` and keep failure
 metadata when required evidence failed.
+
+Use these mutually exclusive terminal branches. A review, QA, or readiness
+expansion can successfully deliver a report without authorizing build success.
+
+Successful branch:
+
+- Require the canonical review artifact to have `status: approved`, including
+  when `gc.var.review_mode=report` and report delivery is recorded separately.
+- Require QA and release readiness to have semantic approval and require all
+  implementation evidence below to pass.
+- Write the final artifact with `status: approved`, validate it, apply only the
+  completed/success lifecycle update below, and close the claimed finalize step
+  with `gc.outcome=pass`.
+
+Blocked branch:
+
+- A report-mode review artifact with `status: changes_required` is successful
+  report delivery, not implementation approval. Write the final artifact with
+  `status: blocked`, record both final-report paths, and run the installed
+  artifact check against that blocked artifact.
+- After the blocked artifact validates, atomically record at least
+  `gc.outcome=fail`, `gc.build.status=blocked`,
+  `gc.build.finalize_status=failed`, `gc.build.finalize_outcome=failure`,
+  `gc.build.repair_status=repairable`,
+  `gc.restart.entrypoint=build-from-review`,
+  `gc.restart.reason=review_changes_required`,
+  `gc.restart.review_report_path=<canonical review report path>`,
+  `gc.blocked_reason=code_review_changes_required`, and
+  `gc.failure_class=review_iteration_needed` on the workflow root.
+- A review artifact with `status: blocked`, unresolved report-mode QA or release
+  readiness findings, missing implementation evidence, or a validation failure
+  must use the same failure-only lifecycle shape with
+  `gc.build.repair_status=blocked` and a precise blocked reason, failure class,
+  and restart entrypoint.
+- Set the claimed finalize step to `gc.outcome=fail`, close it, and stop. This
+  branch must not set `gc.outcome=pass`, must not set
+  `gc.build.finalize_status=completed`, and must not set
+  `gc.build.finalize_outcome=success` anywhere. A validated report with
+  findings must never become a completed build.
 
 Re-read runtime implementation state before approving. The launch requirements
 must trace every direct member of `gc.var.convoy_id`. The implementation convoy
@@ -89,9 +134,10 @@ below; shell variables from earlier tool calls do not persist. Then run:
 GC_BEAD_ID=<exact-claimed-bead-id> <launcher-rig>/.gc/scripts/checks/build-artifact-valid.sh
 ```
 
-Fix every validation error against the canonical `gc.build.final_report_path`
-before declaring success. After validation and all required evidence pass,
-reconcile workflow root lifecycle metadata in one update:
+Fix every validation error against the canonical `gc.build.final_report_path`.
+After validation, follow the matching terminal branch above. Only after an
+approved final artifact and all required evidence pass may the successful
+branch reconcile workflow root lifecycle metadata in one update:
 
 ```bash
 gc bd update <workflow-root-id> \
@@ -100,12 +146,19 @@ gc bd update <workflow-root-id> \
   --set-metadata 'gc.build.finalize_status=completed' \
   --set-metadata 'gc.build.finalize_outcome=success' \
   --unset-metadata gc.blocked_reason \
-  --unset-metadata gc.failure_class
+  --unset-metadata gc.failure_class \
+  --unset-metadata gc.build.repair_status \
+  --unset-metadata gc.restart.entrypoint \
+  --unset-metadata gc.restart.reason \
+  --unset-metadata gc.restart.review_report_path \
+  --unset-metadata gc.restart.review_fix_formula \
+  --unset-metadata gc.restart.implementation_target
 ```
 
-Do not clear either failure marker when validation or required evidence fails.
-
-Close with `gc.outcome=pass` and the sprint report path.
+Then set the claimed finalize step to `gc.outcome=pass` and close it with the
+sprint report path. This update and pass outcome belong only to the successful
+branch. On validation or evidence failure, retain failure markers and use the
+blocked branch; never emit completed/success metadata.
 
 Do not invoke provider-native subagents.
 

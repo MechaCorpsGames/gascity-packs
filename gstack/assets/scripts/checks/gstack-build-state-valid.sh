@@ -47,11 +47,16 @@ VALIDATOR="$LAUNCHER_ROOT/.gc/scripts/validate_build_artifact.py"
 cd "$LAUNCHER_ROOT"
 "$BASE_CHECK"
 
-python3 - "$BEAD_ID" "$LAUNCHER_ROOT" "$VALIDATOR" <<'PY'
+python3 - \
+  "$BEAD_ID" \
+  "$LAUNCHER_ROOT" \
+  "$VALIDATOR" \
+  "$LAUNCHER_ROOT/.gc/scripts/checks/gstack-report-stage-valid.sh" <<'PY'
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -64,6 +69,7 @@ import yaml
 BEAD_ID = sys.argv[1]
 LAUNCHER_ROOT = Path(sys.argv[2]).resolve()
 VALIDATOR = Path(sys.argv[3]).resolve()
+REPORT_STAGE_CHECK = Path(sys.argv[4]).resolve()
 
 
 def fail(message: str) -> None:
@@ -217,20 +223,40 @@ trace = requirements_front.get("trace")
 upstream = trace.get("upstream") if isinstance(trace, dict) else None
 if not isinstance(upstream, list):
     fail(f"requirements trace.upstream is missing: {REQUIREMENTS_PATH}")
-observed_source_traces = [
-    str(entry.get("path") or "")[len("beads/") :]
-    for entry in upstream
-    if isinstance(entry, dict)
-    and str(entry.get("path") or "").startswith("beads/")
-    and str(entry.get("hash") or "")
-    == "bead:" + str(entry.get("path") or "")[len("beads/") :]
-]
+observed_source_traces: list[str] = []
+malformed_source_traces: list[dict[str, str]] = []
+for entry in upstream:
+    if not isinstance(entry, dict):
+        continue
+    raw_path = str(entry.get("path") or "")
+    raw_hash = str(entry.get("hash") or "")
+    is_bead_path = raw_path.startswith("beads/")
+    is_bead_hash = raw_hash.lower().startswith("bead:")
+    if not is_bead_path and not is_bead_hash:
+        continue
+    source_id = raw_path[len("beads/") :] if is_bead_path else ""
+    if not source_id or raw_hash != f"bead:{source_id}":
+        malformed_source_traces.append({"path": raw_path, "hash": raw_hash})
+        continue
+    observed_source_traces.append(source_id)
+if malformed_source_traces:
+    fail(
+        "malformed launch source trace in requirements: "
+        f"launch_convoy={LAUNCH_CONVOY_ID} malformed={malformed_source_traces}"
+    )
 missing_sources = [source_id for source_id in SOURCE_IDS if source_id not in observed_source_traces]
 if missing_sources:
     fail(
         "missing launch source trace in requirements: "
         f"launch_convoy={LAUNCH_CONVOY_ID} missing={missing_sources} "
         f"observed={sorted(observed_source_traces)}"
+    )
+unexpected_sources = sorted(set(observed_source_traces) - set(SOURCE_IDS))
+if unexpected_sources:
+    fail(
+        "unexpected launch source trace in requirements: "
+        f"launch_convoy={LAUNCH_CONVOY_ID} unexpected={unexpected_sources} "
+        f"expected={sorted(SOURCE_IDS)}"
     )
 duplicate_sources = sorted(
     source_id for source_id in SOURCE_IDS if observed_source_traces.count(source_id) != 1
@@ -672,12 +698,172 @@ def implementation_state(*, require_closed: bool, require_worktree_proof: bool) 
             )
 
 
+def final_status_state() -> None:
+    review_mode = metadata(ROOT, "gc.var.review_mode")
+    if review_mode not in {"report", "agent", "interactive"}:
+        fail(f"unsupported gstack review mode for finalization: {review_mode!r}")
+
+    if review_mode == "report":
+        if not REPORT_STAGE_CHECK.is_file() or not os.access(REPORT_STAGE_CHECK, os.X_OK):
+            fail(
+                "gstack report-stage validator is missing or not executable: "
+                f"{REPORT_STAGE_CHECK}"
+            )
+        all_rows = json_command(
+            [
+                "gc",
+                "bd",
+                "list",
+                "--all",
+                "--metadata-field",
+                f"gc.root_bead_id={ROOT_ID}",
+                "--json",
+                "--limit=0",
+            ],
+            label=f"list report-stage finalizers for {ROOT_ID}",
+        )
+        if not isinstance(all_rows, list) or any(
+            not isinstance(row, dict) for row in all_rows
+        ):
+            fail("report-stage finalizer listing returned malformed rows")
+        for path_key in (
+            "gc.build.qa_summary_path",
+            "gc.build.release_readiness_summary_path",
+        ):
+            finalizer_controls = [
+                row
+                for row in all_rows
+                if metadata(row, "gc.root_bead_id") == ROOT_ID
+                and metadata(row, "gc.gstack.report_path_key") == path_key
+                and metadata(row, "gc.kind") == "ralph"
+                and not metadata(row, "gc.attempt")
+            ]
+            if len(finalizer_controls) != 1:
+                fail(
+                    "expected exactly one logical report-stage finalizer control for "
+                    f"{path_key}, observed {len(finalizer_controls)}"
+                )
+            finalizer = finalizer_controls[0]
+            finalizer_id = str(finalizer.get("id") or "").strip()
+            finalizer_step = metadata(finalizer, "gc.step_id")
+            control_epoch = metadata(finalizer, "gc.control_epoch")
+            if (
+                not finalizer_id
+                or not finalizer_step
+                or re.fullmatch(r"[1-9][0-9]*", control_epoch) is None
+                or str(finalizer.get("status") or "") != "closed"
+                or metadata(finalizer, "gc.outcome") != "pass"
+            ):
+                fail(
+                    f"logical report-stage finalizer for {path_key} must have a "
+                    "rendered step, positive current control epoch, and be closed/pass: "
+                    f"id={finalizer_id!r} status={finalizer.get('status')!r} "
+                    f"outcome={metadata(finalizer, 'gc.outcome')!r} "
+                    f"step={finalizer_step!r} epoch={control_epoch!r}"
+                )
+            current_iterations = [
+                row
+                for row in all_rows
+                if metadata(row, "gc.root_bead_id") == ROOT_ID
+                and metadata(row, "gc.gstack.report_path_key") == path_key
+                and metadata(row, "gc.ralph_step_id") == finalizer_step
+                and metadata(row, "gc.attempt") == control_epoch
+            ]
+            if len(current_iterations) != 1:
+                fail(
+                    "expected exactly one current report-stage finalizer iteration for "
+                    f"{path_key} step={finalizer_step} epoch={control_epoch}, "
+                    f"observed {len(current_iterations)}"
+                )
+            current_iteration = current_iterations[0]
+            if (
+                str(current_iteration.get("status") or "") != "closed"
+                or metadata(current_iteration, "gc.outcome") != "pass"
+            ):
+                fail(
+                    "current report-stage finalizer iteration must be closed/pass: "
+                    f"path_key={path_key} id={current_iteration.get('id')!r} "
+                    f"status={current_iteration.get('status')!r} "
+                    f"outcome={metadata(current_iteration, 'gc.outcome')!r}"
+                )
+            result = subprocess.run(
+                [str(REPORT_STAGE_CHECK)],
+                text=True,
+                capture_output=True,
+                check=False,
+                env={**os.environ, "GC_BEAD_ID": finalizer_id},
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip().splitlines()
+                suffix = f": {detail[0]}" if detail else ""
+                fail(f"current report-stage evidence failed for {path_key}{suffix}")
+
+    status_paths = {
+        "review": (
+            "gc.build.review_report_path",
+            metadata(ROOT, "gc.build.review_report_path"),
+        ),
+        "QA": (
+            "gc.build.qa_summary_path",
+            metadata(ROOT, "gc.build.qa_summary_path"),
+        ),
+        "release readiness": (
+            "gc.build.release_readiness_summary_path",
+            metadata(ROOT, "gc.build.release_readiness_summary_path"),
+        ),
+        "final report": (
+            "gc.build.final_report_path",
+            metadata(ROOT, "gc.build.final_report_path"),
+        ),
+    }
+    statuses: dict[str, str] = {}
+    allowed_statuses = {"approved", "changes_required", "blocked"}
+    for label, (key, raw_path) in status_paths.items():
+        path = resolved_file(raw_path, key=key)
+        status = front_matter(path).get("status")
+        if not isinstance(status, str) or status not in allowed_statuses:
+            fail(
+                f"{label} artifact has unsupported status: "
+                f"path={path} status={status!r}"
+            )
+        statuses[label] = status
+
+    upstream_statuses = {
+        label: status for label, status in statuses.items() if label != "final report"
+    }
+    unresolved = {
+        label: status
+        for label, status in upstream_statuses.items()
+        if status != "approved"
+    }
+    if not unresolved:
+        expected_final_status = "approved"
+    elif review_mode == "report":
+        expected_final_status = "blocked"
+    else:
+        fail(
+            "cannot finalize unresolved evidence outside report mode: "
+            f"mode={review_mode} statuses={upstream_statuses}"
+        )
+
+    observed_final_status = statuses["final report"]
+    if observed_final_status != expected_final_status:
+        fail(
+            "final report status mismatch: "
+            f"mode={review_mode} upstream={upstream_statuses} "
+            f"expected={expected_final_status} observed={observed_final_status}"
+        )
+
+
 if SCHEMA == "gc.build.requirements.v1":
     pass
 elif SCHEMA == "gc.build.decomposition.v1":
     implementation_state(require_closed=False, require_worktree_proof=False)
-elif SCHEMA in {"gc.build.implementation-summary.v1", "gc.build.final-report.v1"}:
+elif SCHEMA == "gc.build.implementation-summary.v1":
     implementation_state(require_closed=True, require_worktree_proof=True)
+elif SCHEMA == "gc.build.final-report.v1":
+    implementation_state(require_closed=True, require_worktree_proof=True)
+    final_status_state()
 else:
     fail(f"unsupported gstack semantic gate schema: {SCHEMA}")
 

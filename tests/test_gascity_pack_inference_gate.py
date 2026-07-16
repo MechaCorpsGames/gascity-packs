@@ -938,6 +938,93 @@ printf '{{"root_bead_id":"fi-root"}}\\n'
     )
 
 
+def test_run_build_gate_passes_complete_bead_snapshot_to_artifact_validation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    workspace = gascity_pack_inference_gate.GateWorkspace(
+        root=tmp_path,
+        city_dir=tmp_path / "city",
+        rig_dir=tmp_path / "fixture",
+        gc_home=tmp_path / "gc-home",
+        runtime_dir=tmp_path / "runtime",
+        claude_config_dir=tmp_path / "gc-home" / ".claude",
+        city_name="inference-city",
+        rig_name="fixture",
+    )
+    pack_spec = gascity_pack_inference_gate.PACK_SPECS["superpowers"]
+    root_bead = {"id": "fi-root", "metadata": {}}
+    beads = [{"id": "fi-source"}, {"id": "fi-review-control"}]
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "git_output",
+        lambda *args, **kwargs: "a" * 40,
+    )
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "launch_build_formula",
+        lambda *args, **kwargs: "fi-root",
+    )
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "wait_for_workflow_pass",
+        lambda *args, **kwargs: root_bead,
+    )
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "list_beads",
+        lambda *args, **kwargs: beads,
+    )
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "build_basic_source_id",
+        lambda value: "fi-source",
+    )
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "implementation_convoy_member_ids",
+        lambda *args, **kwargs: ["fi-member"],
+    )
+
+    def capture_artifact_validation(bead, **kwargs) -> None:
+        observed["root_bead"] = bead
+        observed.update(kwargs)
+
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "validate_build_basic_artifacts",
+        capture_artifact_validation,
+    )
+    for function_name in (
+        "validate_build_basic_source_provenance",
+        "validate_build_basic_result",
+        "validate_required_routes",
+    ):
+        monkeypatch.setattr(
+            gascity_pack_inference_gate,
+            function_name,
+            lambda *args, **kwargs: None,
+        )
+
+    gascity_pack_inference_gate.run_build_gate(
+        "/usr/bin/gc",
+        workspace,
+        env={},
+        pack_spec=pack_spec,
+        timeout=60,
+        poll_interval=1,
+    )
+
+    assert observed["root_bead"] is root_bead
+    assert observed["beads"] is beads
+    assert observed["pack_spec"] is pack_spec
+    assert observed["expected_artifact_root"] == (
+        workspace.rig_dir / gascity_pack_inference_gate.build_artifact_root(pack_spec)
+    )
+
+
 def test_list_beads_uses_gc_bd_list_when_file_store_absent(tmp_path) -> None:
     workspace = gascity_pack_inference_gate.GateWorkspace(
         root=tmp_path,
@@ -1854,6 +1941,40 @@ def test_wait_for_workflow_pass_rejects_failed_finalizer(tmp_path, monkeypatch) 
     monkeypatch.setattr(gascity_pack_inference_gate, "collect_diagnostics", lambda *args, **kwargs: "diagnostics")
 
     with pytest.raises(gascity_pack_inference_gate.GateError, match="logical workflow control failed.*fi-finalize"):
+        gascity_pack_inference_gate.wait_for_workflow_pass(
+            "gc",
+            workspace,
+            "fi-root",
+            env={},
+            timeout=5,
+            poll_interval=0,
+        )
+
+
+def test_wait_for_workflow_pass_rejects_truthful_blocked_build(tmp_path, monkeypatch) -> None:
+    workspace = gate_workspace(tmp_path)
+    root = {
+        "id": "fi-root",
+        "status": "closed",
+        "metadata": {
+            "gc.outcome": "fail",
+            "gc.build.status": "blocked",
+            "gc.build.finalize_status": "failed",
+            "gc.build.finalize_outcome": "failure",
+        },
+    }
+    monkeypatch.setattr(gascity_pack_inference_gate, "show_bead", lambda *args, **kwargs: root)
+    monkeypatch.setattr(gascity_pack_inference_gate, "list_beads", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        gascity_pack_inference_gate,
+        "collect_diagnostics",
+        lambda *args, **kwargs: "diagnostics",
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"closed with gc\.outcome='fail'.*want 'pass'",
+    ):
         gascity_pack_inference_gate.wait_for_workflow_pass(
             "gc",
             workspace,
@@ -3342,22 +3463,916 @@ def test_validate_build_basic_result_rejects_canonical_summary_mismatch(tmp_path
         validate_build_basic_fixture(fixture)
 
 
+def successful_build_basic_root(
+    artifact_metadata: dict[str, str],
+    *,
+    artifact_root: Path | None = None,
+) -> dict:
+    resolved_artifact_root = artifact_root or Path(next(iter(artifact_metadata.values()))).parent
+    metadata = {
+        "gc.var.review_mode": "report",
+        "gc.build.artifact_root": str(resolved_artifact_root.resolve()),
+        "gc.build.status": "completed",
+        "gc.build.finalize_status": "completed",
+        "gc.build.finalize_outcome": "success",
+        **artifact_metadata,
+    }
+    return {
+        "id": "fi-root",
+        "status": "closed",
+        "metadata": {"gc.outcome": "pass", **metadata},
+    }
+
+
+def blocked_build_basic_root(
+    artifact_metadata: dict[str, str],
+    *,
+    artifact_root: Path | None = None,
+) -> dict:
+    resolved_artifact_root = artifact_root or Path(next(iter(artifact_metadata.values()))).parent
+    metadata = {
+        "gc.var.review_mode": "report",
+        "gc.build.artifact_root": str(resolved_artifact_root.resolve()),
+        "gc.build.status": "blocked",
+        "gc.build.finalize_status": "failed",
+        "gc.build.finalize_outcome": "failure",
+        **artifact_metadata,
+    }
+    return {
+        "id": "fi-root",
+        "status": "closed",
+        "metadata": {"gc.outcome": "fail", **metadata},
+    }
+
+
+def add_sha256_upstreams(text: str, *upstream_paths: Path) -> str:
+    entries = "".join(
+        f"    - path: {path.resolve()}\n"
+        f"      hash: sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
+        for path in upstream_paths
+    )
+    return text.replace("  coverage:\n", entries + "  coverage:\n", 1)
+
+
+PACK_BUILD_ARTIFACT_IDENTITIES = {
+    "gascity": {
+        "gc.build.requirements_path": ("build-basic", "gascity", "build-basic", "build-basic", "requirements"),
+        "gc.build.plan_path": ("build-basic", "gascity", "build-basic", "build-basic", "plan"),
+        "gc.build.decomposition_path": ("build-basic", "gascity", "build-basic", "build-basic", "decompose"),
+        "gc.build.implementation_summary_path": (
+            "build-basic",
+            "gascity",
+            "build-basic",
+            "build-basic",
+            "summarize-implementation",
+        ),
+        "gc.build.review_report_path": ("build-basic", "gascity", "build-basic", "build-basic-review", "review"),
+        "gc.build.final_report_path": ("build-basic", "gascity", "build-basic", "build-basic", "finalize"),
+    },
+    "superpowers": {
+        "gc.build.requirements_path": (
+            "superpowers-build",
+            "superpowers",
+            "superpowers-brainstorming",
+            "superpowers-brainstorming",
+            "requirements",
+        ),
+        "gc.build.plan_path": ("superpowers-build", "superpowers", "writing-plans", "superpowers-build", "plan"),
+        "gc.build.decomposition_path": (
+            "superpowers-build",
+            "superpowers",
+            "superpowers-decomposition",
+            "superpowers-build",
+            "decompose",
+        ),
+        "gc.build.implementation_summary_path": (
+            "superpowers-build",
+            "superpowers",
+            "superpowers-build",
+            "superpowers-build",
+            "summarize-implementation",
+        ),
+        "gc.build.review_report_path": (
+            "superpowers-build",
+            "superpowers",
+            "superpowers-code-review",
+            "superpowers-code-review",
+            "adapter-report",
+        ),
+        "gc.build.final_report_path": (
+            "superpowers-build",
+            "superpowers",
+            "superpowers-build",
+            "superpowers-build",
+            "finalize",
+        ),
+    },
+    "compound-engineering": {
+        "gc.build.requirements_path": (
+            "compound-build",
+            "compound-engineering",
+            "ce-brainstorm",
+            "compound-build",
+            "requirements",
+        ),
+        "gc.build.plan_path": ("compound-build", "compound-engineering", "ce-plan", "compound-build", "plan"),
+        "gc.build.decomposition_path": (
+            "compound-build",
+            "compound-engineering",
+            "compound-decomposition",
+            "compound-build",
+            "decompose",
+        ),
+        "gc.build.implementation_summary_path": (
+            "compound-build",
+            "compound-engineering",
+            "compound-build",
+            "compound-build",
+            "summarize-implementation",
+        ),
+        "gc.build.review_report_path": (
+            "compound-review",
+            "compound-engineering",
+            "compound-review",
+            "compound-code-review",
+            "synthesize-code-review",
+        ),
+        "gc.build.final_report_path": (
+            "compound-build",
+            "compound-engineering",
+            "ce-compound",
+            "compound-resolution",
+            "synthesize-resolution",
+        ),
+    },
+    "gstack": {
+        "gc.build.requirements_path": ("gstack-build", "gstack", "office-hours", "gstack-build", "requirements"),
+        "gc.build.plan_path": ("gstack-build", "gstack", "autoplan", "gstack-build", "plan"),
+        "gc.build.decomposition_path": (
+            "gstack-build",
+            "gstack",
+            "gstack-decomposition",
+            "gstack-build",
+            "decompose",
+        ),
+        "gc.build.implementation_summary_path": (
+            "gstack-build",
+            "gstack",
+            "gstack-build",
+            "gstack-build",
+            "summarize-implementation",
+        ),
+        "gc.build.review_report_path": (
+            "gstack-code-review",
+            "gstack",
+            "gstack-review",
+            "gstack-code-review",
+            "adapter-report",
+        ),
+        "gc.build.final_report_path": ("gstack-build", "gstack", "gstack-build", "gstack-build", "finalize"),
+    },
+    "bmad": {
+        "gc.build.requirements_path": ("bmad-build", "bmad", "bmad-prd", "bmad-build", "requirements"),
+        "gc.build.plan_path": ("bmad-build", "bmad", "bmad-create-architecture", "bmad-build", "plan"),
+        "gc.build.decomposition_path": (
+            "bmad-build",
+            "bmad",
+            "bmad-create-epics-and-stories",
+            "bmad-build",
+            "decompose",
+        ),
+        "gc.build.implementation_summary_path": (
+            "bmad-build",
+            "bmad",
+            "bmad-build",
+            "bmad-build",
+            "summarize-implementation",
+        ),
+        "gc.build.review_report_path": (
+            "bmad-review",
+            "bmad",
+            "bmad-review",
+            "bmad-code-review-flow",
+            "synthesize-bmad-review",
+        ),
+        "gc.build.final_report_path": ("bmad-build", "bmad", "bmad-build", "bmad-build", "finalize"),
+    },
+}
+
+PACK_BUILD_ARTIFACT_IDENTITY_ASSETS = {
+    "gascity": {
+        "gc.build.requirements_path": "gascity/assets/workflows/build-basic/requirements.md",
+        "gc.build.plan_path": "gascity/assets/workflows/build-basic/plan.md",
+        "gc.build.decomposition_path": "gascity/assets/workflows/build-basic/decompose.md",
+        "gc.build.implementation_summary_path": "gascity/assets/workflows/build-base/summarize-implementation.md",
+        "gc.build.review_report_path": "gascity/assets/workflows/build-basic-review/{target}.md",
+        "gc.build.final_report_path": "gascity/assets/workflows/build-basic/finalize.md",
+    },
+    "superpowers": {
+        "gc.build.requirements_path": (
+            "superpowers/assets/workflows/superpowers-brainstorming/write-requirements-spec.md"
+        ),
+        "gc.build.plan_path": "superpowers/assets/workflows/superpowers-build/plan.md",
+        "gc.build.decomposition_path": "superpowers/assets/workflows/superpowers-build/decompose.md",
+        "gc.build.implementation_summary_path": "gascity/assets/workflows/build-base/summarize-implementation.md",
+        "gc.build.review_report_path": (
+            "superpowers/assets/workflows/superpowers-code-review/finalize-code-review.md"
+        ),
+        "gc.build.final_report_path": "superpowers/assets/workflows/superpowers-build/finalize.md",
+    },
+    "compound-engineering": {
+        "gc.build.requirements_path": (
+            "compound-engineering/assets/workflows/compound-build/requirements.md"
+        ),
+        "gc.build.plan_path": "compound-engineering/assets/workflows/compound-build/plan.md",
+        "gc.build.decomposition_path": (
+            "compound-engineering/assets/workflows/compound-decomposition/decompose.md"
+        ),
+        "gc.build.implementation_summary_path": "gascity/assets/workflows/build-base/summarize-implementation.md",
+        "gc.build.review_report_path": (
+            "compound-engineering/assets/workflows/compound-code-review/synthesize-code-review.md"
+        ),
+        "gc.build.final_report_path": (
+            "compound-engineering/assets/workflows/compound-resolution/{target}.synthesize-resolution.md"
+        ),
+    },
+    "gstack": {
+        "gc.build.requirements_path": "gstack/assets/workflows/gstack-build/requirements.md",
+        "gc.build.plan_path": "gstack/assets/workflows/gstack-build/plan.md",
+        "gc.build.decomposition_path": "gstack/assets/workflows/gstack-build/decompose.md",
+        "gc.build.implementation_summary_path": (
+            "gstack/assets/workflows/gstack-build/summarize-implementation.md"
+        ),
+        "gc.build.review_report_path": (
+            "gstack/assets/workflows/gstack-code-review/finalize-code-review.md"
+        ),
+        "gc.build.final_report_path": "gstack/assets/workflows/gstack-build/finalize.md",
+    },
+    "bmad": {
+        "gc.build.requirements_path": "bmad/assets/workflows/bmad-build/requirements.md",
+        "gc.build.plan_path": "bmad/assets/workflows/bmad-build/plan.md",
+        "gc.build.decomposition_path": "bmad/assets/workflows/bmad-build/decompose.md",
+        "gc.build.implementation_summary_path": "gascity/assets/workflows/build-base/summarize-implementation.md",
+        "gc.build.review_report_path": (
+            "bmad/assets/workflows/bmad-code-review-flow/synthesize-bmad-review.md"
+        ),
+        "gc.build.final_report_path": "bmad/assets/workflows/bmad-build/finalize.md",
+    },
+}
+
+
+def write_build_basic_artifacts(
+    rig_dir: Path,
+    *,
+    statuses: dict[str, str] | None = None,
+    identities: dict[str, tuple[str, str, str, str, str]] | None = None,
+    attempts: dict[str, int] | None = None,
+) -> dict[str, str]:
+    selected_statuses = statuses or {}
+    selected_identities = identities or PACK_BUILD_ARTIFACT_IDENTITIES["gascity"]
+    selected_attempts = attempts or {}
+    metadata: dict[str, str] = {}
+    for metadata_key, schema in gascity_pack_inference_gate.BUILD_BASIC_ARTIFACT_CONTRACTS:
+        artifact_path = rig_dir / f"{metadata_key.rsplit('.', 1)[-1]}.md"
+        status = selected_statuses.get(metadata_key, "approved")
+        if schema == "gc.build.review.v1":
+            text = valid_review_artifact(status)
+        else:
+            text = valid_build_artifact(schema).replace(
+                "status: approved", f"status: {status}", 1
+            )
+        (
+            workflow_formula,
+            methodology_pack,
+            methodology_name,
+            producer_formula,
+            producer_stage,
+        ) = selected_identities[metadata_key]
+        text = text.replace(
+            "workflow:\n  id: fi-root\n  formula: build-basic\n",
+            f"workflow:\n  id: fi-root\n  formula: {workflow_formula}\n",
+            1,
+        ).replace(
+            "methodology:\n  pack: gascity\n  name: build-basic\n",
+            f"methodology:\n  pack: {methodology_pack}\n  name: {methodology_name}\n",
+            1,
+        )
+        text = text.replace(
+            "producer:\n  formula: build-basic\n  stage: test\n",
+            f"producer:\n  formula: {producer_formula}\n  stage: {producer_stage}\n",
+            1,
+        )
+        text = text.replace(
+            "  attempt: 1\n",
+            f"  attempt: {selected_attempts.get(metadata_key, 1)}\n",
+            1,
+        )
+        if metadata_key == "gc.build.review_report_path":
+            text = add_sha256_upstreams(
+                text,
+                Path(metadata["gc.build.implementation_summary_path"]),
+            )
+        elif metadata_key == "gc.build.final_report_path":
+            text = add_sha256_upstreams(
+                text,
+                Path(metadata["gc.build.implementation_summary_path"]),
+                Path(metadata["gc.build.review_report_path"]),
+            )
+        artifact_path.write_text(text, encoding="utf-8")
+        metadata[metadata_key] = str(artifact_path)
+    return metadata
+
+
+def build_basic_success_beads(
+    review_path: Path,
+    *,
+    review_attempt: int = 1,
+) -> list[dict]:
+    report_terminal_path = review_path.parent / "apply-review-findings-report.md"
+    controls = [
+        {
+            "id": f"fi-{step_id}-control",
+            "status": "closed",
+            "metadata": {
+                "gc.root_bead_id": "fi-root",
+                "gc.kind": "ralph",
+                "gc.step_id": step_id,
+                "gc.control_epoch": "1",
+                "gc.outcome": "pass",
+            },
+        }
+        for step_id in gascity_pack_inference_gate.BUILD_BASIC_STAGE_STEPS.values()
+    ]
+    controls.append(
+        {
+            "id": f"fi-review-report-attempt-{review_attempt}",
+            "status": "closed",
+            "metadata": {
+                "gc.root_bead_id": "fi-root",
+                "gc.attempt": str(review_attempt),
+                "gc.ralph_step_id": "review.build-basic-review-loop",
+                "gc.step_id": "review.report-review-findings",
+                "gc.scope_role": "member",
+                "gc.outcome": "pass",
+                "code_review.verdict": "reported",
+                "code_review.report_path": str(report_terminal_path),
+                "code_review.output_path": str(report_terminal_path),
+            },
+        }
+    )
+    return controls
+
+
+def derived_build_success_beads(
+    *,
+    stage_attempts: dict[str, int] | None = None,
+) -> list[dict]:
+    selected_attempts = stage_attempts or {}
+    return [
+        {
+            "id": f"fi-{step_id}-control",
+            "status": "closed",
+            "metadata": {
+                "gc.root_bead_id": "fi-root",
+                "gc.kind": "ralph",
+                "gc.step_id": step_id,
+                "gc.control_epoch": str(selected_attempts.get(metadata_key, 1)),
+                "gc.outcome": "pass",
+            },
+        }
+        for metadata_key, step_id in (
+            gascity_pack_inference_gate.BUILD_ARTIFACT_STAGE_BY_KEY.items()
+        )
+    ]
+
+
 def test_validate_build_basic_artifacts_accepts_declared_markdown_artifacts(tmp_path) -> None:
     rig_dir = tmp_path / "fixture"
     rig_dir.mkdir()
-    metadata: dict[str, str] = {}
-
-    for metadata_key, schema in gascity_pack_inference_gate.BUILD_BASIC_ARTIFACT_CONTRACTS:
-        artifact_path = rig_dir / f"{metadata_key.rsplit('.', 1)[-1]}.md"
-        artifact_path.write_text(valid_build_artifact(schema), encoding="utf-8")
-        metadata[metadata_key] = str(artifact_path)
+    metadata = write_build_basic_artifacts(rig_dir)
 
     gascity_pack_inference_gate.validate_build_basic_artifacts(
-        {"metadata": metadata},
+        successful_build_basic_root(metadata),
         rig_dir=rig_dir,
         env={},
         validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
     )
+
+
+@pytest.mark.parametrize(
+    "pack_name",
+    ("gascity", "superpowers", "compound-engineering", "gstack", "bmad"),
+)
+def test_validate_build_basic_artifacts_accepts_pack_specific_identities(
+    tmp_path,
+    pack_name: str,
+) -> None:
+    rig_dir = tmp_path / pack_name
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(
+        rig_dir,
+        identities=PACK_BUILD_ARTIFACT_IDENTITIES[pack_name],
+    )
+
+    gascity_pack_inference_gate.validate_build_basic_artifacts(
+        successful_build_basic_root(metadata),
+        rig_dir=rig_dir,
+        env={},
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        pack_spec=gascity_pack_inference_gate.PACK_SPECS[pack_name],
+    )
+
+
+def prompt_declares_identity_value(
+    text: str,
+    *,
+    section: str,
+    field: str,
+    value: str,
+) -> bool:
+    escaped_value = re.escape(value)
+    inline = re.search(
+        rf"{re.escape(section)}:\s*\{{[^}}\n]*\b{re.escape(field)}:\s*"
+        rf"{escaped_value}(?=\s*[,}}])",
+        text,
+    )
+    block = re.search(
+        rf"(?m)^[ \t-]*{re.escape(section)}:\s*$\n"
+        rf"(?:^[ \t]+.*\n){{0,3}}"
+        rf"^[ \t]+{re.escape(field)}:\s*{escaped_value}\s*$",
+        text,
+    )
+    return inline is not None or block is not None
+
+
+def test_pack_build_artifact_identities_are_anchored_in_producer_assets() -> None:
+    default_stage = {
+        "gc.build.requirements_path": "requirements",
+        "gc.build.plan_path": "plan",
+        "gc.build.decomposition_path": "decompose",
+        "gc.build.implementation_summary_path": "summarize-implementation",
+        "gc.build.review_report_path": "review",
+        "gc.build.final_report_path": "finalize",
+    }
+    fields = (
+        ("workflow", "formula"),
+        ("methodology", "pack"),
+        ("methodology", "name"),
+        ("producer", "formula"),
+        ("producer", "stage"),
+    )
+
+    for pack_name, identities in PACK_BUILD_ARTIFACT_IDENTITIES.items():
+        pack_spec = gascity_pack_inference_gate.PACK_SPECS[pack_name]
+        for metadata_key, identity in identities.items():
+            asset = (
+                gascity_pack_inference_gate.REPO_ROOT
+                / PACK_BUILD_ARTIFACT_IDENTITY_ASSETS[pack_name][metadata_key]
+            )
+            text = asset.read_text(encoding="utf-8").replace("`", "")
+            generic_defaults = (
+                pack_spec.build_formula,
+                pack_name,
+                pack_spec.build_formula,
+                pack_spec.build_formula,
+                default_stage[metadata_key],
+            )
+            for (section, field), expected, generic_default in zip(
+                fields,
+                identity,
+                generic_defaults,
+                strict=True,
+            ):
+                if prompt_declares_identity_value(
+                    text,
+                    section=section,
+                    field=field,
+                    value=expected,
+                ):
+                    continue
+                assert expected == generic_default, (
+                    f"{pack_name} {metadata_key} {section}.{field}={expected!r} "
+                    f"is neither declared by {asset} nor the generic build contract "
+                    f"default {generic_default!r}"
+                )
+                assert f"{section}.{field}" in text or (
+                    f"{section}:" in text and f"{field}:" in text
+                ), f"{asset} does not document generic field {section}.{field}"
+
+
+def test_derived_build_finalizers_emit_success_lifecycle_metadata() -> None:
+    finalizers = {
+        "superpowers": "superpowers/assets/workflows/superpowers-build/finalize.md",
+        "compound-engineering": (
+            "compound-engineering/assets/workflows/compound-resolution/{target}.md"
+        ),
+        "gstack": "gstack/assets/workflows/gstack-build/finalize.md",
+        "bmad": "bmad/assets/workflows/bmad-build/finalize.md",
+    }
+    required = (
+        "gc.build.status=completed",
+        "gc.build.finalize_status=completed",
+        "gc.build.finalize_outcome=success",
+        "gc.outcome=pass",
+    )
+
+    for pack_name, relative_path in finalizers.items():
+        text = (gascity_pack_inference_gate.REPO_ROOT / relative_path).read_text(
+            encoding="utf-8"
+        )
+        missing = [fragment for fragment in required if fragment not in text]
+        assert not missing, f"{pack_name} finalizer is missing lifecycle contract: {missing}"
+
+
+def test_derived_build_producers_declare_current_lineage_contract() -> None:
+    producer_assets = {
+        "superpowers": (
+            "superpowers/assets/workflows/superpowers-code-review/finalize-code-review.md",
+            "superpowers/assets/workflows/superpowers-build/finalize.md",
+        ),
+        "compound-engineering": (
+            "compound-engineering/assets/workflows/compound-code-review/finalize-code-review.md",
+            "compound-engineering/assets/workflows/compound-resolution/{target}.synthesize-resolution.md",
+        ),
+        "gstack": (
+            "gstack/assets/workflows/gstack-code-review/finalize-code-review.md",
+            "gstack/assets/workflows/gstack-build/finalize.md",
+        ),
+        "bmad": (
+            "bmad/assets/workflows/bmad-code-review-flow/finalize-bmad-code-review.md",
+            "bmad/assets/workflows/bmad-build/finalize.md",
+        ),
+    }
+
+    for pack_name, (review_asset, final_asset) in producer_assets.items():
+        review_text = (gascity_pack_inference_gate.REPO_ROOT / review_asset).read_text(
+            encoding="utf-8"
+        )
+        final_text = (gascity_pack_inference_gate.REPO_ROOT / final_asset).read_text(
+            encoding="utf-8"
+        )
+        review_contract = " ".join(review_text.replace("`", "").split())
+        final_contract = " ".join(final_text.replace("`", "").split())
+        for fragment in (
+            "producer.attempt",
+            "current positive",
+            "gc.build.implementation_summary_path",
+            "exactly one",
+        ):
+            assert fragment in review_contract, (
+                f"{pack_name} review producer omits {fragment!r}"
+            )
+        for fragment in (
+            "current positive",
+            "gc.attempt",
+            "gc.build.implementation_summary_path",
+            "gc.build.review_report_path",
+            "exactly once",
+        ):
+            assert fragment in final_contract, (
+                f"{pack_name} final producer omits {fragment!r}"
+            )
+
+
+@pytest.mark.parametrize(
+    "pack_name",
+    ("gascity", "superpowers", "compound-engineering", "gstack", "bmad"),
+)
+def test_validate_build_basic_artifacts_rejects_wrong_pack_identity(
+    tmp_path,
+    pack_name: str,
+) -> None:
+    rig_dir = tmp_path / pack_name
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(
+        rig_dir,
+        identities=PACK_BUILD_ARTIFACT_IDENTITIES[pack_name],
+    )
+    plan_path = Path(metadata["gc.build.plan_path"])
+    plan_path.write_text(
+        plan_path.read_text(encoding="utf-8").replace(
+            f"  pack: {pack_name}\n",
+            "  pack: wrong-pack\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=rf"gc\.build\.plan_path methodology\.pack.*{re.escape(pack_name)}.*wrong-pack",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+            pack_spec=gascity_pack_inference_gate.PACK_SPECS[pack_name],
+        )
+
+
+def test_validate_build_basic_artifacts_accepts_current_stage_attempts(tmp_path) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(rig_dir)
+
+    gascity_pack_inference_gate.validate_build_basic_artifacts(
+        successful_build_basic_root(metadata),
+        rig_dir=rig_dir,
+        env={},
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        beads=build_basic_success_beads(
+            Path(metadata["gc.build.review_report_path"]),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "pack_name",
+    ("superpowers", "compound-engineering", "gstack", "bmad"),
+)
+def test_validate_build_basic_artifacts_accepts_current_derived_pack_lineage(
+    tmp_path,
+    pack_name: str,
+) -> None:
+    rig_dir = tmp_path / pack_name
+    rig_dir.mkdir()
+    attempts = {
+        metadata_key: attempt
+        for attempt, (metadata_key, _) in enumerate(
+            gascity_pack_inference_gate.BUILD_BASIC_ARTIFACT_CONTRACTS,
+            start=2,
+        )
+    }
+    metadata = write_build_basic_artifacts(
+        rig_dir,
+        identities=PACK_BUILD_ARTIFACT_IDENTITIES[pack_name],
+        attempts=attempts,
+    )
+
+    gascity_pack_inference_gate.validate_build_basic_artifacts(
+        successful_build_basic_root(metadata),
+        rig_dir=rig_dir,
+        env={},
+        validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        beads=derived_build_success_beads(stage_attempts=attempts),
+        pack_spec=gascity_pack_inference_gate.PACK_SPECS[pack_name],
+    )
+
+
+@pytest.mark.parametrize(
+    "pack_name",
+    ("superpowers", "compound-engineering", "gstack", "bmad"),
+)
+@pytest.mark.parametrize(
+    "artifact_key",
+    ("gc.build.review_report_path", "gc.build.final_report_path"),
+)
+def test_validate_build_basic_artifacts_rejects_stale_derived_producer_attempt(
+    tmp_path,
+    pack_name: str,
+    artifact_key: str,
+) -> None:
+    rig_dir = tmp_path / pack_name
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(
+        rig_dir,
+        identities=PACK_BUILD_ARTIFACT_IDENTITIES[pack_name],
+    )
+    current_attempts = {artifact_key: 2}
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=rf"{re.escape(artifact_key)}.*producer\.attempt.*current.*2.*1",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+            beads=derived_build_success_beads(stage_attempts=current_attempts),
+            pack_spec=gascity_pack_inference_gate.PACK_SPECS[pack_name],
+        )
+
+
+@pytest.mark.parametrize(
+    "pack_name",
+    ("superpowers", "compound-engineering", "gstack", "bmad"),
+)
+@pytest.mark.parametrize(
+    ("artifact_key", "upstream_key"),
+    (
+        ("gc.build.review_report_path", "gc.build.implementation_summary_path"),
+        ("gc.build.final_report_path", "gc.build.implementation_summary_path"),
+        ("gc.build.final_report_path", "gc.build.review_report_path"),
+    ),
+)
+def test_validate_build_basic_artifacts_rejects_disconnected_derived_lineage(
+    tmp_path,
+    pack_name: str,
+    artifact_key: str,
+    upstream_key: str,
+) -> None:
+    rig_dir = tmp_path / pack_name
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(
+        rig_dir,
+        identities=PACK_BUILD_ARTIFACT_IDENTITIES[pack_name],
+    )
+    artifact = Path(metadata[artifact_key])
+    current_upstream = Path(metadata[upstream_key])
+    stale_upstream = rig_dir / f"stale-{current_upstream.name}"
+    stale_upstream.write_bytes(current_upstream.read_bytes())
+    old_artifact_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    artifact.write_text(
+        artifact.read_text(encoding="utf-8").replace(
+            f"    - path: {current_upstream.resolve()}\n",
+            f"    - path: {stale_upstream.resolve()}\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    if artifact_key == "gc.build.review_report_path":
+        final_report = Path(metadata["gc.build.final_report_path"])
+        new_artifact_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        final_report.write_text(
+            final_report.read_text(encoding="utf-8").replace(
+                f"sha256:{old_artifact_digest}",
+                f"sha256:{new_artifact_digest}",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=rf"{re.escape(artifact_key)}.*exact current.*{re.escape(upstream_key)}",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+            beads=derived_build_success_beads(),
+            pack_spec=gascity_pack_inference_gate.PACK_SPECS[pack_name],
+        )
+
+
+def test_validate_build_basic_artifacts_rejects_artifact_outside_current_root(tmp_path) -> None:
+    rig_dir = tmp_path / "fixture"
+    artifact_root = rig_dir / "current-artifacts"
+    outside_root = tmp_path / "stale-run"
+    artifact_root.mkdir(parents=True)
+    outside_root.mkdir()
+    metadata = write_build_basic_artifacts(artifact_root)
+    current_final = Path(metadata["gc.build.final_report_path"])
+    stale_final = outside_root / current_final.name
+    current_final.rename(stale_final)
+    metadata["gc.build.final_report_path"] = str(stale_final)
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"gc\.build\.final_report_path.*artifact root",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata, artifact_root=artifact_root),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
+
+
+def test_validate_build_basic_artifacts_binds_workflow_id_to_current_root(tmp_path) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(rig_dir)
+    final_report = Path(metadata["gc.build.final_report_path"])
+    final_report.write_text(
+        final_report.read_text(encoding="utf-8").replace(
+            "  id: fi-root\n",
+            "  id: fi-stale\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"gc\.build\.final_report_path.*workflow\.id.*fi-root.*fi-stale",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
+
+
+def test_validate_build_basic_artifacts_rejects_stale_review_producer_attempt(tmp_path) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(rig_dir)
+    review_report = Path(metadata["gc.build.review_report_path"])
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"gc\.build\.review_report_path.*producer\.attempt.*current.*2.*1",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+            beads=build_basic_success_beads(review_report, review_attempt=2),
+        )
+
+
+def test_validate_build_basic_artifacts_rejects_old_terminal_when_newer_review_attempt_exists(
+    tmp_path,
+) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(rig_dir)
+    review_report = Path(metadata["gc.build.review_report_path"])
+    beads = build_basic_success_beads(review_report)
+    beads.append(
+        {
+            "id": "fi-current-acceptance-attempt-2",
+            "status": "closed",
+            "metadata": {
+                "gc.root_bead_id": "fi-root",
+                "gc.attempt": "2",
+                "gc.ralph_step_id": "review.build-basic-review-loop",
+                "gc.step_id": "review.acceptance-review",
+                "gc.scope_role": "member",
+                "gc.outcome": "pass",
+                "code_review.acceptance_verdict": "approve",
+            },
+        }
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"current review attempt 2.*exactly one closed/pass reported terminal",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+            beads=beads,
+        )
+
+
+@pytest.mark.parametrize(
+    ("artifact_key", "upstream_key"),
+    (
+        ("gc.build.review_report_path", "gc.build.implementation_summary_path"),
+        ("gc.build.final_report_path", "gc.build.review_report_path"),
+    ),
+)
+def test_validate_build_basic_artifacts_requires_exact_current_report_upstream(
+    tmp_path,
+    artifact_key: str,
+    upstream_key: str,
+) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(rig_dir)
+    artifact = Path(metadata[artifact_key])
+    current_upstream = Path(metadata[upstream_key])
+    stale_upstream = rig_dir / f"stale-{current_upstream.name}"
+    stale_upstream.write_bytes(current_upstream.read_bytes())
+    original_artifact_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    artifact.write_text(
+        artifact.read_text(encoding="utf-8").replace(
+            f"    - path: {current_upstream.resolve()}\n",
+            f"    - path: {stale_upstream.resolve()}\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    if artifact_key == "gc.build.review_report_path":
+        final_report = Path(metadata["gc.build.final_report_path"])
+        new_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        final_report.write_text(
+            final_report.read_text(encoding="utf-8").replace(
+                f"sha256:{original_artifact_digest}",
+                f"sha256:{new_digest}",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=rf"{re.escape(artifact_key)}.*exact current.*{re.escape(upstream_key)}",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
 
 
 def test_validate_build_basic_artifacts_resolve_repo_relative_sha_from_rig_root(tmp_path) -> None:
@@ -3367,21 +4382,18 @@ def test_validate_build_basic_artifacts_resolve_repo_relative_sha_from_rig_root(
     source = rig_dir / "source.md"
     source.write_text("# Canonical build input\n", encoding="utf-8")
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
-    metadata: dict[str, str] = {}
-
-    for metadata_key, schema in gascity_pack_inference_gate.BUILD_BASIC_ARTIFACT_CONTRACTS:
-        artifact_path = artifact_dir / f"{metadata_key.rsplit('.', 1)[-1]}.md"
-        artifact_path.write_text(
-            valid_build_artifact(schema).replace(
-                "    - path: fixture\n      hash: literal:test",
-                f"    - path: source.md\n      hash: sha256:{digest}",
-            ),
-            encoding="utf-8",
-        )
-        metadata[metadata_key] = str(artifact_path)
+    metadata = write_build_basic_artifacts(artifact_dir)
+    requirements_path = Path(metadata["gc.build.requirements_path"])
+    requirements_path.write_text(
+        requirements_path.read_text(encoding="utf-8").replace(
+            "    - path: fixture\n      hash: literal:test",
+            f"    - path: source.md\n      hash: sha256:{digest}",
+        ),
+        encoding="utf-8",
+    )
 
     gascity_pack_inference_gate.validate_build_basic_artifacts(
-        {"metadata": metadata},
+        successful_build_basic_root(metadata),
         rig_dir=rig_dir,
         env={},
         validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
@@ -3391,12 +4403,222 @@ def test_validate_build_basic_artifacts_resolve_repo_relative_sha_from_rig_root(
 def test_validate_build_basic_artifacts_rejects_json_artifacts(tmp_path) -> None:
     rig_dir = tmp_path / "fixture"
     rig_dir.mkdir()
-    bad_path = rig_dir / "requirements.json"
+    metadata = write_build_basic_artifacts(rig_dir)
+    bad_path = Path(metadata["gc.build.requirements_path"])
     bad_path.write_text('{"schema":"gc.build.requirements.v1"}\n', encoding="utf-8")
 
     with pytest.raises(gascity_pack_inference_gate.GateError, match="failed validation"):
         gascity_pack_inference_gate.validate_build_basic_artifacts(
-            {"metadata": {"gc.build.requirements_path": str(bad_path)}},
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "status"),
+    (
+        ("gc.build.requirements_path", "questions"),
+        ("gc.build.plan_path", "draft"),
+        ("gc.build.decomposition_path", "changes_required"),
+        ("gc.build.implementation_summary_path", "draft"),
+    ),
+)
+def test_validate_build_basic_artifacts_requires_approved_pre_review_stages(
+    tmp_path, metadata_key: str, status: str
+) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(rig_dir, statuses={metadata_key: status})
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=rf"{re.escape(metadata_key)}.*status=approved.*{status}",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("approved-with-blocked-coverage", "changes-required-without-blocked-coverage"),
+)
+def test_validate_build_basic_artifacts_enforces_review_status_coverage_coherence(
+    tmp_path, case: str
+) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    if case == "approved-with-blocked-coverage":
+        metadata = write_build_basic_artifacts(rig_dir)
+        review_text = valid_review_artifact("approved").replace(
+            "      status: covered\n",
+            "      status: blocked\n"
+            "      rationale: A required remediation remains unresolved.\n",
+            1,
+        ).replace("| AC1 | covered |", "| AC1 | blocked |", 1)
+        root = successful_build_basic_root(metadata)
+    else:
+        metadata = write_build_basic_artifacts(
+            rig_dir,
+            statuses={
+                "gc.build.review_report_path": "changes_required",
+                "gc.build.final_report_path": "blocked",
+            },
+        )
+        review_text = valid_review_artifact("changes_required").replace(
+            "      status: blocked\n"
+            "      rationale: The required security remediation remains unresolved.\n",
+            "      status: covered\n",
+            1,
+        ).replace("| AC1 | blocked |", "| AC1 | covered |", 1)
+        root = blocked_build_basic_root(metadata)
+    Path(metadata["gc.build.review_report_path"]).write_text(review_text, encoding="utf-8")
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"gc\.build\.review_report_path.*failed validation",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            root,
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
+
+
+@pytest.mark.parametrize("review_status", ("changes_required", "blocked"))
+def test_validate_build_basic_artifacts_rejects_false_green_report_review(
+    tmp_path, review_status: str
+) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(
+        rig_dir,
+        statuses={"gc.build.review_report_path": review_status},
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=rf"report-mode review status={review_status}.*final status=approved",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
+
+
+@pytest.mark.parametrize("review_status", ("changes_required", "blocked"))
+def test_validate_build_basic_artifacts_rejects_success_lifecycle_for_blocked_final(
+    tmp_path, review_status: str
+) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(
+        rig_dir,
+        statuses={
+            "gc.build.review_report_path": review_status,
+            "gc.build.final_report_path": "blocked",
+        },
+    )
+    root = successful_build_basic_root(metadata)
+    root["metadata"]["gc.outcome"] = "fail"
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=rf"report-mode review status={review_status}.*blocked final report.*gc.build.status",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            root,
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
+
+
+def test_validate_build_basic_artifacts_rejects_blocked_final_after_approved_review(tmp_path) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    metadata = write_build_basic_artifacts(
+        rig_dir,
+        statuses={"gc.build.final_report_path": "blocked"},
+    )
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"report-mode review status=approved.*final status=blocked",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            successful_build_basic_root(metadata),
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
+
+
+@pytest.mark.parametrize("review_mode", ("", "agent"), ids=("missing", "agent"))
+def test_validate_build_basic_artifacts_requires_report_review_mode(
+    tmp_path, review_mode: str
+) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    root = successful_build_basic_root(write_build_basic_artifacts(rig_dir))
+    if review_mode:
+        root["metadata"]["gc.var.review_mode"] = review_mode
+    else:
+        del root["metadata"]["gc.var.review_mode"]
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=r"review mode=report",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            root,
+            rig_dir=rig_dir,
+            env={},
+            validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        ("root-status", "root status"),
+        ("root-outcome", "gc.outcome"),
+        ("missing-build-status", "gc.build.status"),
+        ("finalize-status", "gc.build.finalize_status"),
+        ("finalize-outcome", "gc.build.finalize_outcome"),
+    ),
+)
+def test_validate_build_basic_artifacts_requires_success_lifecycle_for_approved_final(
+    tmp_path, case: str, expected: str
+) -> None:
+    rig_dir = tmp_path / "fixture"
+    rig_dir.mkdir()
+    root = successful_build_basic_root(write_build_basic_artifacts(rig_dir))
+    if case == "root-status":
+        root["status"] = "open"
+    elif case == "root-outcome":
+        root["metadata"]["gc.outcome"] = "fail"
+    elif case == "missing-build-status":
+        del root["metadata"]["gc.build.status"]
+    elif case == "finalize-status":
+        root["metadata"]["gc.build.finalize_status"] = "failed"
+    else:
+        root["metadata"]["gc.build.finalize_outcome"] = "failure"
+
+    with pytest.raises(
+        gascity_pack_inference_gate.GateError,
+        match=rf"approved final report.*{re.escape(expected)}",
+    ):
+        gascity_pack_inference_gate.validate_build_basic_artifacts(
+            root,
             rig_dir=rig_dir,
             env={},
             validator_source=gascity_pack_inference_gate.REPO_ROOT / "gascity",

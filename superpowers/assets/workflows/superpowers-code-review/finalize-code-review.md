@@ -81,6 +81,16 @@ On every repair attempt, correct the whole contract above rather than only the
 first validator complaint. Confirm the selected adapter report is valid before
 closing.
 
+When the caller selects `gc.build.review_report_path` for a build workflow,
+bind the adapter report to the current build evidence before closing. Its
+`producer.attempt` must equal this expansion terminal's current positive
+`gc.attempt`. Its `trace.upstream` must contain exactly one entry whose `path`
+equals the canonical absolute `gc.build.implementation_summary_path` and whose
+`hash` is the freshly computed `sha256:<digest>` of that exact file. A report
+that only traces an earlier summary, a copy at another path, or review-lane
+inputs is not a valid build review artifact. Repair the selected adapter report
+in place while preserving its semantic verdict.
+
 Report-only path:
 
 - If workflow root metadata `gc.var.review_mode=report`, do not require the

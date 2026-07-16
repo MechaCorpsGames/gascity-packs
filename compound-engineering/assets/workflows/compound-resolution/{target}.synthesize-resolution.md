@@ -28,7 +28,7 @@ methodology:
 producer:
   formula: compound-resolution
   stage: synthesize-resolution
-  attempt: <positive integer>
+  attempt: <current positive gc.attempt for this finalize stage>
 status: approved
 trace:
   upstream:
@@ -40,6 +40,12 @@ trace:
       status: covered
 ---
 ```
+
+Trace the canonical absolute `gc.build.implementation_summary_path` and
+`gc.build.review_report_path` exactly once each, using a freshly computed
+`sha256:<digest>` of each exact file. An earlier artifact, a byte-identical copy
+at another path, or a path without its current digest is stale and must block
+finalization.
 
 Use `status: approved` only when requirements, plan, decomposition,
 implementation, review, and required publish-readiness evidence support a

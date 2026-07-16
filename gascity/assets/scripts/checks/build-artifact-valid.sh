@@ -44,7 +44,12 @@ if not isinstance(data, dict):
     raise SystemExit(0)
 metadata = data.get("metadata") or {}
 value = metadata.get(key, "") if isinstance(metadata, dict) else ""
-print(value if isinstance(value, str) else "")
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif isinstance(value, (str, int)):
+    print(value)
+else:
+    print("")
 ' "$2"
 }
 
@@ -384,9 +389,54 @@ match = re.match(r"\A---\n(?P<front>.*?)\n---(?:\n|\Z)", text, re.DOTALL)
 if not match:
     raise SystemExit(1)
 front = yaml.safe_load(match.group("front")) or {}
-value = front.get(sys.argv[2], "") if isinstance(front, dict) else ""
+value = front
+for part in sys.argv[2].split("."):
+    value = value.get(part, "") if isinstance(value, dict) else ""
 print(value if isinstance(value, (str, int)) else "")
 PY
+}
+
+current_producer_attempt() {
+  local control_epoch iteration_attempt ralph_step_id controls
+  control_epoch="$(metadata_value "$SHOW_JSON" "gc.control_epoch")"
+  if [ -n "$control_epoch" ]; then
+    printf '%s\n' "$control_epoch"
+    return 0
+  fi
+
+  iteration_attempt="$(metadata_value "$SHOW_JSON" "gc.attempt")"
+  ralph_step_id="$(metadata_value "$SHOW_JSON" "gc.ralph_step_id")"
+  case "$iteration_attempt" in
+    ''|*[!0-9]*|0) fail "current producer attempt is invalid on $BEAD_ID: ${iteration_attempt:-<missing>}" ;;
+  esac
+  [ -n "$ROOT_ID" ] || fail "current producer iteration $BEAD_ID is missing gc.root_bead_id"
+  [ -n "$ralph_step_id" ] || fail "current producer iteration $BEAD_ID is missing gc.ralph_step_id"
+
+  controls="$(gc bd list --all --metadata-field \
+    "gc.root_bead_id=$ROOT_ID" --json --limit=0 2>/dev/null)" || \
+    fail "could not list current producer controls for workflow root $ROOT_ID"
+  if ! control_epoch="$(printf '%s\n' "$controls" | jq -er \
+    --arg root "$ROOT_ID" \
+    --arg step "$ralph_step_id" '
+      [.[] | select(
+        (.metadata["gc.root_bead_id"] // "") == $root and
+        (.metadata["gc.kind"] // "") == "ralph" and
+        (.metadata["gc.step_id"] // "") == $step
+      )] as $controls
+      | if ($controls | length) != 1 then
+          error("expected exactly one current producer control")
+        else
+          ($controls[0].metadata["gc.control_epoch"] // "") | tostring
+        end
+    ' 2>/dev/null)"; then
+    fail "current producer iteration $BEAD_ID could not resolve exactly one logical control for $ralph_step_id"
+  fi
+  case "$control_epoch" in
+    ''|*[!0-9]*|0) fail "current producer control epoch is invalid for $ralph_step_id: ${control_epoch:-<missing>}" ;;
+  esac
+  [ "$iteration_attempt" = "$control_epoch" ] || fail \
+    "current producer iteration attempt $iteration_attempt does not match current control epoch $control_epoch for $ralph_step_id"
+  printf '%s\n' "$iteration_attempt"
 }
 
 require_review_attempt_provenance() {
@@ -549,6 +599,24 @@ if ! OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" \
   exit 1
 fi
 [ -z "$MISSING_LAUNCHER_ROOT" ] || fail "$MISSING_LAUNCHER_ROOT"
+
+if [ "$(metadata_value "$SHOW_JSON" "gc.build.require_approved_status")" = "true" ]; then
+  ARTIFACT_STATUS="$(front_matter_value "$ARTIFACT_PATH" status)" || \
+    fail "artifact status is unreadable: $ARTIFACT_PATH"
+  [ "$ARTIFACT_STATUS" = "approved" ] || fail \
+    "schema=$SCHEMA path=$ARTIFACT_PATH requires status=approved; observed=${ARTIFACT_STATUS:-<missing>}"
+fi
+
+if [ "$(metadata_value "$SHOW_JSON" "gc.build.require_current_producer_attempt")" = "true" ]; then
+  CURRENT_PRODUCER_ATTEMPT="$(current_producer_attempt)"
+  case "$CURRENT_PRODUCER_ATTEMPT" in
+    ''|*[!0-9]*|0) fail "current producer attempt is invalid on $BEAD_ID: ${CURRENT_PRODUCER_ATTEMPT:-<missing>}" ;;
+  esac
+  ARTIFACT_PRODUCER_ATTEMPT="$(front_matter_value "$ARTIFACT_PATH" producer.attempt)" || \
+    fail "artifact producer.attempt is unreadable: $ARTIFACT_PATH"
+  [ "$ARTIFACT_PRODUCER_ATTEMPT" = "$CURRENT_PRODUCER_ATTEMPT" ] || fail \
+    "schema=$SCHEMA path=$ARTIFACT_PATH requires producer.attempt=$CURRENT_PRODUCER_ATTEMPT; observed=${ARTIFACT_PRODUCER_ATTEMPT:-<missing>}"
+fi
 
 IMPLEMENTATION_PROVENANCE_REQUIRED="$(metadata_value "$SHOW_JSON" "gc.build.require_implementation_provenance")"
 if [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" = "true" ]; then

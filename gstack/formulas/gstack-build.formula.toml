@@ -193,7 +193,7 @@ title = "gstack QA fanout"
 needs = ["review"]
 metadata = { "gc.run_target" = "gstack.qa-lead" }
 expand = "gstack-qa-review"
-expand_vars = { implementation_target = "{{implementation_target}}", interaction_mode = "{{interaction_mode}}" }
+expand_vars = { implementation_target = "{{implementation_target}}", interaction_mode = "{{interaction_mode}}", review_mode = "{{review_mode}}" }
 description_file = "../assets/workflows/gstack-build/qa.md"
 
 [[steps]]

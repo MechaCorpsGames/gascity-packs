@@ -28,6 +28,15 @@ validation-loop control bead first. Repair the complete internal report at
 adapter path so the two reports remain byte-identical. Do not invent an
 attempt-local report path or independently rewrite the adapter copy.
 
+When the selected key is `gc.build.review_report_path` for a build workflow,
+the internal report must also bind the current build evidence before it is
+copied. Set `producer.attempt` to this expansion terminal's current positive
+`gc.attempt`. Require exactly one `trace.upstream` entry whose `path` equals the
+canonical absolute `gc.build.implementation_summary_path` and whose `hash` is
+the freshly computed `sha256:<digest>` of that exact file. Repair the internal
+report first, validate it, and only then make the byte-identical adapter copy;
+an earlier summary or an equivalent copy at another path is stale.
+
 Resolve the launcher rig root from workflow root metadata `gc.work_dir`. When
 that path names an attempt worktree, use the nearest ancestor containing
 `.gc/scripts/checks/build-artifact-valid.sh`. Run the validator against the

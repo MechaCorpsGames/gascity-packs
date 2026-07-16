@@ -39,7 +39,9 @@ Use mapping objects for front matter; do not use scalar shortcuts such as
 - `workflow: {id: <workflow-root-id>, formula: build-basic}`
 - `methodology: {pack: gascity, name: build-basic}`
 - `producer: {formula: build-basic, stage: requirements, attempt: <positive integer>}`
-- `status: approved` or another schema-allowed status
+- Set `producer.attempt` to the current `gc.attempt` on every write or repair.
+- Use `status: approved` before closing; unresolved questions must keep the
+  producer stage open or fail its bounded validation loop.
 - `trace: {upstream: [...], coverage: [...]}`
 
 Trace front matter must use the validator shape exactly:

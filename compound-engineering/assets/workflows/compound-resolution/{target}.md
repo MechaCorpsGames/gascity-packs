@@ -24,6 +24,11 @@ GC_BEAD_ID="$CLAIMED_BEAD_ID" <launcher-rig>/.gc/scripts/checks/build-artifact-v
 On repair attempts (`gc.attempt` greater than 1), first read `gc.attempt_log`
 on the validation-loop control bead and repair the report in place at the exact
 `gc.build.final_report_path`. Do not change the root path to bypass validation.
+The repaired report's `producer.attempt` must equal this terminal's current
+positive `gc.attempt`. It must trace the canonical absolute
+`gc.build.implementation_summary_path` and `gc.build.review_report_path`
+exactly once each with their freshly computed `sha256:<digest>` values; an
+earlier artifact or an equivalent copy at another path is stale.
 
 Only after the canonical `gc.build.final-report.v1` report validates and all
 required evidence succeeds, reconcile the build-base workflow root lifecycle

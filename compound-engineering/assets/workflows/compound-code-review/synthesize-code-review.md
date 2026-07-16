@@ -35,11 +35,22 @@ The synthesized report must be valid for `gc.build.review.v1`: start with YAML
 front matter containing `schema: gc.build.review.v1`, `workflow`,
 `methodology`, `producer`, `status`, and `trace`; include a Markdown coverage
 table; and include `## Verdict`, `## Findings`, and `## Verification`
-sections. Use `status: changes_required` when required fixes remain, and use
-schema-allowed coverage statuses only (`covered`, `blocked`, `deferred`,
-`not_applicable`, `out_of_scope`, `superseded`). Do not use `violated`,
-`resolved`, `approved`, or `changes_required` as coverage row statuses. Include
+sections. Use `status: approved` when no required fixes remain, use
+`status: changes_required` when required fixes remain, and use `status: blocked`
+when the available evidence cannot support a review. Use schema-allowed coverage
+statuses only (`covered`, `blocked`, `deferred`, `not_applicable`,
+`out_of_scope`, `superseded`). Do not use `violated`, `resolved`, `approved`, or
+`changes_required` as coverage row statuses. Include
 `rationale: <why this id is not covered>` on every non-`covered` coverage row.
+
+Keep top-level review status and coverage mechanically coherent:
+
+- When coverage is non-empty, `status: changes_required` or `status: blocked`
+  requires at least one `blocked` coverage row tied to a concrete required
+  finding.
+- `status: approved` requires no `blocked` coverage rows.
+- When no authoritative input declares IDs, do not invent them: omit `ids` and
+  use `coverage: []`. Record any concrete required finding in `## Findings`.
 
 Use this front matter shape exactly. Do not use dotted YAML keys such as
 `workflow.id`, and do not make `trace` a list:
@@ -65,7 +76,8 @@ trace:
       ids: [<finding-or-lane-id>]
   coverage:
     - id: <finding-or-lane-id>
-      status: covered
+      status: blocked
+      rationale: <why the finding remains unresolved>
 ---
 ```
 

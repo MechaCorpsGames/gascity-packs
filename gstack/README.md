@@ -138,20 +138,31 @@ finalize -> publish`. No base anchor is renamed, skipped, or reordered;
 `qa`, `finalize` is rewired to need `release-readiness`, and `publish` still
 needs `finalize`. Each expands a check-gated loop
 (`implementation-review-approved.sh`; QA allows 6 attempts, release-readiness
-4) whose final lane (`synthesize-qa`, `synthesize-release-readiness`) owns the
-`code_review.verdict=done|iterate` loop verdict. Their outputs are the
-approved QA summary recorded on the workflow root at
-`gc.build.qa_summary_path` before release readiness begins and the approved
-readiness summary at `gc.build.release_readiness_summary_path` before finalize
-begins.
+4). QA synthesis owns the semantic `approve|iterate` result, followed by one
+mode-selected terminal: agent/interactive mode may apply fixes and owns
+`done|iterate`, while report mode records findings without mutation and owns
+`reported`. Release-readiness synthesis owns `done|iterate` in
+agent/interactive mode and feeds a current-attempt `reported` terminal in
+report mode. Their outputs are the QA summary recorded on the workflow root at
+`gc.build.qa_summary_path` before release readiness begins and the readiness
+summary at `gc.build.release_readiness_summary_path` before finalize begins.
+Each summary preserves `approved`, `changes_required`, or `blocked`; the final
+gate requires a blocked final report whenever report-mode findings remain.
 
 The `review` anchor works the same way: `gstack-code-review` records the
 review context, fans out the staff, QA-evidence, CSO-security, and
 gap-analysis lanes, fans in at `synthesize-code-review`, and loops an
 `apply-review-findings` lane (routed to the caller-selected implementation
 target) through a bounded graph check until `code_review.verdict=done` lands
-on the workflow root. `gstack-fix-loop` carries the same review-fix contract
-for standalone adapter use.
+on the workflow root. In report mode a separate read-only terminal records
+`reported`, and the loop check requires that terminal from the current attempt
+instead of accepting a pre-existing root report path. `gstack-fix-loop`
+carries the same review-fix contract for standalone adapter use.
+
+The QA and release-readiness expansion finalizers run a second executable
+binding check after they update root metadata. It requires each selected root
+path to equal the one report terminal from the current loop epoch and rejects
+missing, duplicate, stale, non-canonical, or outside-artifact-root evidence.
 
 Supported modes and drain policies, as declared in
 `[metadata.gc.methodology]` of `gstack-build`:

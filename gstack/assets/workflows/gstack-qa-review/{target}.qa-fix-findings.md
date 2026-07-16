@@ -1,8 +1,17 @@
 Apply gstack QA findings.
 
+This lane is valid only when `gc.var.review_mode` is `agent` or `interactive`.
+If it is `report`, stop without reading, testing, or changing product source;
+the graph must select `qa-report-findings` instead.
+
 Use implementation target {{implementation_target}} for fixes. Fix behavior
 defects first, then add or update regression tests. If the QA lane found only
 missing evidence, run and record the missing proof instead of changing code.
+Read the current synthesis result first. When it is `approve`, write a no-op QA
+fix artifact and set the terminal verdict to `done`. When it is `iterate`, apply
+the focused fixes below and set the terminal verdict to `iterate` so the browser
+and regression lanes rerun against the new commit; a same-iteration fix claim
+must not erase the reviewers' finding.
 
 Read `gc.build.implementation_member_ids` and the exact member-to-worktree map
 from the QA context. Apply each fix only inside the affected member's
@@ -24,7 +33,10 @@ iteration.
 
 Write a QA fix artifact under the artifact root.
 
-Close with `gc.outcome=pass` and
+Close with `gc.outcome=pass`,
+`code_review.verdict=done|iterate`,
+`code_review.report_path=<QA fix artifact path>`,
+`code_review.output_path=<QA fix artifact path>`, and
 `gstack.qa.fix_output_path=<QA fix artifact path>`.
 
 Do not invoke provider-native subagents. This Gas City graph lane is the QA fix

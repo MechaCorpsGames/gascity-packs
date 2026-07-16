@@ -96,6 +96,8 @@ IMPLEMENTATION_PROVENANCE_REQUIRED="$(metadata_value "$ROOT_JSON" "gc.build.requ
 if [ -z "$IMPLEMENTATION_PROVENANCE_REQUIRED" ]; then
   IMPLEMENTATION_PROVENANCE_REQUIRED="$(metadata_value "$PARENT_JSON" "gc.build.require_implementation_provenance")"
 fi
+CURRENT_REPORT_TERMINAL_REQUIRED="$(metadata_value "$ROOT_JSON" "gc.review.require_current_report_terminal")"
+ARTIFACT_PRODUCER_BINDING_REQUIRED="$(metadata_value "$ROOT_JSON" "gc.review.require_artifact_producer_binding")"
 IMPLEMENTATION_PROVENANCE_VALIDATED=false
 CURRENT_IMPLEMENTATION_SNAPSHOT=""
 CURRENT_REVIEW_INPUT_SNAPSHOT=""
@@ -441,6 +443,599 @@ if ! CURRENT_MATCHES="$(printf '%s\n' "$MATCHES" | jq -c \
   exit 1
 fi
 
+validate_current_report_terminal() {
+  local rows count status outcome attempt verdict report_path output_path
+  local artifact_root launcher_work_dir launcher_top canonical_root canonical_report
+  local root_report_path root_gap_path root_formula producer_rows producer_count
+  local script_dir validator validation_output
+
+  rows="$(printf '%s\n' "$CURRENT_MATCHES" | jq -c '
+    [.[] | select((.metadata["gc.review.report_terminal"] // "") == "true")]
+  ' 2>/dev/null)" || {
+    echo "review check: current report terminal metadata is malformed" >&2
+    return 1
+  }
+  count="$(printf '%s\n' "$rows" | jq -r 'length' 2>/dev/null)"
+  if [ "$count" != "1" ]; then
+    echo "review check: expected exactly one current report terminal, observed ${count:-<invalid>}" >&2
+    return 1
+  fi
+
+  status="$(printf '%s\n' "$rows" | jq -r '.[0].status // ""')"
+  outcome="$(printf '%s\n' "$rows" | jq -r '.[0].metadata["gc.outcome"] // ""')"
+  attempt="$(printf '%s\n' "$rows" | jq -r '.[0].metadata["gc.attempt"] // ""')"
+  verdict="$(printf '%s\n' "$rows" | jq -r '.[0].metadata["code_review.verdict"] // ""')"
+  report_path="$(printf '%s\n' "$rows" | jq -r '.[0].metadata["code_review.report_path"] // ""')"
+  output_path="$(printf '%s\n' "$rows" | jq -r '.[0].metadata["code_review.output_path"] // ""')"
+
+  if [ "$status" != "closed" ] || [ "$outcome" != "pass" ] || [ "$attempt" != "$ATTEMPT" ]; then
+    echo "review check: current report terminal must be closed/pass for attempt $ATTEMPT: status=${status:-<missing>} outcome=${outcome:-<missing>} attempt=${attempt:-<missing>}" >&2
+    return 1
+  fi
+  if [ "$verdict" != "reported" ]; then
+    echo "review check: current report terminal must record code_review.verdict=reported, observed ${verdict:-<missing>}" >&2
+    return 1
+  fi
+  if [ -z "$report_path" ] || [ "$report_path" != "$output_path" ]; then
+    echo "review check: current report terminal report/output paths disagree: report=${report_path:-<missing>} output=${output_path:-<missing>}" >&2
+    return 1
+  fi
+
+  artifact_root="$(metadata_value "$PARENT_JSON" "gc.build.artifact_root")"
+  if [ -z "$artifact_root" ]; then
+    artifact_root="$(metadata_value "$PARENT_JSON" "gc.var.artifact_root")"
+  fi
+  if [ -z "$artifact_root" ]; then
+    artifact_root="$(metadata_value "$PARENT_JSON" "gc.build.code_review_artifact_root")"
+  fi
+  [ -n "$artifact_root" ] || {
+    echo "review check: current report terminal requires workflow artifact root metadata" >&2
+    return 1
+  }
+  case "$artifact_root" in
+    /*) ;;
+    *)
+      launcher_work_dir="$(metadata_value "$PARENT_JSON" "gc.work_dir")"
+      launcher_top="$(git_top_level "$launcher_work_dir")" || {
+        echo "review check: current report terminal cannot resolve launcher root for relative artifact root" >&2
+        return 1
+      }
+      artifact_root="$launcher_top/$artifact_root"
+      ;;
+  esac
+  canonical_root="$(cd "$artifact_root" 2>/dev/null && pwd -P)" || {
+    echo "review check: current report terminal artifact root does not resolve: $artifact_root" >&2
+    return 1
+  }
+
+  case "$report_path" in
+    /*) ;;
+    *)
+      echo "review check: current report terminal path must be absolute: $report_path" >&2
+      return 1
+      ;;
+  esac
+  [ -f "$report_path" ] || {
+    echo "review check: current report terminal path is not a regular file: $report_path" >&2
+    return 1
+  }
+  [ ! -L "$report_path" ] || {
+    echo "review check: current report terminal path must not be a symlink: $report_path" >&2
+    return 1
+  }
+  canonical_report="$(cd "$(dirname "$report_path")" 2>/dev/null && pwd -P)/$(basename "$report_path")" || {
+    echo "review check: current report terminal path does not resolve: $report_path" >&2
+    return 1
+  }
+  if [ "$canonical_report" != "$report_path" ]; then
+    echo "review check: current report terminal path is not canonical: path=$report_path canonical=$canonical_report" >&2
+    return 1
+  fi
+  case "$canonical_report" in
+    "$canonical_root"/*) ;;
+    *)
+      echo "review check: current report terminal path must stay under canonical artifact root: path=$canonical_report root=$canonical_root" >&2
+      return 1
+      ;;
+  esac
+
+  root_report_path="$(metadata_value "$PARENT_JSON" "gc.build.code_review_report_path")"
+  root_gap_path="$(metadata_value "$PARENT_JSON" "gc.build.gap_analysis_report_path")"
+  root_formula="$(metadata_value "$PARENT_JSON" "gc.formula_name")"
+  if ! producer_rows="$(printf '%s\n' "$CURRENT_MATCHES" | jq -c '
+    . as $rows
+    | [
+        .[]
+        | select((.metadata["gc.review.report_terminal"] // "") == "true")
+      ][0] as $terminal
+    | [
+        $rows[]
+        | . as $control
+        | select(
+            [
+              $terminal.dependencies[]?
+              | select((.type // "") == "blocks")
+              | .depends_on_id // ""
+            ]
+            | index($control.id // "") != null
+          )
+        | $rows[]
+        | . as $producer
+        | select(
+            [
+              $control.dependencies[]?
+              | select((.type // "") == "blocks")
+              | .depends_on_id // ""
+            ]
+            | index($producer.id // "") != null
+          )
+        | ((.metadata["gc.build.artifact_path_keys"] // "")
+            | split(",") | map(gsub("\\s"; ""))) as $path_keys
+        | select(
+            (($path_keys | index("gc.build.code_review_report_path")) != null) or
+            (($path_keys | index("gc.build.gap_analysis_report_path")) != null)
+          )
+        | {
+            control: {
+              id: ($control.id // ""),
+              status: ($control.status // ""),
+              metadata: {
+                "gc.outcome": ($control.metadata["gc.outcome"] // ""),
+                "gc.attempt": ($control.metadata["gc.attempt"] // ""),
+                "gc.scope_role": ($control.metadata["gc.scope_role"] // ""),
+                "gc.kind": ($control.metadata["gc.kind"] // ""),
+                "gc.control_for": ($control.metadata["gc.control_for"] // ""),
+                "gc.step_id": ($control.metadata["gc.step_id"] // "")
+              }
+            },
+            producer: {
+              id: ($producer.id // ""),
+              status: ($producer.status // ""),
+              metadata: {
+                "gc.outcome": ($producer.metadata["gc.outcome"] // ""),
+                "gc.attempt": ($producer.metadata["gc.attempt"] // ""),
+                "gc.scope_role": ($producer.metadata["gc.scope_role"] // ""),
+                "gc.step_id": ($producer.metadata["gc.step_id"] // ""),
+                "gc.step_ref": ($producer.metadata["gc.step_ref"] // ""),
+                "gc.run_target": ($producer.metadata["gc.run_target"] // ""),
+                "gc.build.artifact_schema": ($producer.metadata["gc.build.artifact_schema"] // ""),
+                "gc.build.artifact_path_keys": ($producer.metadata["gc.build.artifact_path_keys"] // ""),
+                "code_review.review_verdict": ($producer.metadata["code_review.review_verdict"] // ""),
+                "code_review.review_report_path": ($producer.metadata["code_review.review_report_path"] // ""),
+                "code_review.gap_verdict": ($producer.metadata["code_review.gap_verdict"] // ""),
+                "code_review.gap_report_path": ($producer.metadata["code_review.gap_report_path"] // ""),
+                "code_review.output_path": ($producer.metadata["code_review.output_path"] // "")
+              }
+            }
+          }
+      ]
+  ' 2>/dev/null)"; then
+    echo "review check: current code-review producer metadata is malformed" >&2
+    return 1
+  fi
+  producer_count="$(printf '%s\n' "$producer_rows" | jq -r 'length' 2>/dev/null)"
+
+  # The shared report-terminal gate also serves gstack QA/readiness loops.
+  # Code-review loops opt into stronger binding explicitly; retain legacy
+  # detection for graphs that expose a code-review producer or whose terminal
+  # claims the workflow root's canonical code-review path.
+  if [ "$ARTIFACT_PRODUCER_BINDING_REQUIRED" = "true" ] || \
+    [ "$producer_count" != "0" ] || \
+    { [ -n "$root_report_path" ] && [ "$root_report_path" = "$report_path" ]; }; then
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    validator="$script_dir/../validate_build_artifact.py"
+    [ -f "$validator" ] || {
+      echo "review check: current code-review artifact validator is missing: $validator" >&2
+      return 1
+    }
+    launcher_top=""
+    launcher_work_dir="$(metadata_value "$PARENT_JSON" "gc.work_dir")"
+    if [ -n "$launcher_work_dir" ]; then
+      launcher_top="$(git_top_level "$launcher_work_dir")" || {
+        echo "review check: current code-review producer cannot resolve launcher root from workflow gc.work_dir: $launcher_work_dir" >&2
+        return 1
+      }
+    fi
+    if ! validation_output="$(python3 - \
+      "$validator" "$producer_rows" "$PARENT_ROOT" "$root_formula" \
+      "$ATTEMPT" "$canonical_root" "$launcher_top" "$canonical_report" \
+      "$root_report_path" "$root_gap_path" 2>&1 <<'PY'
+import hashlib
+import json
+import stat
+import sys
+from pathlib import Path
+
+
+class GateError(Exception):
+    pass
+
+
+validator_path = Path(sys.argv[1])
+producer_pairs = json.loads(sys.argv[2])
+workflow_root_id = sys.argv[3]
+root_formula = sys.argv[4]
+expected_attempt = sys.argv[5]
+artifact_root = Path(sys.argv[6])
+launcher_root = Path(sys.argv[7]) if sys.argv[7] else None
+terminal_report = sys.argv[8]
+root_report = sys.argv[9]
+root_gap_report = sys.argv[10]
+sys.path.insert(0, str(validator_path.parent))
+
+import validate_build_artifact  # noqa: E402
+
+
+PATH_CONTRACTS = {
+    "gc.build.code_review_report_path": {
+        "label": "code-review",
+        "path_metadata": "code_review.review_report_path",
+        "verdict_metadata": "code_review.review_verdict",
+    },
+    "gc.build.gap_analysis_report_path": {
+        "label": "gap-analysis",
+        "path_metadata": "code_review.gap_report_path",
+        "verdict_metadata": "code_review.gap_verdict",
+    },
+}
+
+IDENTITY_CONTRACTS = {
+    "bmad": {
+        "workflow_formula": "bmad-review",
+        "methodology_name": "bmad-review",
+        "producer_formula": "bmad-code-review-flow",
+        "producers": {
+            "gc.build.code_review_report_path": "synthesize-bmad-review",
+        },
+    },
+    "compound-engineering": {
+        "workflow_formula": "compound-review",
+        "methodology_name": "compound-review",
+        "producer_formula": "compound-code-review",
+        "producers": {
+            "gc.build.code_review_report_path": "synthesize-code-review",
+        },
+    },
+    "gstack": {
+        "workflow_formula": "gstack-review",
+        "methodology_name": "gstack-review",
+        "producer_formula": "gstack-code-review",
+        "producers": {
+            "gc.build.code_review_report_path": "synthesize-code-review",
+        },
+    },
+    "superpowers": {
+        "workflow_formula": root_formula,
+        "methodology_name": "superpowers-code-review",
+        "producer_formula": "superpowers-code-review",
+        "producers": {
+            "gc.build.code_review_report_path": "request-code-review",
+            "gc.build.gap_analysis_report_path": "gap-analysis-review",
+        },
+    },
+}
+
+
+def metadata(row, key):
+    value = (row.get("metadata") or {}).get(key, "")
+    return str(value) if isinstance(value, (str, int)) else ""
+
+
+def declared_path_keys(row):
+    return {
+        value.strip()
+        for value in metadata(row, "gc.build.artifact_path_keys").split(",")
+        if value.strip()
+    }
+
+
+def rows_for(path_key):
+    return [
+        pair
+        for pair in producer_pairs
+        if path_key in declared_path_keys(pair.get("producer") or {})
+    ]
+
+
+def file_fingerprint(path):
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise GateError(f"not a regular non-symlink file: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    after = path.lstat()
+
+    def fields(value):
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    if fields(before) != fields(after) or not stat.S_ISREG(after.st_mode):
+        raise GateError(f"file changed while fingerprinting: {path}")
+    return (*fields(after), digest.hexdigest())
+
+
+def canonical_artifact_path(raw_path, label):
+    if not raw_path:
+        raise GateError(f"workflow root is missing {label} artifact path")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise GateError(f"{label} artifact path must be absolute: {raw_path}")
+    fingerprint = file_fingerprint(path)
+    canonical = path.resolve(strict=True)
+    if str(canonical) != raw_path:
+        raise GateError(
+            f"{label} artifact path must be canonical: path={raw_path} canonical={canonical}"
+        )
+    try:
+        canonical.relative_to(artifact_root)
+    except ValueError as exc:
+        raise GateError(
+            f"{label} artifact path must stay under canonical artifact root: "
+            f"path={canonical} root={artifact_root}"
+        ) from exc
+    return canonical, fingerprint
+
+
+def mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def pin_sha256_upstreams(artifact, artifact_path, upstream_roots, pinned):
+    for index, entry in enumerate(artifact.upstream):
+        hash_value = str(entry.get("hash", ""))
+        if not hash_value.lower().startswith("sha256:"):
+            continue
+        path = Path(str(entry.get("path", "")))
+        if not path.is_absolute():
+            path = validate_build_artifact.resolve_relative_sha256_upstream(
+                path,
+                index=index,
+                artifact_path=artifact_path,
+                upstream_roots=upstream_roots,
+            )
+        pinned.setdefault(path, file_fingerprint(path))
+
+
+def validate_producer(path_key, pair, contract, upstream_roots, pinned):
+    path_contract = PATH_CONTRACTS[path_key]
+    label = path_contract["label"]
+    expected_stage = contract["producers"][path_key]
+    control = pair.get("control") or {}
+    row = pair.get("producer") or {}
+    control_status = str(control.get("status", ""))
+    control_outcome = metadata(control, "gc.outcome")
+    control_attempt = metadata(control, "gc.attempt")
+    control_role = metadata(control, "gc.scope_role")
+    control_kind = metadata(control, "gc.kind")
+    producer_step_ref = metadata(row, "gc.step_ref")
+    producer_step_id = metadata(row, "gc.step_id")
+    control_for = metadata(control, "gc.control_for")
+    control_step_id = metadata(control, "gc.step_id")
+    if (
+        control_status != "closed"
+        or control_outcome != "pass"
+        or control_attempt != expected_attempt
+        or control_role != "control"
+        or control_kind != "scope-check"
+        or not producer_step_ref
+        or control_for != producer_step_ref
+        or control_step_id != producer_step_id
+    ):
+        raise GateError(
+            f"current {label} scope-check must bind the current producer: "
+            f"status={control_status or '<missing>'} "
+            f"outcome={control_outcome or '<missing>'} "
+            f"attempt={control_attempt or '<missing>'} "
+            f"role={control_role or '<missing>'} "
+            f"kind={control_kind or '<missing>'} "
+            f"control_for={control_for or '<missing>'} "
+            f"producer_step_ref={producer_step_ref or '<missing>'} "
+            f"control_step_id={control_step_id or '<missing>'} "
+            f"producer_step_id={producer_step_id or '<missing>'}"
+        )
+
+    row_status = str(row.get("status", ""))
+    row_outcome = metadata(row, "gc.outcome")
+    row_attempt = metadata(row, "gc.attempt")
+    row_role = metadata(row, "gc.scope_role")
+    if (
+        row_status != "closed"
+        or row_outcome != "pass"
+        or row_attempt != expected_attempt
+        or row_role != "member"
+    ):
+        raise GateError(
+            f"current {label} producer must be a closed/pass member for attempt "
+            f"{expected_attempt}: status={row_status or '<missing>'} "
+            f"outcome={row_outcome or '<missing>'} "
+            f"attempt={row_attempt or '<missing>'} role={row_role or '<missing>'}"
+        )
+    if metadata(row, "gc.build.artifact_schema") != "gc.build.review.v1":
+        raise GateError(
+            f"current {label} producer must declare gc.build.review.v1"
+        )
+
+    observed_stage = producer_step_id.rsplit(".", 1)[-1] if producer_step_id else ""
+    run_target = metadata(row, "gc.run_target")
+    observed_pack = run_target.split(".", 1)[0] if "." in run_target else ""
+    if observed_stage != expected_stage or observed_pack != pack:
+        raise GateError(
+            f"current {label} producer identity mismatch: pack={observed_pack or '<missing>'} "
+            f"stage={observed_stage or '<missing>'} expected_pack={pack} "
+            f"expected_stage={expected_stage}"
+        )
+
+    expected_root_path = root_report if path_key == "gc.build.code_review_report_path" else root_gap_report
+    artifact_path_raw = metadata(row, path_contract["path_metadata"])
+    output_path = metadata(row, "code_review.output_path")
+    if (
+        not artifact_path_raw
+        or artifact_path_raw != output_path
+        or output_path != expected_root_path
+        or (
+            path_key == "gc.build.code_review_report_path"
+            and output_path != terminal_report
+        )
+    ):
+        raise GateError(
+            f"current {label} producer, terminal, and workflow-root paths must agree: "
+            f"producer_report={artifact_path_raw or '<missing>'} "
+            f"producer_output={output_path or '<missing>'} "
+            f"terminal={terminal_report} root={expected_root_path or '<missing>'}"
+        )
+
+    artifact_path, artifact_fingerprint = canonical_artifact_path(
+        expected_root_path, label
+    )
+    pinned.setdefault(artifact_path, artifact_fingerprint)
+    text = artifact_path.read_text(encoding="utf-8")
+    artifact = validate_build_artifact.validate_artifact_text(
+        text,
+        expected_schema="gc.build.review.v1",
+        enforce_review_status_coverage=True,
+        artifact_path=artifact_path,
+        upstream_roots=upstream_roots,
+    )
+    pin_sha256_upstreams(artifact, artifact_path, upstream_roots, pinned)
+    artifact = validate_build_artifact.validate_artifact_text(
+        text,
+        expected_schema="gc.build.review.v1",
+        verify_absolute_upstreams=True,
+        enforce_review_status_coverage=True,
+        artifact_path=artifact_path,
+        upstream_roots=upstream_roots,
+    )
+
+    front = artifact.front_matter
+    producer = mapping(front.get("producer"))
+    observed_attempt = producer.get("attempt")
+    if str(observed_attempt) != expected_attempt:
+        raise GateError(
+            f"artifact producer.attempt for current {label} producer does not "
+            "match current review attempt: "
+            f"expected={expected_attempt} observed={observed_attempt!r}"
+        )
+
+    expected_identity = {
+        "workflow.id": workflow_root_id,
+        "workflow.formula": contract["workflow_formula"],
+        "methodology.pack": pack,
+        "methodology.name": contract["methodology_name"],
+        "producer.formula": contract["producer_formula"],
+        "producer.stage": expected_stage,
+    }
+    observed_identity = {
+        "workflow.id": mapping(front.get("workflow")).get("id"),
+        "workflow.formula": mapping(front.get("workflow")).get("formula"),
+        "methodology.pack": mapping(front.get("methodology")).get("pack"),
+        "methodology.name": mapping(front.get("methodology")).get("name"),
+        "producer.formula": producer.get("formula"),
+        "producer.stage": producer.get("stage"),
+    }
+    if observed_identity != expected_identity:
+        raise GateError(
+            f"artifact identity mismatch for current {label} producer: "
+            f"expected={expected_identity!r} observed={observed_identity!r}"
+        )
+
+    artifact_status = str(front.get("status", ""))
+    if artifact_status not in {"approved", "changes_required", "blocked"}:
+        raise GateError(
+            "artifact terminal status must be approved, changes_required, or "
+            f"blocked; observed={artifact_status or '<missing>'}"
+        )
+    producer_verdict = metadata(row, path_contract["verdict_metadata"])
+    verdict_matches = (
+        producer_verdict == "approve" and artifact_status == "approved"
+    ) or (
+        producer_verdict == "iterate"
+        and artifact_status in {"changes_required", "blocked"}
+    )
+    if not verdict_matches:
+        raise GateError(
+            f"artifact status/verdict mismatch for current {label} producer: "
+            f"status={artifact_status or '<missing>'} "
+            f"verdict={producer_verdict or '<missing>'}"
+        )
+
+
+try:
+    if not isinstance(producer_pairs, list):
+        raise GateError("current code-review producer metadata must be a list")
+    code_rows = rows_for("gc.build.code_review_report_path")
+    if len(code_rows) != 1:
+        raise GateError(
+            "expected exactly one current code-review producer directly required "
+            f"by the report terminal, observed {len(code_rows)}"
+        )
+
+    run_target = metadata(code_rows[0].get("producer") or {}, "gc.run_target")
+    pack = run_target.split(".", 1)[0] if "." in run_target else ""
+    contract = IDENTITY_CONTRACTS.get(pack)
+    if contract is None:
+        raise GateError(
+            f"current code-review producer has unsupported pack identity: {pack or '<missing>'}"
+        )
+    if pack == "superpowers" and not root_formula:
+        raise GateError(
+            "current Superpowers code-review producer requires gc.formula_name on the workflow root"
+        )
+
+    gap_rows = rows_for("gc.build.gap_analysis_report_path")
+    expected_gap = "gc.build.gap_analysis_report_path" in contract["producers"]
+    if expected_gap and len(gap_rows) != 1:
+        raise GateError(
+            "expected exactly one current gap-analysis producer directly required "
+            f"by the report terminal, observed {len(gap_rows)}"
+        )
+    if not expected_gap and gap_rows:
+        raise GateError(
+            "current report terminal has an unexpected gap-analysis artifact producer"
+        )
+
+    upstream_roots = [artifact_root]
+    if launcher_root is not None:
+        upstream_roots.append(launcher_root)
+    pinned = {}
+    validate_producer(
+        "gc.build.code_review_report_path",
+        code_rows[0],
+        contract,
+        upstream_roots,
+        pinned,
+    )
+    if expected_gap:
+        validate_producer(
+            "gc.build.gap_analysis_report_path",
+            gap_rows[0],
+            contract,
+            upstream_roots,
+            pinned,
+        )
+    for pinned_path, expected_fingerprint in pinned.items():
+        observed_fingerprint = file_fingerprint(pinned_path)
+        if observed_fingerprint != expected_fingerprint:
+            raise GateError(f"file changed during validation: {pinned_path}")
+except Exception as exc:
+    raise SystemExit(f"artifact validation failed: {exc}")
+PY
+    )"; then
+      echo "review check: current code-review artifacts are invalid: $validation_output" >&2
+      return 1
+    fi
+  fi
+  printf '%s\n' "$canonical_report"
+}
+
 VERDICT="$(printf '%s\n' "$CURRENT_MATCHES" | jq -r '
   [
     .[] | select((.metadata["code_review.verdict"] // "") != "")
@@ -458,6 +1053,10 @@ if [ -z "$REVIEW_MODE" ]; then
   REVIEW_MODE="$(metadata_value "$PARENT_JSON" "gc.var.review_mode")"
 fi
 if [ "$REVIEW_MODE" = "report" ] && [ "$IMPLEMENTATION_PROVENANCE_REQUIRED" != "true" ]; then
+  if [ "$CURRENT_REPORT_TERMINAL_REQUIRED" = "true" ]; then
+    REPORT_MODE_PATH="$(validate_current_report_terminal)" || exit 1
+    approve "Implementation review current report terminal satisfied: $REPORT_MODE_PATH"
+  fi
   REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.build.code_review_report_path")"
   if [ -z "$REPORT_MODE_PATH" ]; then
     REPORT_MODE_PATH="$(metadata_value "$PARENT_JSON" "gc.build.review_report_path")"

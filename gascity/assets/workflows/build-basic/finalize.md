@@ -78,6 +78,7 @@ Use mapping objects for front matter; do not use scalar shortcuts such as
 - `workflow: {id: <workflow-root-id>, formula: build-basic}`
 - `methodology: {pack: gascity, name: build-basic}`
 - `producer: {formula: build-basic, stage: finalize, attempt: <positive integer>}`
+- Set `producer.attempt` to the current `gc.attempt` on every write or repair.
 - `status: approved` for successful finalization; use `status: blocked` only for
   the failure branch above
 - `implementation_snapshot: <exact review snapshot>`

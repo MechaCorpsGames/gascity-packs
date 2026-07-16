@@ -15,8 +15,10 @@ and identify an authoritative implementation worktree distinct from the
 launcher checkout. Put this exact member-to-worktree map in the QA context;
 missing or inconsistent proof is a blocking QA defect.
 
-Current interaction_mode is {{interaction_mode}}. Ask for credentials or a
-staging URL only when the flow cannot be tested otherwise.
+Current interaction_mode is {{interaction_mode}} and current review_mode is
+{{review_mode}}. Ask for credentials or a staging URL only when the flow cannot
+be tested otherwise. In report mode, prepare read-only evidence collection and
+do not authorize implementation changes.
 
 Close with `gc.outcome=pass`.
 

@@ -31,14 +31,23 @@ for every derived pack.
   (`needs = ["qa"]`); `finalize` is rewired to need `release-readiness`, and
   `publish` still needs `finalize`. Each anchor expands a check-gated loop
   (`implementation-review-approved.sh`; QA allows 6 attempts,
-  release-readiness 4) whose final lane owns `code_review.verdict=done|iterate`
-  for the loop: `synthesize-qa` for QA and `synthesize-release-readiness` for
-  release readiness. Their outputs are the approved QA summary recorded on the
+  release-readiness 4). QA synthesis records the semantic result; a
+  mode-selected terminal owns `done|iterate` for agent/interactive mode or
+  `reported` for non-mutating report mode. Release-readiness synthesis owns
+  `done|iterate` in agent/interactive mode and feeds a current-attempt
+  `reported` terminal in report mode. Their outputs are the QA summary recorded on the
   workflow root at `gc.build.qa_summary_path` before release readiness begins
-  and the approved readiness summary at
-  `gc.build.release_readiness_summary_path` before finalize begins
+  and the readiness summary at `gc.build.release_readiness_summary_path` before
+  finalize begins. Those summaries preserve `approved`, `changes_required`, or
+  `blocked`, and the final gate maps any report-mode findings to a blocked final
+  report
   (`gstack/assets/workflows/gstack-build/qa.md`,
   `gstack/assets/workflows/gstack-build/release-readiness.md`).
+  Each expansion finalizer is executable-check-gated so its root summary path
+  must equal the sole report terminal from the current loop epoch; stale,
+  duplicate, or non-canonical terminal evidence is rejected. The code-review
+  loop uses the same current-attempt terminal contract in report mode rather
+  than accepting a pre-existing workflow-root report path.
 - Methodology selectors: the pack ships one derived formula per base
   methodology contract, each declared with `extends` on the matching base:
   `gstack-planning` (`planning-base`), `gstack-decomposition`

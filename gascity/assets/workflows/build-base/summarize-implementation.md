@@ -46,6 +46,7 @@ Write the artifact as Markdown with YAML front matter, not JSON. Use mapping obj
 - `workflow: {id: <workflow-root-id>, formula: <root-workflow-formula>}`
 - `methodology: {pack: <pack-name>, name: <build-formula>}`
 - `producer: {formula: <build-formula>, stage: summarize-implementation, attempt: <positive integer>}`
+- Set `producer.attempt` to the current `gc.attempt` on every write or repair.
 - Use `status: approved` before closing; a successful canonical implementation
   proof must be approved.
 - `trace: {upstream: [...], coverage: [...]}`

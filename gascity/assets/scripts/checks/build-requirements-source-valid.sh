@@ -164,6 +164,12 @@ if not launch_convoy_id:
             f"expected=({expected_path}, {expected_hash}) "
             f"observed=({identity.get('path')}, {identity.get('hash')})"
         )
+    if len(upstream) != 1:
+        fail(
+            "unexpected internal planning source trace in requirements: "
+            f"expected_only=({expected_path}, {expected_hash}) "
+            f"observed_entries={len(upstream)}"
+        )
 
     print(
         "build requirements source valid: internal planning context "
@@ -193,14 +199,33 @@ for source_id in source_ids:
 
 requirements_path, upstream = requirements_upstream(root, root_id, work_dir)
 
-observed_source_traces = [
-    str(entry.get("path") or "")[len("beads/") :]
-    for entry in upstream
-    if isinstance(entry, dict)
-    and str(entry.get("path") or "").startswith("beads/")
-    and str(entry.get("hash") or "")
-    == "bead:" + str(entry.get("path") or "")[len("beads/") :]
-]
+observed_source_traces: list[str] = []
+malformed_source_traces: list[dict[str, Any]] = []
+for entry in upstream:
+    if not isinstance(entry, dict):
+        continue
+    raw_path = str(entry.get("path") or "").strip()
+    raw_hash = str(entry.get("hash") or "").strip()
+    has_bead_path = raw_path.startswith("beads/")
+    has_bead_hash = raw_hash.lower().startswith("bead:")
+    if not has_bead_path and not has_bead_hash:
+        continue
+
+    source_id = raw_path[len("beads/") :] if has_bead_path else ""
+    if (
+        not has_bead_path
+        or not has_bead_hash
+        or not source_id
+        or raw_hash != f"bead:{source_id}"
+    ):
+        malformed_source_traces.append({"path": raw_path, "hash": raw_hash})
+        continue
+    observed_source_traces.append(source_id)
+if malformed_source_traces:
+    fail(
+        "malformed launch source trace in requirements: "
+        f"launch_convoy={launch_convoy_id} observed={malformed_source_traces}"
+    )
 missing = [source_id for source_id in source_ids if source_id not in observed_source_traces]
 if missing:
     fail(
@@ -215,6 +240,15 @@ if duplicates:
     fail(
         "duplicate launch source trace in requirements: "
         f"launch_convoy={launch_convoy_id} duplicates={duplicates}"
+    )
+unexpected = sorted(
+    source_id for source_id in set(observed_source_traces) if source_id not in source_ids
+)
+if unexpected:
+    fail(
+        "unexpected launch source trace in requirements: "
+        f"launch_convoy={launch_convoy_id} unexpected={unexpected} "
+        f"expected={sorted(source_ids)}"
     )
 
 print(

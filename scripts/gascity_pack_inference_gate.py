@@ -22,6 +22,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -460,6 +461,134 @@ BUILD_BASIC_ARTIFACT_CONTRACTS = (
     ("gc.build.review_report_path", "gc.build.review.v1"),
     ("gc.build.final_report_path", "gc.build.final-report.v1"),
 )
+BUILD_ARTIFACT_STAGE_BY_KEY = {
+    "gc.build.requirements_path": "requirements",
+    "gc.build.plan_path": "plan",
+    "gc.build.decomposition_path": "decompose",
+    "gc.build.implementation_summary_path": "summarize-implementation",
+    "gc.build.review_report_path": "review",
+    "gc.build.final_report_path": "finalize",
+}
+BUILD_ARTIFACT_IDENTITY_PROFILES = {
+    "gascity": {
+        "build_formula": "build-basic",
+        "review_attempt": {
+            "source": "loop",
+            "ralph_step_id": "review.build-basic-review-loop",
+            "terminal_step_id": "review.report-review-findings",
+            "terminal_report_name": "apply-review-findings-report.md",
+        },
+        "methodology_names": {},
+        "workflow_formulas": {},
+        "producer_formulas": {
+            "gc.build.review_report_path": "build-basic-review",
+        },
+        "producer_stages": {},
+    },
+    "superpowers": {
+        "build_formula": "superpowers-build",
+        "review_attempt": {"source": "stage", "step_id": "review"},
+        "methodology_names": {
+            "gc.build.requirements_path": "superpowers-brainstorming",
+            "gc.build.plan_path": "writing-plans",
+            "gc.build.decomposition_path": "superpowers-decomposition",
+            "gc.build.review_report_path": "superpowers-code-review",
+        },
+        "workflow_formulas": {},
+        "producer_formulas": {
+            "gc.build.requirements_path": "superpowers-brainstorming",
+            "gc.build.review_report_path": "superpowers-code-review",
+        },
+        "producer_stages": {
+            "gc.build.review_report_path": "adapter-report",
+        },
+    },
+    "compound-engineering": {
+        "build_formula": "compound-build",
+        "review_attempt": {"source": "stage", "step_id": "review"},
+        "methodology_names": {
+            "gc.build.requirements_path": "ce-brainstorm",
+            "gc.build.plan_path": "ce-plan",
+            "gc.build.decomposition_path": "compound-decomposition",
+            "gc.build.review_report_path": "compound-review",
+            "gc.build.final_report_path": "ce-compound",
+        },
+        "workflow_formulas": {
+            "gc.build.review_report_path": "compound-review",
+        },
+        "producer_formulas": {
+            "gc.build.review_report_path": "compound-code-review",
+            "gc.build.final_report_path": "compound-resolution",
+        },
+        "producer_stages": {
+            "gc.build.review_report_path": "synthesize-code-review",
+            "gc.build.final_report_path": "synthesize-resolution",
+        },
+    },
+    "gstack": {
+        "build_formula": "gstack-build",
+        "review_attempt": {"source": "stage", "step_id": "review"},
+        "methodology_names": {
+            "gc.build.requirements_path": "office-hours",
+            "gc.build.plan_path": "autoplan",
+            "gc.build.decomposition_path": "gstack-decomposition",
+            "gc.build.review_report_path": "gstack-review",
+        },
+        "workflow_formulas": {
+            "gc.build.review_report_path": "gstack-code-review",
+        },
+        "producer_formulas": {
+            "gc.build.review_report_path": "gstack-code-review",
+        },
+        "producer_stages": {
+            "gc.build.review_report_path": "adapter-report",
+        },
+    },
+    "bmad": {
+        "build_formula": "bmad-build",
+        "review_attempt": {"source": "stage", "step_id": "review"},
+        "methodology_names": {
+            "gc.build.requirements_path": "bmad-prd",
+            "gc.build.plan_path": "bmad-create-architecture",
+            "gc.build.decomposition_path": "bmad-create-epics-and-stories",
+            "gc.build.review_report_path": "bmad-review",
+        },
+        "workflow_formulas": {
+            "gc.build.review_report_path": "bmad-review",
+        },
+        "producer_formulas": {
+            "gc.build.review_report_path": "bmad-code-review-flow",
+        },
+        "producer_stages": {
+            "gc.build.review_report_path": "synthesize-bmad-review",
+        },
+    },
+}
+BUILD_BASIC_STAGE_STEPS = {
+    "gc.build.requirements_path": "requirements",
+    "gc.build.plan_path": "plan",
+    "gc.build.decomposition_path": "decompose",
+    "gc.build.implementation_summary_path": "summarize-implementation",
+    "gc.build.final_report_path": "finalize",
+}
+BUILD_BASIC_PRE_REVIEW_ARTIFACT_KEYS = (
+    "gc.build.requirements_path",
+    "gc.build.plan_path",
+    "gc.build.decomposition_path",
+    "gc.build.implementation_summary_path",
+)
+BUILD_BASIC_SUCCESS_LIFECYCLE = {
+    "gc.outcome": "pass",
+    "gc.build.status": "completed",
+    "gc.build.finalize_status": "completed",
+    "gc.build.finalize_outcome": "success",
+}
+BUILD_BASIC_BLOCKED_LIFECYCLE = {
+    "gc.outcome": "fail",
+    "gc.build.status": "blocked",
+    "gc.build.finalize_status": "failed",
+    "gc.build.finalize_outcome": "failure",
+}
 DEFAULT_GATE = "all"
 DEFAULT_TIMEOUT = "75m"
 DEFAULT_POLL_INTERVAL = "5s"
@@ -3016,6 +3145,7 @@ def validate_build_artifact_schema(
     env: Mapping[str, str],
     context: str,
     upstream_roots: Sequence[Path] = (),
+    enforce_review_status_coverage: bool = False,
 ) -> None:
     validator = validator_source / "assets" / "scripts" / "validate_build_artifact.py"
     if not validator.is_file():
@@ -3030,6 +3160,8 @@ def validate_build_artifact_schema(
             str(artifact_path),
             "--verify-absolute-upstreams",
         ]
+        if enforce_review_status_coverage:
+            command.append("--enforce-review-status-coverage")
         for root in upstream_roots:
             command.extend(("--upstream-root", str(root.resolve(strict=True))))
         run_checked(
@@ -3182,14 +3314,31 @@ def validate_build_basic_artifacts(
     rig_dir: Path,
     env: Mapping[str, str],
     validator_source: Path,
+    beads: Sequence[Mapping[str, Any]] | None = None,
+    expected_artifact_root: Path | None = None,
+    pack_spec: PackSpec | None = None,
 ) -> None:
+    selected_pack = pack_spec or PACK_SPECS[GASCITY_PACK]
+    root_id = str(root_bead.get("id") or "").strip()
+    if not root_id:
+        raise GateError("build-basic artifact validation requires a workflow root id")
+    artifact_root = resolve_build_basic_artifact_root(
+        root_bead,
+        rig_dir=rig_dir,
+        expected_artifact_root=expected_artifact_root,
+    )
+    statuses: dict[str, str] = {}
+    artifact_paths: dict[str, Path] = {}
+    front_matters: dict[str, Mapping[str, Any]] = {}
     for metadata_key, schema in BUILD_BASIC_ARTIFACT_CONTRACTS:
         raw_path = metadata_value(root_bead, metadata_key)
         if not raw_path:
             raise GateError(f"build-basic root missing required artifact metadata {metadata_key}")
-        artifact_path = resolve_artifact_path(raw_path, base=rig_dir)
-        if not artifact_path.is_file():
-            raise GateError(f"build-basic artifact from {metadata_key} does not exist: {artifact_path}")
+        artifact_path = resolve_current_build_basic_artifact(
+            raw_path,
+            metadata_key=metadata_key,
+            artifact_root=artifact_root,
+        )
         validate_build_artifact_schema(
             artifact_path,
             schema=schema,
@@ -3197,8 +3346,431 @@ def validate_build_basic_artifacts(
             env=env,
             context=f"build-basic artifact from {metadata_key}",
             upstream_roots=(rig_dir,),
+            enforce_review_status_coverage=schema == "gc.build.review.v1",
         )
+        front_matter = artifact_front_matter(
+            artifact_path,
+            label=f"build-basic artifact from {metadata_key}",
+        )
+        validate_build_basic_artifact_identity(
+            front_matter,
+            metadata_key=metadata_key,
+            root_id=root_id,
+            pack_name=selected_pack.name,
+        )
+        status = front_matter.get("status")
+        statuses[metadata_key] = status.strip() if isinstance(status, str) else ""
+        artifact_paths[metadata_key] = artifact_path
+        front_matters[metadata_key] = front_matter
         print(f"validated build-basic artifact: {metadata_key} schema={schema} path={artifact_path}", flush=True)
+
+    validate_build_basic_artifact_lineage(
+        root_bead,
+        artifact_paths=artifact_paths,
+        front_matters=front_matters,
+        beads=beads,
+        pack_name=selected_pack.name,
+    )
+    validate_build_basic_stage_statuses(root_bead, statuses)
+
+
+def resolve_build_basic_artifact_root(
+    root_bead: Mapping[str, Any],
+    *,
+    rig_dir: Path,
+    expected_artifact_root: Path | None,
+) -> Path:
+    raw_root = metadata_value(root_bead, "gc.build.artifact_root").strip()
+    if not raw_root:
+        raise GateError("build-basic root is missing gc.build.artifact_root")
+    declared_root = Path(raw_root)
+    if not declared_root.is_absolute():
+        raise GateError(
+            f"build-basic gc.build.artifact_root must be absolute: {raw_root!r}"
+        )
+    try:
+        artifact_root = declared_root.resolve(strict=True)
+    except OSError as exc:
+        raise GateError(
+            f"build-basic gc.build.artifact_root does not resolve: {raw_root!r}: {exc}"
+        ) from exc
+    if not artifact_root.is_dir() or artifact_root != declared_root:
+        raise GateError(
+            "build-basic gc.build.artifact_root must name its canonical directory: "
+            f"declared={declared_root} canonical={artifact_root}"
+        )
+    rig_root = rig_dir.resolve(strict=True)
+    try:
+        artifact_root.relative_to(rig_root)
+    except ValueError as exc:
+        raise GateError(
+            "build-basic gc.build.artifact_root must stay inside the launcher rig: "
+            f"root={artifact_root} rig={rig_root}"
+        ) from exc
+    if expected_artifact_root is not None:
+        expected = expected_artifact_root.resolve(strict=True)
+        if artifact_root != expected:
+            raise GateError(
+                "build-basic gc.build.artifact_root does not match the current launch: "
+                f"observed={artifact_root} expected={expected}"
+            )
+    return artifact_root
+
+
+def resolve_current_build_basic_artifact(
+    raw_path: str,
+    *,
+    metadata_key: str,
+    artifact_root: Path,
+) -> Path:
+    declared = Path(raw_path)
+    if not declared.is_absolute():
+        raise GateError(
+            f"build-basic artifact {metadata_key} must be absolute: {raw_path!r}"
+        )
+    try:
+        mode = declared.lstat().st_mode
+        artifact_path = declared.resolve(strict=True)
+    except OSError as exc:
+        raise GateError(
+            f"build-basic artifact from {metadata_key} does not resolve: {declared}: {exc}"
+        ) from exc
+    if not stat.S_ISREG(mode) or artifact_path != declared:
+        raise GateError(
+            f"build-basic artifact {metadata_key} must be a canonical regular non-symlink file: "
+            f"declared={declared} canonical={artifact_path}"
+        )
+    try:
+        artifact_path.relative_to(artifact_root)
+    except ValueError as exc:
+        raise GateError(
+            f"build-basic artifact {metadata_key} must stay under the current artifact root: "
+            f"artifact={artifact_path} root={artifact_root}"
+        ) from exc
+    return artifact_path
+
+
+def validate_build_basic_artifact_identity(
+    front_matter: Mapping[str, Any],
+    *,
+    metadata_key: str,
+    root_id: str,
+    pack_name: str,
+) -> None:
+    profile = BUILD_ARTIFACT_IDENTITY_PROFILES.get(pack_name)
+    default_stage = BUILD_ARTIFACT_STAGE_BY_KEY.get(metadata_key)
+    if profile is None or default_stage is None:
+        raise GateError(
+            f"build artifact identity contract is missing for pack={pack_name} key={metadata_key}"
+        )
+    build_formula = str(profile["build_formula"])
+    expected_workflow_formula = profile["workflow_formulas"].get(
+        metadata_key, build_formula
+    )
+    expected_methodology_pack = pack_name
+    expected_methodology_name = profile["methodology_names"].get(
+        metadata_key, build_formula
+    )
+    expected_producer_formula = profile["producer_formulas"].get(
+        metadata_key, build_formula
+    )
+    expected_producer_stage = profile["producer_stages"].get(
+        metadata_key, default_stage
+    )
+    workflow = front_matter.get("workflow")
+    methodology = front_matter.get("methodology")
+    producer = front_matter.get("producer")
+    expected = {
+        "workflow.id": root_id,
+        "workflow.formula": expected_workflow_formula,
+        "methodology.pack": expected_methodology_pack,
+        "methodology.name": expected_methodology_name,
+        "producer.formula": expected_producer_formula,
+        "producer.stage": expected_producer_stage,
+    }
+    observed = {
+        "workflow.id": workflow.get("id") if isinstance(workflow, Mapping) else None,
+        "workflow.formula": workflow.get("formula") if isinstance(workflow, Mapping) else None,
+        "methodology.pack": methodology.get("pack") if isinstance(methodology, Mapping) else None,
+        "methodology.name": methodology.get("name") if isinstance(methodology, Mapping) else None,
+        "producer.formula": producer.get("formula") if isinstance(producer, Mapping) else None,
+        "producer.stage": producer.get("stage") if isinstance(producer, Mapping) else None,
+    }
+    for field, expected_value in expected.items():
+        if observed[field] != expected_value:
+            raise GateError(
+                f"build-basic artifact {metadata_key} {field} must equal {expected_value!r}; "
+                f"observed={observed[field]!r}"
+            )
+
+
+def require_exact_build_basic_upstream(
+    front_matter: Mapping[str, Any],
+    *,
+    artifact_key: str,
+    artifact_path: Path,
+    upstream_key: str,
+    upstream_path: Path,
+) -> None:
+    entries = artifact_upstream(
+        front_matter,
+        artifact_path=artifact_path,
+        label=f"build-basic artifact {artifact_key}",
+    )
+    expected_path = str(upstream_path)
+    expected_digest = f"sha256:{hashlib.sha256(upstream_path.read_bytes()).hexdigest()}"
+    observed = [
+        str(entry.get("hash") or "")
+        for entry in entries
+        if entry.get("path") == expected_path
+    ]
+    if observed != [expected_digest]:
+        raise GateError(
+            f"build-basic artifact {artifact_key} must trace exact current {upstream_key} once: "
+            f"path={expected_path} expected={expected_digest} observed={observed}"
+        )
+
+
+def build_basic_stage_attempt(
+    beads: Sequence[Mapping[str, Any]],
+    *,
+    root_id: str,
+    step_id: str,
+) -> int:
+    controls = [
+        bead
+        for bead in beads
+        if metadata_value(bead, "gc.root_bead_id") == root_id
+        and metadata_value(bead, "gc.kind") == "ralph"
+        and metadata_value(bead, "gc.step_id") == step_id
+    ]
+    if len(controls) != 1:
+        raise GateError(
+            f"build-basic current stage {step_id} must have exactly one logical control; "
+            f"observed={len(controls)}"
+        )
+    control = controls[0]
+    if str(control.get("status") or "") != "closed" or metadata_value(control, "gc.outcome") != "pass":
+        raise GateError(
+            f"build-basic current stage {step_id} control must be closed/pass"
+        )
+    raw_attempt = metadata_value(control, "gc.control_epoch").strip()
+    if not re.fullmatch(r"[1-9][0-9]*", raw_attempt):
+        raise GateError(
+            f"build-basic current stage {step_id} has invalid gc.control_epoch={raw_attempt!r}"
+        )
+    return int(raw_attempt)
+
+
+def build_basic_review_attempt(
+    beads: Sequence[Mapping[str, Any]],
+    *,
+    root_id: str,
+    review_path: Path,
+    pack_name: str,
+    ralph_step_id: str,
+    terminal_step_id: str,
+    terminal_report_name: str,
+) -> int:
+    member_rows = [
+        bead
+        for bead in beads
+        if metadata_value(bead, "gc.root_bead_id") == root_id
+        and metadata_value(bead, "gc.ralph_step_id") == ralph_step_id
+        and metadata_value(bead, "gc.scope_role") == "member"
+    ]
+    if not member_rows:
+        raise GateError(
+            f"build-basic {pack_name} review has no member rows from which to determine "
+            "the current attempt"
+        )
+    attempts: list[int] = []
+    for bead in member_rows:
+        raw_attempt = metadata_value(bead, "gc.attempt").strip()
+        if not re.fullmatch(r"[1-9][0-9]*", raw_attempt):
+            raise GateError(
+                "build-basic review member has invalid gc.attempt: "
+                f"bead={bead.get('id') or '<unknown>'} attempt={raw_attempt or '<missing>'}"
+            )
+        attempts.append(int(raw_attempt))
+    current_attempt = max(attempts)
+    report_terminal_path = review_path.parent / terminal_report_name
+    terminals = [
+        bead
+        for bead in member_rows
+        if metadata_value(bead, "gc.attempt") == str(current_attempt)
+        and metadata_value(bead, "gc.step_id") == terminal_step_id
+        and str(bead.get("status") or "") == "closed"
+        and metadata_value(bead, "gc.outcome") == "pass"
+        and metadata_value(bead, "code_review.verdict") == "reported"
+        and metadata_value(bead, "code_review.report_path") == str(report_terminal_path)
+        and metadata_value(bead, "code_review.output_path") == str(report_terminal_path)
+    ]
+    if len(terminals) != 1:
+        raise GateError(
+            f"build-basic current review attempt {current_attempt} must have exactly one "
+            f"closed/pass reported terminal at {report_terminal_path}; "
+            f"observed={[str(bead.get('id') or '<unknown>') for bead in terminals]}"
+        )
+    return current_attempt
+
+
+def validate_build_basic_artifact_lineage(
+    root_bead: Mapping[str, Any],
+    *,
+    artifact_paths: Mapping[str, Path],
+    front_matters: Mapping[str, Mapping[str, Any]],
+    beads: Sequence[Mapping[str, Any]] | None,
+    pack_name: str,
+) -> None:
+    root_id = str(root_bead.get("id") or "").strip()
+    review_key = "gc.build.review_report_path"
+    final_key = "gc.build.final_report_path"
+    summary_key = "gc.build.implementation_summary_path"
+    require_exact_build_basic_upstream(
+        front_matters[review_key],
+        artifact_key=review_key,
+        artifact_path=artifact_paths[review_key],
+        upstream_key=summary_key,
+        upstream_path=artifact_paths[summary_key],
+    )
+    require_exact_build_basic_upstream(
+        front_matters[final_key],
+        artifact_key=final_key,
+        artifact_path=artifact_paths[final_key],
+        upstream_key=summary_key,
+        upstream_path=artifact_paths[summary_key],
+    )
+    require_exact_build_basic_upstream(
+        front_matters[final_key],
+        artifact_key=final_key,
+        artifact_path=artifact_paths[final_key],
+        upstream_key=review_key,
+        upstream_path=artifact_paths[review_key],
+    )
+
+    if beads is None:
+        return
+    profile = BUILD_ARTIFACT_IDENTITY_PROFILES.get(pack_name)
+    review_attempt_contract = (
+        profile.get("review_attempt") if isinstance(profile, Mapping) else None
+    )
+    if not isinstance(review_attempt_contract, Mapping):
+        raise GateError(
+            f"build artifact review attempt contract is missing for pack={pack_name}"
+        )
+    expected_attempts = {
+        key: build_basic_stage_attempt(
+            beads,
+            root_id=root_id,
+            step_id=step_id,
+        )
+        for key, step_id in BUILD_BASIC_STAGE_STEPS.items()
+    }
+    review_attempt_source = review_attempt_contract.get("source")
+    if review_attempt_source == "stage":
+        review_step_id = str(review_attempt_contract.get("step_id") or "").strip()
+        if not review_step_id:
+            raise GateError(
+                f"build artifact review stage attempt contract is invalid for pack={pack_name}"
+            )
+        expected_attempts[review_key] = build_basic_stage_attempt(
+            beads,
+            root_id=root_id,
+            step_id=review_step_id,
+        )
+    elif review_attempt_source == "loop":
+        loop_fields = {
+            field: str(review_attempt_contract.get(field) or "").strip()
+            for field in (
+                "ralph_step_id",
+                "terminal_step_id",
+                "terminal_report_name",
+            )
+        }
+        if not all(loop_fields.values()):
+            raise GateError(
+                f"build artifact review loop attempt contract is invalid for pack={pack_name}"
+            )
+        expected_attempts[review_key] = build_basic_review_attempt(
+            beads,
+            root_id=root_id,
+            review_path=artifact_paths[review_key],
+            pack_name=pack_name,
+            **loop_fields,
+        )
+    else:
+        raise GateError(
+            f"build artifact review attempt source is invalid for pack={pack_name}: "
+            f"{review_attempt_source!r}"
+        )
+
+    for metadata_key, expected_attempt in expected_attempts.items():
+        producer = front_matters[metadata_key].get("producer")
+        observed = producer.get("attempt") if isinstance(producer, Mapping) else None
+        if observed != expected_attempt:
+            raise GateError(
+                f"build-basic artifact {metadata_key} producer.attempt must equal current "
+                f"stage attempt {expected_attempt}; observed={observed!r}"
+            )
+
+
+def validate_build_basic_stage_statuses(
+    root_bead: Mapping[str, Any],
+    statuses: Mapping[str, str],
+) -> None:
+    for metadata_key in BUILD_BASIC_PRE_REVIEW_ARTIFACT_KEYS:
+        status = statuses.get(metadata_key, "")
+        if status != "approved":
+            raise GateError(
+                f"build-basic pre-review artifact {metadata_key} must have status=approved; "
+                f"observed={status or '<missing>'}"
+            )
+
+    review_mode = metadata_value(root_bead, "gc.var.review_mode").strip()
+    if review_mode != "report":
+        raise GateError(
+            "build-basic inference gate requires review mode=report; "
+            f"observed={review_mode or '<missing>'}"
+        )
+
+    review_status = statuses.get("gc.build.review_report_path", "")
+    final_status = statuses.get("gc.build.final_report_path", "")
+    if review_status == "approved":
+        expected_final_status = "approved"
+        lifecycle = BUILD_BASIC_SUCCESS_LIFECYCLE
+        lifecycle_context = "approved final report"
+    elif review_status in {"changes_required", "blocked"}:
+        expected_final_status = "blocked"
+        lifecycle = BUILD_BASIC_BLOCKED_LIFECYCLE
+        lifecycle_context = (
+            f"report-mode review status={review_status} with blocked final report"
+        )
+    else:
+        raise GateError(
+            f"build-basic report-mode review status={review_status or '<missing>'} "
+            "cannot finalize"
+        )
+
+    if final_status != expected_final_status:
+        raise GateError(
+            f"build-basic report-mode review status={review_status} must map to "
+            f"final status={expected_final_status}; observed final status={final_status or '<missing>'}"
+        )
+
+    root_status = str(root_bead.get("status") or "")
+    if root_status != "closed":
+        raise GateError(
+            f"build-basic {lifecycle_context} requires root status=closed; "
+            f"observed={root_status or '<missing>'}"
+        )
+    for metadata_key, expected in lifecycle.items():
+        observed = metadata_value(root_bead, metadata_key).strip()
+        if observed != expected:
+            raise GateError(
+                f"build-basic {lifecycle_context} requires {metadata_key}={expected}; "
+                f"observed={observed or '<missing>'}"
+            )
 
 
 def resolve_artifact_path(value: str, *, base: Path) -> Path:
@@ -3924,7 +4496,17 @@ def run_build_gate(
     beads = list_beads(gc_bin, workspace, env=env)
     source_id = build_basic_source_id(beads)
     expected_member_ids = implementation_convoy_member_ids(gc_bin, workspace, root_bead, env=env)
-    validate_build_basic_artifacts(root_bead, rig_dir=workspace.rig_dir, env=env, validator_source=pack_spec.validator_source)
+    validate_build_basic_artifacts(
+        root_bead,
+        rig_dir=workspace.rig_dir,
+        env=env,
+        validator_source=pack_spec.validator_source,
+        beads=beads,
+        expected_artifact_root=(
+            workspace.rig_dir / build_artifact_root(pack_spec)
+        ),
+        pack_spec=pack_spec,
+    )
     validate_build_basic_source_provenance(
         root_bead,
         source_id=source_id,
