@@ -485,6 +485,69 @@ def test_supported_pack_nightly_excludes_volatile_database_telemetry_from_diagno
     ]
 
 
+def test_supported_pack_nightly_primes_diagnostics_before_setup_and_fails_closed_if_missing(
+    tmp_path,
+) -> None:
+    steps = supported_pack_nightly_document()["jobs"]["inference"]["steps"]
+    checkout_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == "Check out gascity-packs"
+    )
+    diagnostics_dir = "$RUNNER_TEMP/supported-pack-nightly/$MATRIX_PACK"
+    selected_row_guard = "steps.subset.outputs.run_gate == 'true'"
+    primes_diagnostics = any(
+        step.get("if") == selected_row_guard
+        and isinstance((script := step.get("run")), str)
+        and diagnostics_dir in script
+        and re.search(r"\bmkdir\s+-p\b", script)
+        and any(
+            "run-context.txt" in line
+            and (re.search(r"\btouch\b", line) or ">" in line or re.search(r"\btee\b", line))
+            for line in script.splitlines()
+        )
+        for step in steps[:checkout_index]
+    )
+    upload = next(step for step in steps if step.get("name") == "Upload inference gate diagnostics")
+
+    violations = []
+    if not primes_diagnostics:
+        violations.append(
+            "selected inference rows must create the diagnostics directory and run-context.txt "
+            "before checking out gascity-packs"
+        )
+    if upload["with"].get("if-no-files-found") != "error":
+        violations.append("diagnostics upload must set if-no-files-found: error")
+
+    assert not violations, "\n" + "\n".join(violations)
+
+    initialize = next(
+        step for step in steps if step.get("name") == "Initialize inference diagnostics"
+    )
+    result, _ = run_workflow_script(
+        initialize["run"],
+        tmp_path,
+        RUNNER_TEMP=str(tmp_path),
+        GITHUB_RUN_ID="123",
+        GITHUB_RUN_ATTEMPT="2",
+        MATRIX_PACK="gascity",
+        MATRIX_GATE="build-basic",
+        RUNTIME_REF="runtime-sha",
+        SETUP_REF="setup-sha",
+        PACK_REF="pack-sha",
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        tmp_path / "supported-pack-nightly" / "gascity" / "run-context.txt"
+    ).read_text(encoding="utf-8") == (
+        "run_id=123\n"
+        "run_attempt=2\n"
+        "pack=gascity\n"
+        "gate=build-basic\n"
+        "runtime_ref=runtime-sha\n"
+        "setup_ref=setup-sha\n"
+        "pack_ref=pack-sha\n"
+    )
+
+
 @pytest.mark.parametrize(
     ("selected_pack", "selected_gate", "expected"),
     (

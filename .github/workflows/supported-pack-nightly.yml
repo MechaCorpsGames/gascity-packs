@@ -384,6 +384,27 @@ jobs:
           echo "run_gate=$run_gate" >> "$GITHUB_OUTPUT"
           echo "nightly subset decision: pack=$MATRIX_PACK gate=$MATRIX_GATE run_gate=$run_gate"
 
+      - name: Initialize inference diagnostics
+        if: steps.subset.outputs.run_gate == 'true'
+        env:
+          MATRIX_PACK: ${{ matrix.pack }}
+          MATRIX_GATE: ${{ matrix.gate }}
+          RUNTIME_REF: ${{ needs.resolve-nightly-inputs.outputs.runtime_ref }}
+          SETUP_REF: ${{ needs.resolve-nightly-inputs.outputs.setup_ref }}
+          PACK_REF: ${{ needs.resolve-nightly-inputs.outputs.pack_ref }}
+        run: |
+          diagnostics_dir="$RUNNER_TEMP/supported-pack-nightly/$MATRIX_PACK"
+          mkdir -p "$diagnostics_dir"
+          {
+            printf 'run_id=%s\n' "$GITHUB_RUN_ID"
+            printf 'run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'pack=%s\n' "$MATRIX_PACK"
+            printf 'gate=%s\n' "$MATRIX_GATE"
+            printf 'runtime_ref=%s\n' "$RUNTIME_REF"
+            printf 'setup_ref=%s\n' "$SETUP_REF"
+            printf 'pack_ref=%s\n' "$PACK_REF"
+          } > "$diagnostics_dir/run-context.txt"
+
       - name: Check out gascity-packs
         if: steps.subset.outputs.run_gate == 'true'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -491,5 +512,5 @@ jobs:
             ${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}
             !${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/gc-home/.dolt/eventsData/**
             !${{ runner.temp }}/supported-pack-nightly/${{ matrix.pack }}/**/.beads/eventsData/**
-          if-no-files-found: ignore
+          if-no-files-found: error
           include-hidden-files: true
