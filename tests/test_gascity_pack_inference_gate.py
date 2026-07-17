@@ -495,6 +495,23 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert "include-hidden-files: true" in workflow
 
 
+def test_supported_pack_nightly_static_contracts_cover_flow_regression_suites() -> None:
+    document = supported_pack_nightly_document()
+    static_steps = document["jobs"]["static-contracts"]["steps"]
+    test_step = next(step for step in static_steps if step.get("name") == "Run supported-pack contract tests")
+
+    assert test_step["run"].split() == [
+        "python3",
+        "-m",
+        "pytest",
+        "tests/test_gascity_pack_inference_gate.py",
+        "gascity/tests/test_formula_assets.py",
+        "gascity/tests/test_derived_pack_compatibility.py",
+        "gascity/tests/test_validators.py",
+        "-q",
+    ]
+
+
 def test_supported_pack_nightly_excludes_volatile_database_telemetry_from_diagnostics() -> None:
     document = supported_pack_nightly_document()
     upload = next(

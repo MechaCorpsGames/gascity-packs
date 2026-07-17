@@ -300,7 +300,13 @@ jobs:
         run: python3 -m pip install PyYAML pytest
 
       - name: Run supported-pack contract tests
-        run: python3 -m pytest tests/test_gascity_pack_inference_gate.py gascity/tests/test_formula_assets.py -q
+        run: >-
+          python3 -m pytest
+          tests/test_gascity_pack_inference_gate.py
+          gascity/tests/test_formula_assets.py
+          gascity/tests/test_derived_pack_compatibility.py
+          gascity/tests/test_validators.py
+          -q
 
   inference:
     name: ${{ matrix.pack }} / ${{ matrix.gate }}
