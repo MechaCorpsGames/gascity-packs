@@ -26,7 +26,7 @@ table with `ID` and `Status` columns. Record the canonical absolute path before
 writing the final report:
 
 ```sh
-bd update "<workflow-root-id>" \
+gc bd update "<workflow-root-id>" \
   --set-metadata "gc.build.implementation_summary_path=<absolute path>"
 ```
 

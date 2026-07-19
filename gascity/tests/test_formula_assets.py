@@ -2798,7 +2798,7 @@ class FormulaAssetTests(unittest.TestCase):
             "gc.build.implementation-summary.v1",
             "gc.implementation.summary_path",
             "source anchors",
-            "bd update",
+            "gc bd update",
             "Do not create the final report",
         ):
             with self.subTest(fragment=fragment):
