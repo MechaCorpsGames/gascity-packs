@@ -228,7 +228,7 @@ def test_build_gate_env_uses_nightly_ollama_auth_shape(tmp_path) -> None:
     assert dolt_config["user.email"] == "gascity-pack-gate@example.invalid"
 
 
-def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matrix() -> None:
+def test_supported_pack_nightly_workflow_uses_manifold_shape_and_pack_matrix() -> None:
     workflow = (gascity_pack_inference_gate.REPO_ROOT / ".github" / "workflows" / "supported-pack-nightly.yml").read_text(
         encoding="utf-8"
     )
@@ -256,10 +256,17 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert "GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}" in workflow
     assert '--timeout "$GATE_TIMEOUT"' in workflow
     assert 'DOLT_VERSION: "2.1.0"' in workflow
-    assert "ANTHROPIC_BASE_URL: https://ollama.com" in workflow
-    assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
-    assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert "ANTHROPIC_BASE_URL: https://works.gascity.com/manifold-api" in workflow
+    assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.MANIFOLD_AUTH_TOKEN }}" in workflow
     assert "OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert "ANTHROPIC_API_KEY:" not in workflow
+    for model_var in (
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_HAIKU_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SONNET_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_OPUS_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SUBAGENT_MODEL",
+    ):
+        assert model_var in workflow
     expected_entries = (
         ("gascity", "review", "30m"),
         ("gascity", "build-basic", "90m"),
@@ -295,8 +302,11 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
     assert "\n  push:" not in workflow
     assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
     assert 'DOLT_VERSION: "2.1.0"' in workflow
-    assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
     assert "include-hidden-files: true" in workflow
+    assert "ANTHROPIC_BASE_URL: https://works.gascity.com/manifold-api" in workflow
+    assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.MANIFOLD_AUTH_TOKEN }}" in workflow
+    assert "OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert "ANTHROPIC_API_KEY:" not in workflow
 
 
 def test_ci_workflows_use_blacksmith_runner_labels() -> None:

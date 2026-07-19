@@ -133,14 +133,15 @@ jobs:
             timeout_minutes: 120
             gate_timeout: 110m
     env:
-      ANTHROPIC_BASE_URL: https://ollama.com
-      ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-      ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}
+      # Claude Code appends /v1/messages itself, so this base URL intentionally
+      # does not end in /v1.
+      ANTHROPIC_BASE_URL: https://works.gascity.com/manifold-api
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.MANIFOLD_AUTH_TOKEN }}
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_HAIKU_MODEL }}
-      ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_SONNET_MODEL }}
-      ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_OPUS_MODEL }}
-      CLAUDE_CODE_SUBAGENT_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_SUBAGENT_MODEL }}
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_HAIKU_MODEL }}
+      ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SONNET_MODEL }}
+      ANTHROPIC_DEFAULT_OPUS_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_OPUS_MODEL }}
+      CLAUDE_CODE_SUBAGENT_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SUBAGENT_MODEL }}
       CLAUDE_CODE_EFFORT_LEVEL: auto
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
       PYTHONUNBUFFERED: "1"
@@ -254,12 +255,12 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           "$(go env GOPATH)/bin/gc" version
 
-      - name: Validate Ollama Claude configuration
+      - name: Validate Manifold Claude configuration
         if: steps.subset.outputs.run_gate == 'true'
         run: |
           test -n "$OLLAMA_API_KEY" || { echo "Missing OLLAMA_API_KEY GitHub secret" >&2; exit 1; }
-          test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY resolved empty" >&2; exit 1; }
-          test -n "$ANTHROPIC_AUTH_TOKEN" || { echo "ANTHROPIC_AUTH_TOKEN resolved empty" >&2; exit 1; }
+          test -n "$ANTHROPIC_AUTH_TOKEN" || { echo "Missing MANIFOLD_AUTH_TOKEN GitHub secret" >&2; exit 1; }
+          test "$ANTHROPIC_BASE_URL" = "https://works.gascity.com/manifold-api" || { echo "ANTHROPIC_BASE_URL must be the Manifold base URL without /v1" >&2; exit 1; }
           test -n "$ANTHROPIC_DEFAULT_HAIKU_MODEL" || { echo "ANTHROPIC_DEFAULT_HAIKU_MODEL resolved empty" >&2; exit 1; }
           test -n "$ANTHROPIC_DEFAULT_SONNET_MODEL" || { echo "ANTHROPIC_DEFAULT_SONNET_MODEL resolved empty" >&2; exit 1; }
           test -n "$ANTHROPIC_DEFAULT_OPUS_MODEL" || { echo "ANTHROPIC_DEFAULT_OPUS_MODEL resolved empty" >&2; exit 1; }
