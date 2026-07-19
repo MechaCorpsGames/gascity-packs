@@ -220,10 +220,17 @@ def test_supported_pack_nightly_workflow_uses_tier_c_ollama_shape_and_pack_matri
     assert "max-parallel: 1" in workflow
     assert "runs-on: blacksmith-2vcpu-ubuntu-2404" in workflow
     assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
-    assert "ANTHROPIC_BASE_URL: https://ollama.com" in workflow
-    assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
-    assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert "ANTHROPIC_BASE_URL: https://works.gascity.com/manifold-api" in workflow
+    assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.MANIFOLD_AUTH_TOKEN }}" in workflow
     assert "OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert "ANTHROPIC_API_KEY:" not in workflow
+    for model_var in (
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_HAIKU_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SONNET_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_OPUS_MODEL",
+        "GC_WORKER_INFERENCE_CLAUDE_MANIFOLD_SUBAGENT_MODEL",
+    ):
+        assert model_var in workflow
     for pack in ("gascity", "superpowers", "compound-engineering", "gstack", "bmad", "gastown"):
         assert f"- pack: {pack}" in workflow
     assert '--pack "${{ matrix.pack }}"' in workflow
@@ -239,7 +246,10 @@ def test_dispatch_inference_workflow_is_not_the_scheduled_nightly() -> None:
     assert "workflow_dispatch:" in workflow
     assert "\n  schedule:" not in workflow
     assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
-    assert "ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert "ANTHROPIC_BASE_URL: https://works.gascity.com/manifold-api" in workflow
+    assert "ANTHROPIC_AUTH_TOKEN: ${{ secrets.MANIFOLD_AUTH_TOKEN }}" in workflow
+    assert "OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}" in workflow
+    assert "ANTHROPIC_API_KEY:" not in workflow
 
 
 def test_ci_workflows_use_blacksmith_runner_labels() -> None:
