@@ -1,6 +1,12 @@
 Use the installed Superpowers brainstorming guidance to produce an approved
 design candidate.
 
+Before drafting, read the setup context recorded on the workflow root as
+`gc.build.brainstorming_context_path`. Its `## Source Work Items` section is
+the authoritative requested outcome. Preserve every source constraint,
+acceptance criterion, and verification requirement in the design candidate;
+the formula title and a generic example are not substitutes for those items.
+
 This lane maps stock Superpowers checklist items 1-5. Track each item in the
 design candidate so the loop state is durable:
 

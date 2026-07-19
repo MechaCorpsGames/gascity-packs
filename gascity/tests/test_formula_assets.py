@@ -2804,6 +2804,42 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, finalize)
 
+    def test_superpowers_brainstorm_setup_preserves_source_convoy_context(self) -> None:
+        packs_root = pathlib.Path(__file__).resolve().parents[2]
+        setup = (
+            packs_root
+            / "superpowers"
+            / "assets"
+            / "workflows"
+            / "superpowers-brainstorming"
+            / "{target}.setup-superpowers-brainstorming.md"
+        ).read_text(encoding="utf-8")
+
+        for fragment in (
+            "gc.input_convoy_id",
+            "gc convoy status",
+            "gc bd show",
+            "source work item",
+            "Do not invent a replacement feature",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, setup)
+
+        brainstorm = (
+            packs_root
+            / "superpowers"
+            / "assets"
+            / "workflows"
+            / "superpowers-brainstorming"
+            / "{target}.brainstorm-design.md"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            "gc.build.brainstorming_context_path",
+            "Source Work Items",
+        ):
+            with self.subTest(asset="brainstorm", fragment=fragment):
+                self.assertIn(fragment, brainstorm)
+
     def test_superpowers_development_converts_subagent_reviews_to_fanout(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
         pack_root = packs_root / "superpowers"
