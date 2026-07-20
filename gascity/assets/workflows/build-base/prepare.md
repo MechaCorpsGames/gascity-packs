@@ -26,6 +26,43 @@ Launch inputs:
 
 Validate the target, artifact root, and optional context inputs. Record the normalized artifact paths on the workflow root bead so later stages can reuse them without inventing new locations.
 
+Before any downstream stage runs, capture the immutable source request in a
+shared context artifact. Read the workflow root with
+`gc bd show "<workflow-root-id>" --json`, obtain its original
+`gc.input_convoy_id`, inspect that convoy with
+`gc convoy status "<source-convoy-id>" --json`, and read every listed source
+work item with `gc bd show "<source-work-item-id>" --json`. This must happen
+in prepare, before decomposition can replace `gc.input_convoy_id` with an
+implementation convoy.
+
+Use `GC_RIG_ROOT` as the stable shared filesystem root. Resolve
+`{{artifact_root}}` to an absolute directory beneath `GC_RIG_ROOT` and write
+the context as `<absolute-artifact-root>/brainstorming-context.md`. Never resolve shared artifacts relative to the current worktree: each workflow lane
+gets a disposable worktree, so a path under the claimed bead's work directory
+is unavailable to later lanes. Require the resolved artifact root and context
+path to be absolute and to remain beneath `GC_RIG_ROOT`.
+
+The context file must contain a `## Source Work Items` section. For every
+source work item include its ID, title, complete description, constraints,
+acceptance criteria, and required verification. Treat this section as the
+authoritative requested outcome; an optional `context_path` only supplements
+it. Record the absolute context path on the workflow root before closing this
+step:
+
+```sh
+gc bd update "<workflow-root-id>" \
+  --set-metadata "gc.build.brainstorming_context_path=<absolute context path>" \
+  --set-metadata "gc.build.source_context_path=<absolute context path>"
+```
+
+Do not close prepare with `gc.outcome=pass` until that metadata points to the
+existing shared file. If the source convoy, a source item, the stable artifact
+path, or the metadata write cannot be obtained, fail closed: set
+`gc.build.status=blocked` and
+`gc.blocked_reason=missing-source-work-context` on the workflow root, then
+close prepare with `gc.outcome=fail`. In headless mode, never invent a generic
+replacement feature or ask a question in place of this source context.
+
 Validate mode inputs against the methodology vocabulary before any stage runs:
 `interaction_mode` must be `interactive`, `autonomous`, or `headless`;
 `review_mode` must be `report`, `agent`, or `interactive`; `drain_policy` must
