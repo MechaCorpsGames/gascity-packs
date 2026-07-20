@@ -2830,6 +2830,8 @@ class FormulaAssetTests(unittest.TestCase):
             "gc convoy status",
             "## Source Work Items",
             "gc.build.brainstorming_context_path",
+            "gc.var.artifact_root",
+            "Do not rely on unresolved template placeholders",
             "Never resolve shared artifacts relative to the current worktree",
         ):
             with self.subTest(asset="prepare", fragment=fragment):

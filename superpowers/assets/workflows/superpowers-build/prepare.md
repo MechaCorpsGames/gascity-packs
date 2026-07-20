@@ -1,26 +1,15 @@
 Prepare the Superpowers build context before the brainstorming graph expands.
 
-This is a complete override of the inherited `build-base` prepare step. Validate
-the launch inputs and persist their normalized values on the workflow root:
-
-- artifact_root: {{artifact_root}}
-- context_path: {{context_path}}
-- requirements_path: {{requirements_path}}
-- plan_path: {{plan_path}}
-- decomposition_path: {{decomposition_path}}
-- drain_policy: {{drain_policy}}
-- interaction_mode: {{interaction_mode}}
-- review_mode: {{review_mode}}
-- implementation_target: {{implementation_target}}
-- planning_formula: {{planning_formula}}
-- decomposition_formula: {{decomposition_formula}}
-- implementation_formula: {{implementation_formula}}
-- implementation_item_formula: {{implementation_item_formula}}
-- code_review_formula: {{code_review_formula}}
-- review_fix_formula: {{review_fix_formula}}
-- max_iterations: {{max_iterations}}
-- push: {{push}}
-- open_pr: {{open_pr}}
+This is a complete override of the inherited `build-base` prepare step. First
+read the workflow root with `gc bd show "<workflow-root-id>" --json`. Use its
+already-resolved `gc.var.*` metadata as the launch inputs, including
+`gc.var.artifact_root`, `gc.var.context_path`, `gc.var.requirements_path`,
+`gc.var.plan_path`, `gc.var.decomposition_path`, `gc.var.drain_policy`,
+`gc.var.interaction_mode`, `gc.var.review_mode`, the selected methodology
+formula names, `gc.var.max_iterations`, `gc.var.push`, and
+`gc.var.open_pr`. Do not rely on unresolved template placeholders in this
+external prompt. Persist normalized values back to the workflow root before
+any downstream stage runs.
 
 `interaction_mode` must be `interactive`, `autonomous`, or `headless`;
 `review_mode` must be `report`, `agent`, or `interactive`; and `drain_policy`
