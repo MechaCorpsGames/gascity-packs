@@ -54,6 +54,12 @@ description = "Superpowers brainstorming approval mode: autonomous or interactiv
 default = "autonomous"
 
 [[steps]]
+id = "prepare"
+title = "Prepare durable Superpowers build context"
+metadata = { "gc.run_target" = "gc.run-operator" }
+description_file = "../assets/workflows/superpowers-build/prepare.md"
+
+[[steps]]
 id = "requirements"
 title = "Superpowers brainstorm requirements"
 needs = ["prepare"]

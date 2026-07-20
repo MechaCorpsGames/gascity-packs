@@ -2812,6 +2812,29 @@ class FormulaAssetTests(unittest.TestCase):
 
     def test_superpowers_brainstorm_setup_preserves_source_convoy_context(self) -> None:
         packs_root = pathlib.Path(__file__).resolve().parents[2]
+        pack_root = packs_root / "superpowers"
+        build = load_formula(pack_root, "superpowers-build")
+        prepare_step = {step["id"]: step for step in build["steps"]}["prepare"]
+        self.assertEqual(prepare_step["metadata"]["gc.run_target"], "gc.run-operator")
+        self.assertEqual(
+            prepare_step["description_file"],
+            "../assets/workflows/superpowers-build/prepare.md",
+        )
+
+        prepare = (
+            pack_root / "assets" / "workflows" / "superpowers-build" / "prepare.md"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            "GC_RIG_ROOT",
+            "gc.input_convoy_id",
+            "gc convoy status",
+            "## Source Work Items",
+            "gc.build.brainstorming_context_path",
+            "Never resolve shared artifacts relative to the current worktree",
+        ):
+            with self.subTest(asset="prepare", fragment=fragment):
+                self.assertIn(fragment, prepare)
+
         setup = (
             packs_root
             / "superpowers"
