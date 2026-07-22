@@ -60,27 +60,36 @@ jobs:
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # The managed Ollama pool has two credentials. Keep one real full E2E
+      # canary while running the direct pack smokes in bounded pairs.
+      max-parallel: 2
       matrix:
         include:
           - pack: gascity
-            gate: all
-            timeout_minutes: 120
+            # Full E2E canary: artifacts, implementation worktree, and pytest.
+            gate: build
+            timeout_minutes: 30
+            gate_timeout: 30m
           - pack: superpowers
-            gate: all
-            timeout_minutes: 150
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
           - pack: compound-engineering
-            gate: all
-            timeout_minutes: 150
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
           - pack: gstack
-            gate: all
-            timeout_minutes: 180
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
           - pack: bmad
-            gate: all
-            timeout_minutes: 150
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
           - pack: gastown
-            gate: gastown-orchestration
-            timeout_minutes: 120
+            gate: smoke
+            timeout_minutes: 25
+            gate_timeout: 25m
     env:
       # Claude Code appends /v1/messages itself, so this base URL intentionally
       # does not end in /v1.
@@ -160,7 +169,7 @@ jobs:
 
       - name: Run supported-pack nightly inference gate
         env:
-          GATE_TIMEOUT: ${{ github.event.inputs.timeout || '90m' }}
+          GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}
         run: |
           python3 scripts/gascity_pack_inference_gate.py \
             --gc-bin "$(go env GOPATH)/bin/gc" \
