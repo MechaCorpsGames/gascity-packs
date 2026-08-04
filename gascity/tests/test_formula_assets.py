@@ -272,7 +272,7 @@ BUILD_ARTIFACT_VALIDATION_GATES = {
     ("build-basic", "requirements"): REQUIREMENTS_GATE,
     ("build-basic", "plan"): PLAN_GATE,
     ("build-basic", "decompose"): DECOMPOSITION_GATE,
-    ("build-basic", "review"): BUILD_REVIEW_GATE,
+    ("build-basic-review", "{target}"): BUILD_REVIEW_GATE,
     ("build-basic", "finalize"): FINAL_REPORT_GATE,
     ("build-from-requirements-base", "requirements"): REQUIREMENTS_GATE,
     ("build-from-plan-base", "plan"): PLAN_GATE,
@@ -1331,6 +1331,7 @@ class FormulaAssetTests(unittest.TestCase):
                 "implementation_target": "{{implementation_target}}",
             },
         )
+        self.assertNotIn("check", review_step)
         text = effective_formula_text(root, "build-basic")
         for fragment in (
             "generate-requirements",
@@ -3243,9 +3244,10 @@ description = "Override sink that writes the base triage report contract."
         for (formula_name, step_id), (schema, path_keys) in BUILD_ARTIFACT_VALIDATION_GATES.items():
             with self.subTest(formula=formula_name, step=step_id):
                 formula = load_formula(root, formula_name)
-                steps = {step["id"]: step for step in formula["steps"]}
-                self.assertIn(step_id, steps, f"{formula_name} lost producer step {step_id}")
-                step = steps[step_id]
+                nodes = formula.get("steps") or formula.get("template") or []
+                nodes_by_id = {node["id"]: node for node in nodes}
+                self.assertIn(step_id, nodes_by_id, f"{formula_name} lost producer node {step_id}")
+                step = nodes_by_id[step_id]
 
                 self.assertIn(
                     "check",

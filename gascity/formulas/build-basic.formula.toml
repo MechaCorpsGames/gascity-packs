@@ -112,14 +112,6 @@ expand = "build-basic-review"
 expand_vars = { implementation_target = "{{implementation_target}}" }
 description_file = "../assets/workflows/build-basic/review.md"
 
-[steps.check]
-max_attempts = 3
-
-[steps.check.check]
-mode = "exec"
-path = ".gc/scripts/checks/build-artifact-valid.sh"
-timeout = "5m"
-
 [[steps]]
 id = "finalize"
 title = "Finalize build-basic"
