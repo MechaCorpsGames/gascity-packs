@@ -75,6 +75,51 @@ def resolved_build_formula(pack_name: str, expected: dict) -> dict:
     )
 
 
+def expansion_default_vars(formula: dict) -> dict[str, str]:
+    defaults: dict[str, str] = {}
+    for name, definition in formula.get("vars", {}).items():
+        if isinstance(definition, dict) and "default" in definition:
+            defaults[name] = definition["default"]
+    return defaults
+
+
+def render_expansion_placeholders(value: str, variables: dict[str, str]) -> str:
+    for name, variable_value in variables.items():
+        value = value.replace(f"{{{name}}}", variable_value)
+    return value
+
+
+def artifact_validation_node(pack_name: str, step: dict) -> dict:
+    """Resolve an expanded producer to its terminal artifact-gate node."""
+    expansion = step.get("expand")
+    if not expansion:
+        return step
+
+    formula = base_contract.resolve_formula_from_dirs(
+        pack_formula_dirs(pack_name), expansion
+    )
+    terminal = next(
+        (
+            template
+            for template in formula.get("template", [])
+            if template.get("id") == "{target}"
+        ),
+        None,
+    )
+    if terminal is None:
+        return step
+
+    variables = expansion_default_vars(formula)
+    variables.update(step.get("expand_vars", {}))
+    rendered = dict(terminal)
+    metadata = dict(terminal.get("metadata", {}))
+    rendered["metadata"] = {
+        key: render_expansion_placeholders(value, variables)
+        for key, value in metadata.items()
+    }
+    return rendered
+
+
 def pack_methodology_metadata(pack_name: str, expected: dict) -> dict:
     data = base_contract.load_formula(PACKS_ROOT / pack_name, expected["formula"])
     methodology = data.get("metadata", {}).get("gc", {}).get("methodology")
@@ -406,7 +451,7 @@ class DerivedPackCompatibilityTests(unittest.TestCase):
                 for step_id, (schema, path_keys) in gates.items():
                     if step_id not in steps:
                         continue
-                    step = steps[step_id]
+                    step = artifact_validation_node(pack_name, steps[step_id])
                     with self.subTest(
                         pack=pack_name, formula=formula_name, step=step_id
                     ):
@@ -420,14 +465,31 @@ class DerivedPackCompatibilityTests(unittest.TestCase):
                             step["check"]["max_attempts"],
                             base_contract.BUILD_ARTIFACT_GATE_MAX_ATTEMPTS,
                         )
-                        self.assertEqual(
-                            step["check"]["check"],
-                            {
-                                "mode": "exec",
-                                "path": base_contract.BUILD_ARTIFACT_CHECK_SCRIPT,
-                                "timeout": "5m",
-                            },
-                        )
+                        expected_check = {
+                            "mode": "exec",
+                            "path": base_contract.BUILD_ARTIFACT_CHECK_SCRIPT,
+                            "timeout": "5m",
+                        }
+                        if pack_name == "superpowers" and step["check"]["check"][
+                            "path"
+                        ] == ".gc/scripts/checks/initial-review-adapter-valid.sh":
+                            adapter = (
+                                GASCITY_ROOT
+                                / "assets"
+                                / "scripts"
+                                / "checks"
+                                / "initial-review-adapter-valid.sh"
+                            )
+                            self.assertIn(
+                                '"$SCRIPT_DIR/build-artifact-valid.sh"',
+                                adapter.read_text(encoding="utf-8"),
+                                "the Superpowers adapter must compose the generic "
+                                "artifact-schema validator before its semantic gate",
+                            )
+                            expected_check["path"] = (
+                                ".gc/scripts/checks/initial-review-adapter-valid.sh"
+                            )
+                        self.assertEqual(step["check"]["check"], expected_check)
                         self.assertEqual(
                             step["metadata"]["gc.build.artifact_schema"], schema
                         )

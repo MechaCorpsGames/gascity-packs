@@ -136,7 +136,7 @@ title = "Superpowers request code review"
 needs = ["implement", "implement-same-session"]
 metadata = { "gc.run_target" = "superpowers.code-reviewer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.review_report_path" }
 expand = "superpowers-code-review"
-expand_vars = { implementation_target = "{{implementation_target}}" }
+expand_vars = { artifact_path_keys = "gc.build.review_report_path", artifact_root = "{{artifact_root}}", implementation_target = "{{implementation_target}}" }
 description_file = "../assets/workflows/superpowers-build/review.md"
 
 [[steps]]

@@ -1,0 +1,74 @@
+[pack]
+name = "gas-city-inc"
+version = "0.2.0"
+schema = 2
+description = "Internal business operations agent pack for Gas City, Inc."
+
+[agent_defaults]
+scope = "rig"
+append_fragments = ["slack-v0"]
+
+[[named_session]]
+name = "corp--penny"
+template = "penny"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--sam"
+template = "sam"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--clara"
+template = "clara"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--priya"
+template = "priya"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--maya"
+template = "maya"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--lawrence"
+template = "lawrence"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--francesca"
+template = "francesca"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--diego"
+template = "diego"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--eve"
+template = "eve"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--alex"
+template = "alex"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--ollie"
+template = "ollie"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--sky"
+template = "sky"
+mode = "on_demand"
+
+[[named_session]]
+name = "corp--riley"
+template = "riley"
+mode = "on_demand"

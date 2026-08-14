@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "enterprise-search@knowledge-work-plugins": true,
+    "productivity@knowledge-work-plugins": true
+  }
+}

@@ -1,0 +1,9 @@
+# Per-agent Manifold LLM attribution — standardized in-pack 2026-07-22.
+# `claude-attributed` routes this agent's launch through the gas-city-inc edge
+# shim, which swaps the shared fleet cell key for ollie's own mn_live_ key
+# (custody keyed by MANIFOLD_IDENTITY_ID) so their Claude inference stamps
+# spend.key_id=ollie.
+provider = "claude-attributed"
+
+[env]
+MANIFOLD_IDENTITY_ID = "ollie"

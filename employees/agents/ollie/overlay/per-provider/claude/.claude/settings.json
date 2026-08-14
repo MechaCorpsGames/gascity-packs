@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "feature-dev@claude-code-marketplace": true,
+    "pr-review-toolkit@claude-code-marketplace": true
+  }
+}

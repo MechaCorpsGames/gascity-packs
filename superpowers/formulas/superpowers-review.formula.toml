@@ -10,6 +10,10 @@ internal = true
 mode = "report"
 
 [vars]
+[vars.artifact_root]
+description = "Rig-relative directory for review context and review artifacts."
+default = ".gc/inference-gate"
+
 [vars.implementation_target]
 description = "Superpowers task implementation role used for review fixes."
 default = "superpowers.implementer"
@@ -20,5 +24,5 @@ title = "Run Superpowers review"
 needs = ["validate-context"]
 metadata = { "gc.run_target" = "superpowers.code-reviewer", "gc.build.artifact_schema" = "gc.build.review.v1", "gc.build.artifact_path_keys" = "gc.build.review_report_path,gc.var.report_path" }
 expand = "superpowers-code-review"
-expand_vars = { implementation_target = "{{implementation_target}}" }
+expand_vars = { artifact_root = "{{artifact_root}}", implementation_target = "{{implementation_target}}" }
 description_file = "../assets/workflows/superpowers-review/write-report.md"
