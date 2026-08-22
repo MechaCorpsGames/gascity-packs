@@ -56,7 +56,10 @@ if [ "$#" -eq 0 ]; then
   LAUNCHER_RAW="$(metadata_value "$ROOT_JSON" "gc.work_dir")"
   # gc.work_dir reaches the item run's workflow root from a reconcile tick that
   # fires after the first step is in_progress, and the drain path never stamps
-  # it, so an early attempt can legitimately read it empty. Fail closed and let
+  # it, so an early attempt can legitimately read it empty. The reconciler also
+  # refuses the back-fill for pooled/ephemeral claimant sessions; there the
+  # writer is the prepare step's operator, whose prompt has it record its
+  # verified rig root on the workflow root. Fail closed and let
   # the check's retry budget cover the gap: inferring a launcher root from $PWD
   # would build the drain's worktree in whatever repository this check happened
   # to run from, which is far worse than one retry.
