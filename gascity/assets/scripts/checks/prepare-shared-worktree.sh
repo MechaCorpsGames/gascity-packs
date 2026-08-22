@@ -25,13 +25,19 @@ command -v git >/dev/null 2>&1 || fail "git is required on PATH"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required on PATH"
 
 metadata_value() {
-  # metadata_value <json> <key> -> prints metadata[key] or empty
+  # metadata_value <json> <key> -> prints metadata[key] or empty.
+  # `gc bd show --json` marshals a one-element list on the routed path and a
+  # bare object elsewhere, so both shapes have to unwrap.
   printf '%s' "$1" | python3 -c '
 import json
 import sys
 
 key = sys.argv[1]
-data = json.load(sys.stdin)
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    print("")
+    raise SystemExit(0)
 if isinstance(data, list):
     data = data[0] if data else {}
 metadata = data.get("metadata") if isinstance(data, dict) else {}
@@ -117,7 +123,12 @@ if [ ! -e "$WORKTREE" ]; then
   # on the launcher's local HEAD: the launcher checkout can be behind origin, and
   # a drain based on a stale commit redoes work that already landed. Read the
   # local ref first and only touch the network if it is missing.
-  DEFAULT_BRANCH=$(git -C "$LAUNCHER_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+  #
+  # Both reads end in `|| true` because an unset ref makes `git symbolic-ref`
+  # exit 128, and under `set -euo pipefail` that status propagates out of the
+  # assignment and kills the script -- silently, before the refresh below can
+  # run. The empty string is the answer this branch is written to handle.
+  DEFAULT_BRANCH=$(git -C "$LAUNCHER_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)
   if [ -z "$DEFAULT_BRANCH" ]; then
     # refs/remotes/origin/HEAD is written by `git clone` and refreshed by
     # `git remote set-head origin --auto`. It is NOT written by `git init` plus
@@ -125,12 +136,26 @@ if [ ! -e "$WORKTREE" ]; then
     # checkouts are built, so this refresh is load-bearing rather than
     # defensive. The fetch below still guarantees the base is current.
     git -C "$LAUNCHER_ROOT" remote set-head origin --auto >/dev/null 2>&1 || true
-    DEFAULT_BRANCH=$(git -C "$LAUNCHER_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+    DEFAULT_BRANCH=$(git -C "$LAUNCHER_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)
   fi
   [ -n "$DEFAULT_BRANCH" ] || fail "cannot resolve the remote default branch in $LAUNCHER_ROOT"
-  git -C "$LAUNCHER_ROOT" fetch --prune origin "$DEFAULT_BRANCH" >/dev/null 2>&1 || fail "cannot fetch origin/$DEFAULT_BRANCH in $LAUNCHER_ROOT"
+
+  # Exec checks run under a sandboxed gate environment with no SSH agent and no
+  # inherited GIT_* configuration, so a credentialed fetch can fail in ways that
+  # are invisible unless git's own diagnosis is carried into the failure.
+  if ! GIT_ERR="$(git -C "$LAUNCHER_ROOT" fetch --prune origin "$DEFAULT_BRANCH" 2>&1 >/dev/null)"; then
+    fail "cannot fetch origin/$DEFAULT_BRANCH in $LAUNCHER_ROOT: $GIT_ERR"
+  fi
+
   mkdir -p "$(dirname "$WORKTREE")"
-  git -C "$LAUNCHER_ROOT" worktree add --detach "$WORKTREE" "origin/$DEFAULT_BRANCH" >/dev/null || fail "failed to create shared worktree: $WORKTREE"
+  # Drop registrations whose directories are gone. Our worktrees live inside the
+  # launcher checkout, so a stray clean or `rm -rf` leaves a live registration
+  # that makes every later `worktree add` refuse for the whole retry budget.
+  # Prune only forgets worktrees that are already missing from disk.
+  git -C "$LAUNCHER_ROOT" worktree prune >/dev/null 2>&1 || true
+  if ! GIT_ERR="$(git -C "$LAUNCHER_ROOT" worktree add --detach "$WORKTREE" "origin/$DEFAULT_BRANCH" 2>&1 >/dev/null)"; then
+    fail "failed to create shared worktree $WORKTREE: $GIT_ERR"
+  fi
 fi
 
 # Reuse skips the fetch on purpose. Later items must see the commits earlier
