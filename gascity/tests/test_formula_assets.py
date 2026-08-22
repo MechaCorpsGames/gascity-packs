@@ -3757,6 +3757,13 @@ class FormulaAssetTests(unittest.TestCase):
             "Do not read, edit, test, stage, or commit product source",
             "fails closed",
             "Do not invoke provider-native subagents",
+            # The reconcile back-fill of gc.work_dir is refused for pooled and
+            # ephemeral claimant sessions, so the operator has to be able to
+            # record it from its own verified working directory. Without this
+            # the gate is unreachable in those deployments.
+            "If the workflow root has no `gc.work_dir`, record it",
+            "--set-metadata gc.work_dir=",
+            "never a guess",
         ):
             with self.subTest(step=SHARED_WORKTREE_WRITER_STEP, fragment=fragment):
                 self.assertIn(fragment, node_description(root, prepare))
@@ -3816,9 +3823,11 @@ class FormulaAssetTests(unittest.TestCase):
         """
         packs_root = pathlib.Path(__file__).resolve().parents[2]
         gascity_formulas = packs_root / "gascity" / "formulas"
+        pack_formula_dirs = sorted(packs_root.glob("*/formulas"))
 
         sites = 0
-        for formulas_dir in sorted(packs_root.glob("*/formulas")):
+        gascity_item_formulas: set[str] = set()
+        for formulas_dir in pack_formula_dirs:
             formula_dirs = [gascity_formulas]
             if formulas_dir != gascity_formulas:
                 formula_dirs.append(formulas_dir)
@@ -3830,6 +3839,8 @@ class FormulaAssetTests(unittest.TestCase):
                         continue
                     sites += 1
                     item_formula = drain["formula"]
+                    if formulas_dir == gascity_formulas:
+                        gascity_item_formulas.add(item_formula)
                     with self.subTest(
                         pack=formulas_dir.parent.name,
                         formula=path.name,
@@ -3843,6 +3854,28 @@ class FormulaAssetTests(unittest.TestCase):
                             ),
                             [],
                         )
+
+        # gascity's own shared drains were only resolved under pure-gascity
+        # layering above, but a derived pack can ship a formula of the same name
+        # and shadow it. Re-resolve those item formulas under every pack's
+        # layering, so a pack that overrides `do-work-item` without the writer
+        # is caught rather than silently exempt.
+        for formulas_dir in pack_formula_dirs:
+            if formulas_dir == gascity_formulas:
+                continue
+            for item_formula in sorted(gascity_item_formulas):
+                with self.subTest(
+                    shadowing_pack=formulas_dir.parent.name, item_formula=item_formula
+                ):
+                    self.assertEqual(
+                        shared_drain_worktree_violations(
+                            item_formula,
+                            resolve_formula_from_dirs(
+                                [gascity_formulas, formulas_dir], item_formula
+                            ),
+                        ),
+                        [],
+                    )
 
         # A floor, not a pin: it catches a sweep that quietly stopped finding
         # anything. Removing a shared drain means lowering this deliberately.
