@@ -15,6 +15,5 @@ Start with [The City Life vision](./assets/specs/vision/city-life-vision.md).
 - [Citizen memory acceptance plan](./assets/specs/plans/citizen-city.md)
 - [Homepage collaboration test](./assets/specs/plans/homepage-test.md)
 - [Architecture decision records](./assets/specs/adr/)
-- [Research and evidence](./assets/specs/research/)
 
 The complete specification tree lives under [`assets/specs/`](./assets/specs/).
