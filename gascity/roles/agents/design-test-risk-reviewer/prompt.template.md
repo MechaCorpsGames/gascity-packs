@@ -117,7 +117,20 @@ while true; do
   CLAIM_ROOT="$(printf '%s' "$CLAIM_JSON" | json_pick root_bead_id)"
   CLAIM_GROUP="$(printf '%s' "$CLAIM_JSON" | json_pick continuation_group)"
 
-  if [ -n "$EXPECTED_ASSIGNEE" ] && [ "$CLAIM_ASSIGNEE" != "$EXPECTED_ASSIGNEE" ]; then
+  # The claim hook writes the OCCUPANT identity (the session bead id) for
+  # unaliased pool workers and the alias for aliased ones; older binaries wrote
+  # the slot-derived session name. All of these are OUR identities, so verify
+  # membership in the session's own identity set instead of insisting on one
+  # precomputed form -- a strict single-form compare rejected our own claim
+  # forever after the writer moved to the occupant id (ga-jrnou).
+  ASSIGNEE_OK=""
+  for OWN_ID in "${BEADS_ACTOR:-}" "${GC_ALIAS:-}" "${GC_SESSION_ID:-}" "${GC_SESSION_NAME:-}" "${GC_AGENT:-}"; do
+    if [ -n "$OWN_ID" ] && [ "$CLAIM_ASSIGNEE" = "$OWN_ID" ]; then
+      ASSIGNEE_OK=1
+      break
+    fi
+  done
+  if [ -z "$ASSIGNEE_OK" ]; then
     echo "CLAIM_REJECTED assignee mismatch for $WORK_ID"
     sleep 2
     continue
