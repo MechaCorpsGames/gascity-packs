@@ -19,6 +19,7 @@ import {
 import {
   createStructuredFeedController,
   createCityOperationWatcher,
+  type CityOperationSnapshot,
   type CityOperationWatcher,
   type PendingInteraction,
   type StructuredFeedController,
@@ -75,6 +76,18 @@ function mutationFailure(action: string, reason: unknown): { message: string; re
     return { message: `${action} outcome unknown: ${detail}`, refresh: true }
   }
   return { message: `${action} outcome unknown: ${detail}`, refresh: true }
+}
+
+function operationOutcomeUnknownDetail(snapshot: CityOperationSnapshot): string {
+  const payload = snapshot.terminal?.payload
+  if (typeof payload === 'object' && payload !== null && 'error_message' in payload
+    && typeof payload.error_message === 'string' && payload.error_message !== '') {
+    const code = 'error_code' in payload && typeof payload.error_code === 'string' && payload.error_code !== ''
+      ? ` ${payload.error_code}`
+      : ''
+    return `Supervisor reported${code}: ${payload.error_message}`
+  }
+  return `Supervisor result watch ended with ${snapshot.unknownReason ?? 'an unknown reason'}`
 }
 
 const gasCityStyles = `
@@ -264,6 +277,8 @@ function GasCityWorkspace(): React.JSX.Element {
   const [topologySearch, setTopologySearch] = useState('')
   const [loadingMoreSessions, setLoadingMoreSessions] = useState(false)
   const loadMoreAbortRef = useRef<AbortController | null>(null)
+  const selectionRef = useRef({ connectionId: selectedConnectionId, cityName: selectedCityName })
+  selectionRef.current = { connectionId: selectedConnectionId, cityName: selectedCityName }
 
   useEffect(() => {
     const abort = new AbortController()
@@ -419,6 +434,15 @@ function GasCityWorkspace(): React.JSX.Element {
     })
   }
 
+  const refreshSelectedTopology = async (): Promise<void> => {
+    const connectionId = selectedConnectionId
+    const cityName = selectedCityName
+    if (connectionId === null || cityName === null) throw new Error('No Gas City is selected')
+    const refreshed = await loadCityTopology(connectionId, cityName, AbortSignal.timeout(15_000))
+    const current = selectionRef.current
+    if (current.connectionId === connectionId && current.cityName === cityName) setTopology(refreshed)
+  }
+
   return (
     <section className="gc-workspace" role="dialog" aria-label="Gas City">
       <style>{gasCityStyles}</style>
@@ -519,6 +543,7 @@ function GasCityWorkspace(): React.JSX.Element {
           cityName={selectedCityName}
           agent={selectedAgent}
           onCreated={selectCreatedSession}
+          onOutcomeUnknown={refreshSelectedTopology}
         />
       )}
       {selectedConnectionId !== null && selectedCityName !== null && selectedSession !== null && (
@@ -540,23 +565,39 @@ function DraftSessionWorkspace({
   cityName,
   agent,
   onCreated,
+  onOutcomeUnknown,
 }: {
   connectionId: string
   cityName: string
   agent: AgentSummary
   onCreated: (session: SessionSummary) => void
+  onOutcomeUnknown: () => Promise<void>
 }): React.JSX.Element {
   const [operations] = useState(() => createSupervisorOperations({ connectionId, cityName }))
   const [draft, setDraft] = useState('')
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
+  const [retryBlocked, setRetryBlocked] = useState(false)
   const [operation, setOperation] = useState<{ watcher: CityOperationWatcher; prompt: string } | null>(null)
 
+  const handleAcceptedOutcomeUnknown = async (detail: string): Promise<void> => {
+    setOperation(null)
+    setRetryBlocked(true)
+    try {
+      await onOutcomeUnknown()
+      setCreateError(`Create outcome unknown: ${detail}. Session inventory refreshed; inspect sessions before retrying.`)
+    } catch (refreshReason) {
+      const refreshDetail = refreshReason instanceof Error ? refreshReason.message : String(refreshReason)
+      setCreateError(`Create outcome unknown: ${detail}. Session inventory refresh failed: ${refreshDetail}. Inspect Gas City before retrying.`)
+    }
+  }
+
   const create = async (): Promise<void> => {
-    if (draft.trim() === '' || creating || operation !== null) return
+    if (draft.trim() === '' || creating || operation !== null || retryBlocked) return
     const prompt = draft
     setCreating(true)
     setCreateError(null)
+    setRetryBlocked(false)
     try {
       const accepted = await operations.createAgentSession(agent.name, prompt)
       const watcher = createCityOperationWatcher(operations.cityOperationPort, accepted)
@@ -564,9 +605,18 @@ function DraftSessionWorkspace({
       await watcher.start()
     } catch (reason) {
       const detail = reason instanceof Error ? reason.message : String(reason)
-      setCreateError(reason instanceof SupervisorRequestError
-        ? `Session failed to start: ${detail}`
-        : `Create outcome unknown: ${detail}`)
+      if (reason instanceof SupervisorRequestError) {
+        setCreateError(`Session failed to start: ${detail}`)
+      } else {
+        setRetryBlocked(true)
+        try {
+          await onOutcomeUnknown()
+          setCreateError(`Create outcome unknown: ${detail}. Session inventory refreshed; inspect sessions before retrying.`)
+        } catch (refreshReason) {
+          const refreshDetail = refreshReason instanceof Error ? refreshReason.message : String(refreshReason)
+          setCreateError(`Create outcome unknown: ${detail}. Session inventory refresh failed: ${refreshDetail}. Inspect Gas City before retrying.`)
+        }
+      }
     } finally {
       setCreating(false)
     }
@@ -579,9 +629,26 @@ function DraftSessionWorkspace({
         {agent.provider !== undefined && <span>{agent.provider}</span>}
       </header>
       {operation !== null && (
-        <CreateOperation watcher={operation.watcher} prompt={operation.prompt} onCreated={onCreated} />
+        <CreateOperation
+          watcher={operation.watcher}
+          prompt={operation.prompt}
+          onCreated={onCreated}
+          onFailed={detail => {
+            setOperation(null)
+            setCreateError(`Session failed to start: ${detail}`)
+          }}
+          onOutcomeUnknown={detail => void handleAcceptedOutcomeUnknown(detail)}
+        />
       )}
       {createError !== null && <p role="alert">{createError}</p>}
+      {retryBlocked && (
+        <button type="button" onClick={() => {
+          setRetryBlocked(false)
+          setCreateError(null)
+        }}>
+          I checked sessions; allow retry
+        </button>
+      )}
       <label>
         <span>Message {agent.name}</span>
         <textarea
@@ -593,7 +660,7 @@ function DraftSessionWorkspace({
       </label>
       <button
         type="button"
-        disabled={creating || operation !== null || draft.trim() === ''}
+        disabled={creating || operation !== null || retryBlocked || draft.trim() === ''}
         onClick={() => void create()}
       >
         Start session
@@ -606,16 +673,38 @@ function CreateOperation({
   watcher,
   prompt,
   onCreated,
+  onFailed,
+  onOutcomeUnknown,
 }: {
   watcher: CityOperationWatcher
   prompt: string
   onCreated: (session: SessionSummary) => void
+  onFailed: (detail: string) => void
+  onOutcomeUnknown: (detail: string) => void
 }): React.JSX.Element {
   const snapshot = useSyncExternalStore(watcher.subscribe, watcher.getSnapshot)
   const [terminalError, setTerminalError] = useState<string | null>(null)
+  const terminalHandled = useRef(false)
   useEffect(() => () => watcher.dispose(), [watcher])
   useEffect(() => {
+    if (terminalHandled.current) return
+    if (snapshot.phase === 'outcome_unknown') {
+      terminalHandled.current = true
+      onOutcomeUnknown(operationOutcomeUnknownDetail(snapshot))
+      return
+    }
+    if (snapshot.phase === 'failed' && snapshot.terminal !== null) {
+      terminalHandled.current = true
+      const payload = snapshot.terminal.payload
+      const detail = typeof payload === 'object' && payload !== null && 'error_message' in payload
+        && typeof payload.error_message === 'string'
+        ? payload.error_message
+        : 'Supervisor reported request failure'
+      onFailed(detail)
+      return
+    }
     if (snapshot.phase !== 'succeeded' || snapshot.terminal === null) return
+    terminalHandled.current = true
     const payload = snapshot.terminal.payload
     if (typeof payload !== 'object' || payload === null || !('session' in payload)) return
     const session = payload.session
@@ -624,7 +713,7 @@ function CreateOperation({
     } catch (reason) {
       setTerminalError(reason instanceof Error ? reason.message : String(reason))
     }
-  }, [onCreated, snapshot.phase, snapshot.terminal])
+  }, [onCreated, onFailed, onOutcomeUnknown, snapshot.phase, snapshot.terminal, snapshot.unknownReason])
   const label = terminalError !== null
     ? 'Session result incompatible'
     : snapshot.phase === 'succeeded'
@@ -881,7 +970,9 @@ function SessionWorkspace({
   const [draft, setDraft] = useState('')
   const [sending, setSending] = useState(false)
   const [submitError, setSubmitError] = useState<string | null>(null)
+  const [submitRetryBlocked, setSubmitRetryBlocked] = useState(false)
   const [submission, setSubmission] = useState<{ watcher: CityOperationWatcher; prompt: string } | null>(null)
+  const [submissionNotice, setSubmissionNotice] = useState<{ label: string; prompt: string } | null>(null)
   const [controlBusy, setControlBusy] = useState<SessionControl | null>(null)
   const [controlNotice, setControlNotice] = useState<string | null>(null)
   const [controlError, setControlError] = useState<string | null>(null)
@@ -908,11 +999,29 @@ function SessionWorkspace({
   useEffect(() => setTitleDraft(session.title || session.id), [session.id, session.title])
   useEffect(() => setPermissionDraft(currentPermissionMode), [currentPermissionMode])
 
+  const handleSubmitOutcomeUnknown = async (prompt: string, detail: string): Promise<void> => {
+    setSubmission(null)
+    setSubmissionNotice(null)
+    setDraft(prompt)
+    setSubmitRetryBlocked(true)
+    try {
+      const refreshed = await operations.fetchSession(session.id)
+      onSessionChanged(refreshed)
+      await controller.bootstrap({ sessionId: session.id })
+      setSubmitError(`Submit outcome unknown: ${detail}. Inspect the authoritative transcript before retrying.`)
+    } catch (refreshReason) {
+      const refreshDetail = refreshReason instanceof Error ? refreshReason.message : String(refreshReason)
+      setSubmitError(`Submit outcome unknown: ${detail}. Authoritative refresh failed: ${refreshDetail}. Inspect Gas City before retrying.`)
+    }
+  }
+
   const submit = async (intent?: SubmitIntent): Promise<void> => {
-    if (draft.trim() === '' || sending) return
+    if (draft.trim() === '' || sending || submitRetryBlocked) return
     const prompt = draft
     setSending(true)
     setSubmitError(null)
+    setSubmitRetryBlocked(false)
+    setSubmissionNotice(null)
     try {
       const accepted = await operations.submitSession(session.id, prompt, intent)
       const watcher = createCityOperationWatcher(operations.cityOperationPort, accepted)
@@ -921,9 +1030,11 @@ function SessionWorkspace({
       await watcher.start()
     } catch (reason) {
       const detail = reason instanceof Error ? reason.message : String(reason)
-      setSubmitError(reason instanceof SupervisorRequestError
-        ? `Submission rejected: ${detail}`
-        : `Submit outcome unknown: ${detail}`)
+      if (reason instanceof SupervisorRequestError) {
+        setSubmitError(`Submission rejected: ${detail}`)
+      } else {
+        await handleSubmitOutcomeUnknown(prompt, detail)
+      }
     } finally {
       setSending(false)
     }
@@ -1183,26 +1294,55 @@ function SessionWorkspace({
         ))}
       </section>
       <PendingInteractions controller={controller} pending={snapshot.pending} />
-      {submission !== null && <SubmissionOperation watcher={submission.watcher} prompt={submission.prompt} />}
+      {submission !== null && (
+        <SubmissionOperation
+          watcher={submission.watcher}
+          prompt={submission.prompt}
+          onSucceeded={() => {
+            setSubmission(null)
+            setSubmissionNotice({ label: 'Submitted', prompt: submission.prompt })
+          }}
+          onFailed={detail => {
+            setSubmission(null)
+            setDraft(submission.prompt)
+            setSubmitError(`Submission failed: ${detail}`)
+          }}
+          onOutcomeUnknown={detail => void handleSubmitOutcomeUnknown(submission.prompt, detail)}
+        />
+      )}
+      {submissionNotice !== null && (
+        <aside className="gc-operation" aria-label="Submission status">
+          <strong>{submissionNotice.label}</strong>
+          <p>{submissionNotice.prompt}</p>
+        </aside>
+      )}
       {submitError !== null && <p role="alert">{submitError}</p>}
+      {submitRetryBlocked && (
+        <button type="button" onClick={() => {
+          setSubmitRetryBlocked(false)
+          setSubmitError(null)
+        }}>
+          I checked the transcript; allow retry
+        </button>
+      )}
       <section className="gc-composer" aria-label="Composer">
         <label>
           <span>Message {session.title || session.id}</span>
           <textarea
             aria-label={`Message ${session.title || session.id}`}
             value={draft}
-            disabled={sending}
+            disabled={sending || submission !== null}
             onChange={event => setDraft(event.currentTarget.value)}
           />
         </label>
-        <button type="button" disabled={sending || draft.trim() === ''} onClick={() => void submit()}>Send</button>
+        <button type="button" disabled={sending || submission !== null || submitRetryBlocked || draft.trim() === ''} onClick={() => void submit()}>Send</button>
         {session.submission_capabilities?.supports_follow_up === true && (
-          <button type="button" disabled={sending || draft.trim() === ''} onClick={() => void submit('follow_up')}>
+          <button type="button" disabled={sending || submission !== null || submitRetryBlocked || draft.trim() === ''} onClick={() => void submit('follow_up')}>
             Follow up
           </button>
         )}
         {session.submission_capabilities?.supports_interrupt_now === true && (
-          <button type="button" disabled={sending || draft.trim() === ''} onClick={() => void submit('interrupt_now')}>
+          <button type="button" disabled={sending || submission !== null || submitRetryBlocked || draft.trim() === ''} onClick={() => void submit('interrupt_now')}>
             Interrupt and send
           </button>
         )}
@@ -1214,12 +1354,41 @@ function SessionWorkspace({
 function SubmissionOperation({
   watcher,
   prompt,
+  onSucceeded,
+  onFailed,
+  onOutcomeUnknown,
 }: {
   watcher: CityOperationWatcher
   prompt: string
+  onSucceeded: () => void
+  onFailed: (detail: string) => void
+  onOutcomeUnknown: (detail: string) => void
 }): React.JSX.Element {
   const snapshot = useSyncExternalStore(watcher.subscribe, watcher.getSnapshot)
+  const terminalHandled = useRef(false)
   useEffect(() => () => watcher.dispose(), [watcher])
+  useEffect(() => {
+    if (terminalHandled.current) return
+    if (snapshot.phase === 'succeeded') {
+      terminalHandled.current = true
+      onSucceeded()
+      return
+    }
+    if (snapshot.phase === 'outcome_unknown') {
+      terminalHandled.current = true
+      onOutcomeUnknown(operationOutcomeUnknownDetail(snapshot))
+      return
+    }
+    if (snapshot.phase === 'failed' && snapshot.terminal !== null) {
+      terminalHandled.current = true
+      const payload = snapshot.terminal.payload
+      const detail = typeof payload === 'object' && payload !== null && 'error_message' in payload
+        && typeof payload.error_message === 'string'
+        ? payload.error_message
+        : 'Supervisor reported request failure'
+      onFailed(detail)
+    }
+  }, [onFailed, onOutcomeUnknown, onSucceeded, snapshot.phase, snapshot.terminal, snapshot.unknownReason])
   const label = snapshot.phase === 'succeeded'
     ? 'Submitted'
     : snapshot.phase === 'failed'

@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   CleanupStack,
+  formatOwnedError,
   runOwnedCommand,
 } from './support/owned-process.mjs'
 import { assertProfileRestored } from './support/owned-stack.mjs'
@@ -16,6 +17,10 @@ import {
   newCompletedToolCallIds,
   sessionEvidence,
 } from './support/live-evidence.mjs'
+import {
+  isBrowserHttpConsoleNoise,
+  isExpectedClosedSessionNotFound,
+} from './support/browser-diagnostics.mjs'
 
 const execFileAsync = promisify(execFile)
 const supportDir = resolve(dirname(fileURLToPath(import.meta.url)), 'support')
@@ -56,6 +61,34 @@ describe('owned E2E infrastructure', () => {
     await expect(execFileAsync('kill', ['-0', String(pid)])).rejects.toMatchObject({ code: 1 })
   })
 
+  it('terminates and reaps a command when the caller aborts', async () => {
+    const script = [
+      "process.on('SIGTERM', () => {})",
+      "process.stdout.write(String(process.pid) + '\\n')",
+      'setInterval(() => {}, 1_000)',
+    ].join(';')
+    const controller = new AbortController()
+    const command = runOwnedCommand(process.execPath, ['-e', script], {
+      forceKillAfterMs: 30,
+      signal: controller.signal,
+      timeoutMs: 30_000,
+    })
+    setTimeout(() => controller.abort(new Error('operator interrupted')), 100)
+
+    let failure
+    try {
+      await command
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(Error)
+    expect(failure.message).toContain('aborted: operator interrupted')
+    const pid = Number(/\b(\d+)\b/.exec(failure.output)?.[1])
+    assert(Number.isSafeInteger(pid), `missing child pid in ${failure.output}`)
+    await expect(execFileAsync('kill', ['-0', String(pid)])).rejects.toMatchObject({ code: 1 })
+  })
+
   it('runs every cleanup in reverse order and aggregates cleanup failures', async () => {
     const calls = []
     const resources = new CleanupStack()
@@ -83,6 +116,12 @@ describe('owned E2E infrastructure', () => {
       'third cleanup failed: third failed',
       'second cleanup failed: second failed',
     ])
+    expect(formatOwnedError(failure)).toContain([
+      'operation and owned-resource cleanup failed',
+      '  - operation failed',
+      '  - third cleanup failed: third failed',
+      '  - second cleanup failed: second failed',
+    ].join('\n'))
   })
 
   it('requires uninstall to restore the stock profile and remove the pack', () => {
@@ -210,5 +249,27 @@ describe('owned E2E infrastructure', () => {
     }
 
     expect(newCompletedToolCallIds(before, after)).toEqual(['new-complete'])
+  })
+
+  it('suppresses only Chromium HTTP console noise that is checked by response URL', () => {
+    expect(isBrowserHttpConsoleNoise(
+      'Failed to load resource: the server responded with a status of 404 (Not Found)',
+    )).toBe(true)
+    expect(isBrowserHttpConsoleNoise('application console failure')).toBe(false)
+  })
+
+  it('accepts only exact GET 404s for sessions the certificate permanently closed', () => {
+    const closed = new Set(['http://127.0.0.1:4321/api/gas-city/v1/connections/c/city/demo/session/gc-17'])
+    const expected = {
+      method: 'GET',
+      status: 404,
+      url: 'http://127.0.0.1:4321/api/gas-city/v1/connections/c/city/demo/session/gc-17',
+    }
+
+    expect(isExpectedClosedSessionNotFound(expected, closed)).toBe(true)
+    expect(isExpectedClosedSessionNotFound({ ...expected, method: 'POST' }, closed)).toBe(false)
+    expect(isExpectedClosedSessionNotFound({ ...expected, status: 500 }, closed)).toBe(false)
+    expect(isExpectedClosedSessionNotFound({ ...expected, url: `${expected.url}/transcript` }, closed)).toBe(false)
+    expect(isExpectedClosedSessionNotFound({ ...expected, url: `${expected.url}0` }, closed)).toBe(false)
   })
 })

@@ -46,8 +46,11 @@ export interface RigSummary {
 export interface AgentSummary {
   name: string
   rig?: string
+  pool?: string
   description?: string
   provider?: string
+  configured?: boolean
+  is_pool?: boolean
   running: boolean
   suspended: boolean
   available: boolean
@@ -134,6 +137,10 @@ function optionalString(value: unknown, scope: string): string | undefined {
   return value === undefined ? undefined : stringValue(value, scope)
 }
 
+function optionalBoolean(value: unknown, scope: string): boolean | undefined {
+  return value === undefined ? undefined : booleanValue(value, scope)
+}
+
 function optionalStringArray(value: unknown, scope: string): string[] | undefined {
   if (value === undefined) return undefined
   if (!Array.isArray(value)) throw contractError(scope, 'must be an array')
@@ -182,8 +189,50 @@ function parseAgent(value: unknown, index: number): AgentSummary {
     available: booleanValue(object.available, `${scope}.available`),
     state: stringValue(object.state, `${scope}.state`),
     ...(optionalString(object.rig, `${scope}.rig`) === undefined ? {} : { rig: object.rig as string }),
+    ...(optionalString(object.pool, `${scope}.pool`) === undefined ? {} : { pool: object.pool as string }),
     ...(optionalString(object.description, `${scope}.description`) === undefined ? {} : { description: object.description as string }),
     ...(optionalString(object.provider, `${scope}.provider`) === undefined ? {} : { provider: object.provider as string }),
+  }
+}
+
+interface ConfigAgentSummary {
+  name: string
+  dir?: string
+  provider?: string
+  is_pool?: boolean
+  suspended: boolean
+}
+
+function parseConfigAgents(value: unknown): ConfigAgentSummary[] {
+  const object = objectValue(value, 'config')
+  if (object.agents === null) return []
+  if (!Array.isArray(object.agents)) throw contractError('config', 'agents must be an array or null')
+  return object.agents.map((item, index): ConfigAgentSummary => {
+    const scope = `config.agents[${index}]`
+    const agent = objectValue(item, scope)
+    return {
+      name: stringValue(agent.name, `${scope}.name`),
+      suspended: booleanValue(agent.suspended, `${scope}.suspended`),
+      ...(optionalString(agent.dir, `${scope}.dir`) === undefined ? {} : { dir: agent.dir as string }),
+      ...(optionalString(agent.provider, `${scope}.provider`) === undefined ? {} : { provider: agent.provider as string }),
+      ...(optionalBoolean(agent.is_pool, `${scope}.is_pool`) === undefined ? {} : { is_pool: agent.is_pool as boolean }),
+    }
+  })
+}
+
+function configuredAgentSummary(agent: ConfigAgentSummary): AgentSummary {
+  const rig = agent.dir?.trim()
+  const name = rig === undefined || rig === '' ? agent.name : `${rig}/${agent.name}`
+  return {
+    name,
+    running: false,
+    suspended: agent.suspended,
+    available: !agent.suspended,
+    state: agent.suspended ? 'suspended' : 'configured',
+    configured: true,
+    ...(rig === undefined || rig === '' ? {} : { rig }),
+    ...(agent.provider === undefined ? {} : { provider: agent.provider }),
+    ...(agent.is_pool === undefined ? {} : { is_pool: agent.is_pool }),
   }
 }
 
@@ -361,17 +410,27 @@ export async function loadCityTopology(
   signal: AbortSignal,
 ): Promise<CityTopology> {
   const base = cityBase(connectionId, cityName)
-  const [rigs, agents, providers, sessions] = await Promise.all([
+  const [rigs, agents, providers, sessions, configResponse] = await Promise.all([
     loadList(`${base}/rigs`, signal, 'rigs', parseRig),
     loadList(`${base}/agents`, signal, 'agents', parseAgent),
     loadList(`${base}/providers/public`, signal, 'providers', parseProvider),
     loadList(`${base}/sessions?state=all`, signal, 'sessions', (item, index) => (
       parseSessionSummary(item, `sessions.items[${index}]`)
     )),
+    fetch(`${base}/config`, { headers: { Accept: 'application/json' }, signal }),
   ])
+  if (!configResponse.ok) throw await gatewayError(configResponse)
+  const configuredAgents = parseConfigAgents(await configResponse.json())
+  const liveIdentities = new Set(agents.items.flatMap(agent => [agent.name, ...(agent.pool === undefined ? [] : [agent.pool])]))
+  const mergedAgents = [
+    ...agents.items,
+    ...configuredAgents
+      .map(configuredAgentSummary)
+      .filter(agent => !liveIdentities.has(agent.name)),
+  ]
   return {
     rigs: rigs.items,
-    agents: agents.items,
+    agents: mergedAgents,
     providers: providers.items,
     sessions: sessions.items,
     sessionTotal: sessions.total,

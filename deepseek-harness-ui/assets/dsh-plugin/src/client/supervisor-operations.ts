@@ -174,7 +174,8 @@ export function createSupervisorOperations(config: SupervisorOperationsConfig): 
       }
     },
     async controlSession(sessionId, control) {
-      const response = await request(`${base}/session/${encodeURIComponent(sessionId)}/${control}`, {
+      const suffix = control === 'close' ? 'close?delete=true' : control
+      const response = await request(`${base}/session/${encodeURIComponent(sessionId)}/${suffix}`, {
         method: 'POST',
         headers: { Accept: 'application/json' },
       })

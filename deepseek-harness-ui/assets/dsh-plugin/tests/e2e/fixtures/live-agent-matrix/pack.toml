@@ -1,0 +1,5 @@
+[pack]
+name = "deepseek-harness-ui-live-agent-matrix"
+version = "0.1.0"
+schema = 2
+description = "Disposable two-provider agents for the live DSH release certificate"

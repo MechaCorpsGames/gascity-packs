@@ -149,6 +149,7 @@ interface ReadRoute {
 
 const cityReadRoutes: readonly ReadRoute[] = [
   { suffix: 'events/stream', upstreamSuffix: 'events/stream', query: ['after_seq'], sse: true },
+  { suffix: 'config', upstreamSuffix: 'config', query: [] },
   { suffix: 'rigs', upstreamSuffix: 'rigs', query: [] },
   { suffix: 'agents', upstreamSuffix: 'agents', query: ['rig'] },
   { suffix: 'providers/public', upstreamSuffix: 'providers/public', query: [] },
@@ -275,7 +276,8 @@ function mapGatewayRequest(
   requestHeaders: Parameters<WebRoute['handler']>[0]['headers'],
 ): MappedGatewayRequest | 'invalid' | undefined {
   const identifier = '[A-Za-z0-9][A-Za-z0-9._-]*'
-  const supervisor = new RegExp(`^${routePrefix}/connections/(${identifier})/(health|cities)$`).exec(url.pathname)
+  const connectionIdentifier = '[A-Za-z0-9._-]+'
+  const supervisor = new RegExp(`^${routePrefix}/connections/(${connectionIdentifier})/(health|cities)$`).exec(url.pathname)
   if (supervisor !== null) {
     if (method !== 'GET') return undefined
     const connectionId = supervisor[1]
@@ -292,7 +294,7 @@ function mapGatewayRequest(
   }
 
   const cityMatch = new RegExp(
-    `^${routePrefix}/connections/(${identifier})/city/(${identifier})/(.+)$`,
+    `^${routePrefix}/connections/(${connectionIdentifier})/city/(${identifier})/(.+)$`,
   ).exec(url.pathname)
   if (cityMatch === null) return undefined
   const connectionId = cityMatch[1]

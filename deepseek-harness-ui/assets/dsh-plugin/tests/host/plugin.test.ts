@@ -165,6 +165,20 @@ describe('Gas City host plugin', () => {
     expect(proxy).not.toHaveBeenCalled()
   })
 
+  it('routes generated base64url connection IDs that begin with punctuation', async () => {
+    const proxy = vi.fn(async () => Response.json({ items: [], total: 0 }))
+    const { baseUrl } = await mount({
+      inventory: async () => ({ connections: [] }),
+      proxy,
+    })
+
+    for (const connectionId of ['-opaque', '_opaque']) {
+      const response = await fetch(`${baseUrl}/api/gas-city/v1/connections/${connectionId}/cities`)
+      expect(response.status).toBe(200)
+      expect(proxy).toHaveBeenLastCalledWith(expect.objectContaining({ connectionId }))
+    }
+  })
+
   it('enumerates the supported Supervisor and per-city read surface', async () => {
     const proxy = vi.fn(async () => new Response('{}', {
       headers: { 'Content-Type': 'application/json' },
@@ -178,6 +192,7 @@ describe('Gas City host plugin', () => {
       [`${base}/health`, '/health', '', undefined],
       [`${base}/cities`, '/v0/cities', '', undefined],
       [`${base}/city/acme/events/stream?after_seq=41`, '/v0/city/acme/events/stream', 'after_seq=41', 'evt-40'],
+      [`${base}/city/acme/config`, '/v0/city/acme/config', '', undefined],
       [`${base}/city/acme/rigs`, '/v0/city/acme/rigs', '', undefined],
       [`${base}/city/acme/providers/public`, '/v0/city/acme/providers/public', '', undefined],
       [`${base}/city/acme/sessions?cursor=next&limit=10&state=active&template=mayor&peek=true`, '/v0/city/acme/sessions', 'cursor=next&limit=10&state=active&template=mayor&peek=true', undefined],

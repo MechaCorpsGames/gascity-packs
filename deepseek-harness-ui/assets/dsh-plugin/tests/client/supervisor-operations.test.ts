@@ -100,16 +100,24 @@ describe('Supervisor operations', () => {
     )
   })
 
-  it('sends lifecycle controls only to fixed session operation endpoints', async () => {
+  it('sends lifecycle controls only to fixed session operation endpoints and makes permanent close explicit', async () => {
     const fetchBoundary = vi.fn(async () => Response.json({ status: 'ok', id: 'session-1' }))
     const operations = createSupervisorOperations({
       connectionId: 'local', cityName: 'gastown', fetch: fetchBoundary,
     })
 
     await operations.controlSession('session-1', 'stop')
+    await operations.controlSession('session-1', 'close')
 
     expect(fetchBoundary).toHaveBeenCalledWith(
       '/api/gas-city/v1/connections/local/city/gastown/session/session-1/stop',
+      {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+      },
+    )
+    expect(fetchBoundary).toHaveBeenCalledWith(
+      '/api/gas-city/v1/connections/local/city/gastown/session/session-1/close?delete=true',
       {
         method: 'POST',
         headers: { Accept: 'application/json' },

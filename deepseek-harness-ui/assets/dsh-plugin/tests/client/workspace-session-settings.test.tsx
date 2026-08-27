@@ -31,6 +31,7 @@ describe('Gas City session settings', () => {
     let permissionWrites = 0
     const fetchBoundary = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
+      if (path.endsWith('/config')) return Response.json({ workspace: { name: 'gastown' }, agents: [], rigs: [] })
       if (path.endsWith('/connections')) return Response.json({ connections: [
         { id: 'local', label: 'Local Supervisor', cities: ['gastown'], available: true },
       ] })

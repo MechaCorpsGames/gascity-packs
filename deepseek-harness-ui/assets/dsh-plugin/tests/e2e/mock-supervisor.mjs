@@ -63,10 +63,20 @@ export async function startMockSupervisor({ port = 0 } = {}) {
   const sessions = new Map([[active.id, active], [dormant.id, dormant]])
   const sessionStreamAttempts = new Map()
   const finalizedSessions = new Set()
+  const nextResetMessages = new Map()
+  const failedMutations = new Set()
+  const failedResultCursors = new Set()
   const cityResults = []
   let submitCount = 0
+  let createCount = 0
   let pendingInteraction = {
     request_id: 'browser-question-1', kind: 'question', prompt: 'Approve the browser verification?', options: [],
+  }
+
+  function consumeMutationFailure(operation) {
+    if (!failedMutations.has(operation)) return false
+    failedMutations.delete(operation)
+    return true
   }
 
   const server = createServer(async (request, response) => {
@@ -85,8 +95,21 @@ export async function startMockSupervisor({ port = 0 } = {}) {
     if (request.method === 'GET' && path === '/v0/city/demo/rigs') {
       return json(response, 200, { items: [{ name: 'demo', path: '/tmp/demo', suspended: false, agent_count: 1, running_count: 1 }], total: 1 })
     }
+    if (request.method === 'GET' && path === '/v0/city/demo/config') {
+      return json(response, 200, {
+        workspace: { name: 'demo', suspended: false },
+        agents: [
+          { name: 'crew', dir: 'demo', provider: 'codex', is_pool: true, suspended: false },
+          { name: 'cold-reviewer', dir: 'demo', provider: 'codex', is_pool: true, suspended: false },
+        ],
+        rigs: [{ name: 'demo', path: '/tmp/demo', suspended: false }],
+      })
+    }
     if (request.method === 'GET' && path === '/v0/city/demo/agents') {
-      return json(response, 200, { items: [{ name: 'demo/crew', rig: 'demo', provider: 'codex', running: true, suspended: false, available: true, state: 'running' }], total: 1 })
+      return json(response, 200, { items: [{
+        name: 'demo/crew', rig: 'demo', pool: 'demo/crew', provider: 'codex',
+        running: true, suspended: false, available: true, state: 'running',
+      }], total: 1 })
     }
     if (request.method === 'GET' && path === '/v0/city/demo/providers/public') {
       return json(response, 200, { items: [{
@@ -98,8 +121,9 @@ export async function startMockSupervisor({ port = 0 } = {}) {
       }], total: 1 })
     }
     if (request.method === 'GET' && path === '/v0/city/demo/sessions') {
-      if (url.searchParams.get('cursor') === 'page-2') return json(response, 200, { items: [dormant], total: 2 })
-      return json(response, 200, { items: [active], total: 2, next_cursor: 'page-2' })
+      if (url.searchParams.get('cursor') === 'page-2') return json(response, 200, { items: [dormant], total: sessions.size })
+      const created = [...sessions.values()].filter(session => session.id !== active.id && session.id !== dormant.id)
+      return json(response, 200, { items: [active, ...created], total: sessions.size, next_cursor: 'page-2' })
     }
 
     const sessionMatch = /^\/v0\/city\/demo\/session\/([^/]+)(?:\/(.+))?$/.exec(path)
@@ -134,16 +158,18 @@ export async function startMockSupervisor({ port = 0 } = {}) {
         const includeThinking = url.searchParams.get('include_thinking') === 'true'
         const attempt = (sessionStreamAttempts.get(session.id) ?? 0) + 1
         sessionStreamAttempts.set(session.id, attempt)
+        const resetMessage = nextResetMessages.get(session.id)
+        nextResetMessages.delete(session.id)
         response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' })
         sessionStreams.add(response)
         response.write(': connected\n\n')
         let closeTimer
         const timer = setTimeout(() => {
-          const message = session.id === 'session-created-browser'
+          const message = resetMessage ?? (session.id === 'session-created-browser'
             ? 'Created session attached to its own Supervisor stream.'
-            : 'Full structured streaming is live in stock DSH.'
+            : 'Full structured streaming is live in stock DSH.')
           const wire = transcript(session, message, includeThinking, 'final')
-          wire.operation = attempt === 2 && session.id === active.id ? 'reset' : 'upsert'
+          wire.operation = resetMessage !== undefined || (attempt === 2 && session.id === active.id) ? 'reset' : 'upsert'
           if (wire.operation === 'reset') wire.reset_reason = 'cursor_invalidated'
           wire.history.cursor.resume_token = `st1.${session.id}.${wire.operation}.${attempt}.${includeThinking}`
           wire.structured_messages[0].blocks.push({
@@ -165,6 +191,10 @@ export async function startMockSupervisor({ port = 0 } = {}) {
       }
       if (request.method === 'POST' && operation === 'respond') {
         capture.body = await readJson(request)
+        if (consumeMutationFailure('respond')) {
+          response.destroy()
+          return
+        }
         const clearedId = pendingInteraction?.request_id ?? capture.body.request_id
         if (clearedId === 'browser-question-1') {
           pendingInteraction = {
@@ -187,13 +217,31 @@ export async function startMockSupervisor({ port = 0 } = {}) {
       }
       if (request.method === 'POST' && operation === 'submit') {
         capture.body = await readJson(request)
+        if (consumeMutationFailure('submit')) {
+          response.destroy()
+          return
+        }
         submitCount += 1
         const requestId = `browser-submit-${submitCount}`
         const eventCursor = String(200 + (submitCount - 1) * 10)
-        cityResults.push({
-          seq: String(Number(eventCursor) + 1), type: 'request.result.session.submit',
-          payload: { request_id: requestId, session_id: session.id, queued: false, intent: capture.body.intent ?? 'default' },
-        })
+        if (failedMutations.delete('submit-terminal-failed')) {
+          cityResults.push({
+            seq: String(Number(eventCursor) + 1), type: 'request.failed',
+            payload: {
+              request_id: requestId,
+              operation: 'session.submit',
+              error_code: 'submit_failed',
+              error_message: 'Enter delivered to tmux but not confirmed (busy state never observed)',
+            },
+          })
+        } else if (failedMutations.delete('submit-result')) {
+          failedResultCursors.add(eventCursor)
+        } else {
+          cityResults.push({
+            seq: String(Number(eventCursor) + 1), type: 'request.result.session.submit',
+            payload: { request_id: requestId, session_id: session.id, queued: false, intent: capture.body.intent ?? 'default' },
+          })
+        }
         return json(response, 202, { status: 'accepted', request_id: requestId, event_cursor: eventCursor })
       }
       if (request.method === 'POST' && operation === 'rename') {
@@ -215,13 +263,37 @@ export async function startMockSupervisor({ port = 0 } = {}) {
       capture.body = await readJson(request)
       const created = { ...structuredClone(active), id: 'session-created-browser', title: 'Created from stock DSH', template: capture.body.name }
       sessions.set(created.id, created)
-      cityResults.push({
-        seq: '301', type: 'request.result.session.create',
-        payload: { request_id: 'browser-create-1', session: created },
-      })
-      return json(response, 202, { status: 'accepted', request_id: 'browser-create-1', event_cursor: '300' })
+      if (consumeMutationFailure('create')) {
+        response.destroy()
+        return
+      }
+      createCount += 1
+      const requestId = `browser-create-${createCount}`
+      const eventCursor = String(300 + (createCount - 1) * 10)
+      if (failedMutations.delete('create-terminal-failed')) {
+        cityResults.push({
+          seq: String(Number(eventCursor) + 1), type: 'request.failed',
+          payload: {
+            request_id: requestId,
+            operation: 'session.create',
+            error_code: 'create_failed',
+            error_message: 'session did not become commandable after creation',
+          },
+        })
+      } else if (failedMutations.delete('create-result')) {
+        failedResultCursors.add(eventCursor)
+      } else {
+        cityResults.push({
+          seq: String(Number(eventCursor) + 1), type: 'request.result.session.create',
+          payload: { request_id: requestId, session: created },
+        })
+      }
+      return json(response, 202, { status: 'accepted', request_id: requestId, event_cursor: eventCursor })
     }
     if (request.method === 'GET' && path === '/v0/city/demo/events/stream') {
+      if (failedResultCursors.has(url.searchParams.get('after_seq'))) {
+        return json(response, 410, { title: 'Gone', status: 410, detail: 'fixture result cursor expired' })
+      }
       response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
       if (cityResults.length > 0) {
         const event = cityResults.shift()
@@ -242,13 +314,33 @@ export async function startMockSupervisor({ port = 0 } = {}) {
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('fixture did not bind a TCP port')
   const url = `http://127.0.0.1:${address.port}`
+  async function stopListener() {
+    for (const stream of sessionStreams) stream.destroy()
+    sessionStreams.clear()
+    if (!server.listening) return
+    await new Promise((resolveClose, rejectClose) => {
+      server.close(error => error === undefined ? resolveClose() : rejectClose(error))
+    })
+  }
+
   return {
     url,
     port: address.port,
     requests,
+    failNextMutation(operation) {
+      failedMutations.add(operation)
+    },
+    async restart({ downtimeMs = 0, resetMessage } = {}) {
+      if (resetMessage !== undefined) nextResetMessages.set(active.id, resetMessage)
+      await stopListener()
+      if (downtimeMs > 0) await new Promise(resolveDelay => setTimeout(resolveDelay, downtimeMs))
+      await new Promise((resolveListen, rejectListen) => {
+        server.once('error', rejectListen)
+        server.listen(address.port, '127.0.0.1', resolveListen)
+      })
+    },
     async close() {
-      for (const stream of sessionStreams) stream.end()
-      await new Promise(resolve => server.close(resolve))
+      await stopListener()
     },
   }
 }

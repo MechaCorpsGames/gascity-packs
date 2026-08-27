@@ -1034,6 +1034,7 @@ export interface CityOperationSnapshot {
     | "permanent_status"
     | "retry_exhausted"
     | "contract"
+    | "reported_ambiguous_failure"
     | "watchdog_expired";
 }
 
@@ -1241,7 +1242,17 @@ export function createCityOperationWatcher(
             }
             return;
           }
-          publish({ ...snapshot, phase: "failed", terminal: frame });
+          const failureMayHaveMutated =
+            operation.operation === "session.create" ||
+            frame.payload.error_code !== "resolve_failed";
+          publish({
+            ...snapshot,
+            phase: failureMayHaveMutated ? "outcome_unknown" : "failed",
+            terminal: frame,
+            ...(failureMayHaveMutated
+              ? { unknownReason: "reported_ambiguous_failure" as const }
+              : {}),
+          });
           publish({ ...snapshot, cursor: frame.id });
           dataCommitted = true;
           cancelWatchdog?.();
@@ -1327,6 +1338,15 @@ export function createCityOperationWatcher(
       },
     });
     if (generation !== connectionGeneration) {
+      openedConnection.close();
+      return;
+    }
+    if (
+      snapshot.phase === "succeeded" ||
+      snapshot.phase === "failed" ||
+      snapshot.phase === "outcome_unknown" ||
+      snapshot.phase === "dismissed"
+    ) {
       openedConnection.close();
       return;
     }

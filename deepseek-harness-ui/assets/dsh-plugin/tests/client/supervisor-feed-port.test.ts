@@ -110,6 +110,36 @@ describe('Supervisor feed port', () => {
     handle.close()
   })
 
+  it('accepts the Supervisor structured stream heartbeat event', async () => {
+    const encoder = new TextEncoder()
+    const fetchBoundary = vi.fn(async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'event: heartbeat\n'
+          + 'data: {"ts":"2026-08-27T05:00:00Z"}\n\n',
+        ))
+        controller.close()
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+    const port = createSupervisorFeedPort({
+      connectionId: 'local', cityName: 'gastown', includeThinking: false, fetch: fetchBoundary,
+    })
+    const events: unknown[] = []
+    let finish!: (value: unknown) => void
+    const finished = new Promise<unknown>(resolve => { finish = resolve })
+
+    await port.openSessionStream({
+      sessionId: 'session-1',
+      afterCursor: 'st1.cursor-1',
+      onEvent: event => events.push(event),
+      onEof: () => finish(null),
+      onError: finish,
+    })
+
+    await expect(finished).resolves.toBeNull()
+    expect(events).toEqual([{ type: 'heartbeat' }])
+  })
+
   it('reports a malformed structured frame as a contract error', async () => {
     const encoder = new TextEncoder()
     const fetchBoundary = vi.fn(async () => new Response(new ReadableStream({

@@ -127,6 +127,41 @@ describe("city operation watcher", () => {
     });
   });
 
+  it("keeps an immediate replayed terminal result after the stream open resolves", async () => {
+    let closeCount = 0;
+    const port: CityOperationPort = {
+      async openCityEventStream(request) {
+        request.onEvent({
+          id: "42",
+          eventType: "request.result.session.create",
+          payload: {
+            request_id: "request-1",
+            session: { id: "session-1" },
+          },
+        });
+        return {
+          close() {
+            closeCount += 1;
+          },
+        };
+      },
+    };
+    const watcher = createCityOperationWatcher(port, {
+      requestId: "request-1",
+      operation: "session.create",
+      eventCursor: "41",
+    });
+
+    await watcher.start();
+
+    expect(watcher.getSnapshot()).toMatchObject({
+      phase: "succeeded",
+      cursor: "42",
+      terminal: { id: "42" },
+    });
+    expect(closeCount).toBe(1);
+  });
+
   it("replays a malformed matching terminal once then reports unknown outcome", async () => {
     const requests: Parameters<CityOperationPort["openCityEventStream"]>[0][] =
       [];
@@ -381,7 +416,7 @@ describe("city operation watcher", () => {
     expect(requests).toHaveLength(4);
   });
 
-  it("matches request failures by both request id and operation", async () => {
+  it("treats a matching submit failure after acceptance as outcome-ambiguous", async () => {
     let emit!: (frame: CityEventFrame) => void;
     const port: CityOperationPort = {
       async openCityEventStream(request) {
@@ -422,9 +457,77 @@ describe("city operation watcher", () => {
       },
     });
     expect(watcher.getSnapshot()).toMatchObject({
-      phase: "failed",
+      phase: "outcome_unknown",
       cursor: "102",
+      unknownReason: "reported_ambiguous_failure",
       terminal: { id: "102", eventType: "request.failed" },
+    });
+  });
+
+  it("keeps a pre-delivery submit resolution failure as a known failure", async () => {
+    let emit!: (frame: CityEventFrame) => void;
+    const port: CityOperationPort = {
+      async openCityEventStream(request) {
+        emit = request.onEvent;
+        return { close() {} };
+      },
+    };
+    const watcher = createCityOperationWatcher(port, {
+      requestId: "request-1",
+      operation: "session.submit",
+      eventCursor: "100",
+    });
+    await watcher.start();
+
+    emit({
+      id: "101",
+      eventType: "request.failed",
+      payload: {
+        request_id: "request-1",
+        operation: "session.submit",
+        error_code: "resolve_failed",
+        error_message: "session no longer exists",
+      },
+    });
+
+    expect(watcher.getSnapshot()).toMatchObject({
+      phase: "failed",
+      cursor: "101",
+      terminal: { id: "101", eventType: "request.failed" },
+    });
+  });
+
+  it("treats a create failure after acceptance as outcome-ambiguous", async () => {
+    let emit!: (frame: CityEventFrame) => void;
+    const port: CityOperationPort = {
+      async openCityEventStream(request) {
+        emit = request.onEvent;
+        return { close() {} };
+      },
+    };
+    const watcher = createCityOperationWatcher(port, {
+      requestId: "request-1",
+      operation: "session.create",
+      eventCursor: "100",
+    });
+    await watcher.start();
+
+    emit({
+      id: "101",
+      eventType: "request.failed",
+      payload: {
+        request_id: "request-1",
+        operation: "session.create",
+        error_code: "create_failed",
+        error_message: "session did not become commandable",
+      },
+    });
+
+    expect(watcher.getSnapshot()).toMatchObject({
+      phase: "outcome_unknown",
+      cursor: "101",
+      unknownReason: "reported_ambiguous_failure",
+      terminal: { id: "101", eventType: "request.failed" },
     });
   });
 

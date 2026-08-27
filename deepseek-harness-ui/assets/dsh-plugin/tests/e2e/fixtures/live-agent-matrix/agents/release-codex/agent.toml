@@ -1,0 +1,4 @@
+scope = "city"
+provider = "codex"
+max_active_sessions = 1
+description = "Disposable Codex agent for the DSH live release certificate"

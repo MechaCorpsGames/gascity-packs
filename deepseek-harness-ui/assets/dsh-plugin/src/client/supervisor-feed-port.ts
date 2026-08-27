@@ -291,6 +291,7 @@ async function mutationError(response: Response): Promise<FeedMutationError> {
 }
 
 function decodeStreamEvent(event: string, id: string, data: string): SessionStreamEvent {
+  if (event === 'heartbeat') return { type: 'heartbeat' }
   const value = objectValue(JSON.parse(data), `SSE ${event}`)
   if (event === 'structured') {
     const wire: StructuredEventWire = {

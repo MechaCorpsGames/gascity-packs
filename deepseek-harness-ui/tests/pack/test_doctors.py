@@ -280,6 +280,7 @@ class DoctorTests(unittest.TestCase):
         required = {
             "/v0/cities": {"get": {}},
             "/v0/city/{cityName}/events/stream": {"get": {}},
+            "/v0/city/{cityName}/config": {"get": {}},
             "/v0/city/{cityName}/rigs": {"get": {}},
             "/v0/city/{cityName}/agents": {"get": {}},
             "/v0/city/{cityName}/providers/public": {"get": {}},
@@ -350,6 +351,7 @@ class DoctorTests(unittest.TestCase):
         required = {
             "/v0/cities": {"get": {}},
             "/v0/city/{cityName}/events/stream": {"get": {}},
+            "/v0/city/{cityName}/config": {"get": {}},
             "/v0/city/{cityName}/rigs": {"get": {}},
             "/v0/city/{cityName}/agents": {"get": {}},
             "/v0/city/{cityName}/providers/public": {"get": {}},

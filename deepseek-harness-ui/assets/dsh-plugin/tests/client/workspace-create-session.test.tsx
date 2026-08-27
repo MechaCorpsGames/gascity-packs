@@ -32,6 +32,7 @@ describe('Gas City create on first send', () => {
     const fetchBoundary = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
       calls.push({ path, ...(init === undefined ? {} : { init }) })
+      if (path.endsWith('/config')) return Response.json({ workspace: { name: 'gastown' }, agents: [], rigs: [] })
       if (path.endsWith('/connections')) return Response.json({ connections: [
         { id: 'local', label: 'Local Supervisor', cities: ['gastown'], available: true },
       ] })

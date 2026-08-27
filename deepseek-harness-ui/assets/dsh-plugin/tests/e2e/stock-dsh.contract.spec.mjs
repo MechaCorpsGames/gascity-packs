@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 
 import { startOwnedStack } from './support/owned-stack.mjs'
+import { openGasCityWorkspace } from './support/stock-dsh-ui.mjs'
 
 let stack
 
@@ -22,14 +23,7 @@ test('stock DSH renders and controls the provider-neutral Supervisor workspace',
   page.on('request', request => browserRequests.push(request.url()))
 
   await page.goto(stack.url)
-  const testingNotice = page.getByRole('button', { name: 'Continue' })
-  if (await testingNotice.isVisible()) {
-    await testingNotice.click()
-    await page.getByRole('button', { name: 'Configure later' }).waitFor({ state: 'visible', timeout: 5_000 })
-  }
-  const configureLater = page.getByRole('button', { name: 'Configure later' })
-  if (await configureLater.isVisible()) await configureLater.click()
-  await page.getByRole('button', { name: 'Gas City' }).click()
+  await openGasCityWorkspace(page)
   await expect(page.getByRole('dialog', { name: 'Gas City' })).toBeVisible()
   await page.getByRole('button', { name: 'Local Supervisor' }).click()
   await page.getByRole('button', { name: 'demo', exact: true }).click()
@@ -86,8 +80,9 @@ test('stock DSH renders and controls the provider-neutral Supervisor workspace',
   await page.getByRole('button', { name: 'Apply permission mode' }).click()
   await expect(page.getByText('Permission mode updated; it applies on the next launch')).toBeVisible()
 
-  await page.getByRole('button', { name: 'demo/crew' }).click()
-  await page.getByRole('textbox', { name: 'Message demo/crew' }).fill('Create exactly once')
+  await expect(page.getByRole('button', { name: 'demo/crew', exact: true })).toHaveCount(1)
+  await page.getByRole('button', { name: 'demo/cold-reviewer' }).click()
+  await page.getByRole('textbox', { name: 'Message demo/cold-reviewer' }).fill('Create exactly once')
   await page.getByRole('button', { name: 'Start session' }).click()
   await expect(page.getByRole('heading', { name: 'Created from stock DSH' })).toBeVisible()
   await expect(page.locator('main.gc-session')).toHaveAttribute('data-session-id', 'session-created-browser')
@@ -110,7 +105,7 @@ test('stock DSH renders and controls the provider-neutral Supervisor workspace',
     permission_mode: 'auto-edit',
   })
   expect(stack.fixture.requests.find(request => request.path === '/v0/city/demo/sessions' && request.method === 'POST')?.body).toEqual({
-    kind: 'agent', name: 'demo/crew', message: 'Create exactly once', async: true,
+    kind: 'agent', name: 'demo/cold-reviewer', message: 'Create exactly once', async: true,
   })
   expect(browserRequests.some(url => url.startsWith(stack.fixture.url))).toBe(false)
   expect(browserErrors).toEqual([])

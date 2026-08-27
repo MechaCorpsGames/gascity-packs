@@ -93,18 +93,52 @@ export function spawnOwnedCommand(command, args, options = {}) {
 }
 
 export async function runOwnedCommand(command, args, options = {}) {
+  const label = options.label ?? command
+  if (options.signal?.aborted) {
+    const detail = options.signal.reason instanceof Error
+      ? options.signal.reason.message
+      : String(options.signal.reason ?? 'aborted')
+    const error = new Error(`${label} aborted: ${detail}`)
+    error.output = ''
+    throw error
+  }
   const owned = spawnOwnedCommand(command, args, options)
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  const outcome = await Promise.race([
-    owned.completion.then(result => ({ kind: 'completed', result })),
-    delay(timeoutMs, { kind: 'timeout' }),
-  ])
+  let abortListener
+  const aborted = options.signal === undefined
+    ? new Promise(() => {})
+    : new Promise(resolve => {
+        abortListener = () => resolve({ kind: 'aborted', reason: options.signal.reason })
+        options.signal.addEventListener('abort', abortListener, { once: true })
+      })
+  let outcome
+  try {
+    outcome = await Promise.race([
+      owned.completion.then(result => ({ kind: 'completed', result })),
+      delay(timeoutMs, { kind: 'timeout' }),
+      aborted,
+    ])
+  } finally {
+    if (abortListener !== undefined) options.signal.removeEventListener('abort', abortListener)
+  }
+  if (outcome.kind === 'aborted') {
+    await owned.stop({
+      forceKillAfterMs: options.forceKillAfterMs,
+      reapAfterMs: options.reapAfterMs,
+    })
+    const detail = outcome.reason instanceof Error
+      ? outcome.reason.message
+      : String(outcome.reason ?? 'aborted')
+    const error = new Error(`${label} aborted: ${detail}`)
+    error.output = owned.output
+    throw error
+  }
   if (outcome.kind === 'timeout') {
     await owned.stop({
       forceKillAfterMs: options.forceKillAfterMs,
       reapAfterMs: options.reapAfterMs,
     })
-    const error = new Error(`${options.label ?? command} timed out after ${timeoutMs}ms`)
+    const error = new Error(`${label} timed out after ${timeoutMs}ms`)
     error.output = owned.output
     throw error
   }
@@ -116,6 +150,15 @@ export async function runOwnedCommand(command, args, options = {}) {
     throw error
   }
   return owned.output
+}
+
+export function formatOwnedError(error, indent = '') {
+  const detail = error instanceof Error ? error.message : String(error)
+  if (!(error instanceof AggregateError)) return `${indent}${detail}`
+  return [
+    `${indent}${detail}`,
+    ...error.errors.map(item => formatOwnedError(item, `${indent}  - `)),
+  ].join('\n')
 }
 
 export class CleanupStack {

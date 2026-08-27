@@ -1,0 +1,4 @@
+scope = "city"
+provider = "claude"
+max_active_sessions = 1
+description = "Disposable Claude agent for the DSH live release certificate"

@@ -9,8 +9,13 @@ import {
   newCompletedToolCallIds,
   sessionEvidence,
 } from './support/live-evidence.mjs'
+import {
+  isBrowserHttpConsoleNoise,
+  isExpectedClosedSessionNotFound,
+} from './support/browser-diagnostics.mjs'
 import { CleanupStack } from './support/owned-process.mjs'
 import { startOwnedLiveStack } from './support/owned-stack.mjs'
+import { openGasCityWorkspace } from './support/stock-dsh-ui.mjs'
 
 const required = ['DSH_E2E_ALLOW_MUTATION', 'GC_LIVE_CITY', 'GC_LIVE_AGENT_MATRIX']
 const missing = required.filter(name => process.env[name] === undefined || process.env[name] === '')
@@ -49,12 +54,29 @@ const createdSessions = []
 const certifiedSessions = []
 const resources = new CleanupStack()
 let browser
+let page
 let stack
 let connection
 let browserVersion
 let supervisorHealth
 let browserErrors = []
+let browserRequestFailures = []
+let browserHttpFailures = []
+let browserResponses = []
+let browserStreamCancellations = 0
+let browserFailureState
 let remainingSessionIds = []
+const closedSessionUrls = new Set()
+const interruptController = new AbortController()
+let interruptedSignal
+for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    if (interruptController.signal.aborted) return
+    interruptedSignal = signal
+    interruptController.abort(new Error(`interrupted by ${signal}`))
+    void browser?.close().catch(() => {})
+  })
+}
 
 function pathPart(value) {
   return encodeURIComponent(value)
@@ -65,8 +87,9 @@ function sessionBase(sessionId) {
 }
 
 async function gatewayJson(path, options = {}) {
+  const { allowNotFound = false, label, timeoutMs, ...requestOptions } = options
   const response = await fetch(new URL(path, stack.url), {
-    ...options,
+    ...requestOptions,
     headers: {
       Accept: 'application/json',
       Origin: stack.url,
@@ -74,15 +97,19 @@ async function gatewayJson(path, options = {}) {
       ...options.headers,
     },
     redirect: 'error',
-    signal: AbortSignal.timeout(options.timeoutMs ?? 15_000),
+    signal: AbortSignal.timeout(timeoutMs ?? 15_000),
   })
-  if (!response.ok) throw new Error(`${options.label ?? path} returned HTTP ${response.status}`)
+  if (allowNotFound && response.status === 404) return undefined
+  if (!response.ok) throw new Error(`${label ?? path} returned HTTP ${response.status}`)
   if (response.status === 204) return undefined
   return await response.json()
 }
 
 async function readSession(sessionId) {
-  return await gatewayJson(sessionBase(sessionId), { label: `session ${sessionId}` })
+  return await gatewayJson(sessionBase(sessionId), {
+    label: `session ${sessionId}`,
+    allowNotFound: true,
+  }) ?? { id: sessionId, state: 'closed', running: false }
 }
 
 async function readTranscript(sessionId) {
@@ -95,6 +122,7 @@ async function waitForEvidence(sessionId, expectedTemplate, expectedProvider, no
   const deadline = Date.now() + 180_000
   let lastError
   while (Date.now() < deadline) {
+    if (interruptController.signal.aborted) throw interruptController.signal.reason
     try {
       const [session, transcript] = await Promise.all([readSession(sessionId), readTranscript(sessionId)])
       const evidence = sessionEvidence(session, transcript, { expectedTemplate, expectedProvider, nonce })
@@ -119,6 +147,33 @@ async function waitForClosed(sessionId) {
   throw new Error(`${sessionId} remained ${last?.state ?? '<missing>'} after close`)
 }
 
+async function waitForSubmissionOutcome(sessionWorkspace, prompt) {
+  const deadline = Date.now() + 90_000
+  while (Date.now() < deadline) {
+    if (interruptController.signal.aborted) throw interruptController.signal.reason
+    const submitted = await sessionWorkspace.locator('[aria-label="Submission status"] strong').allInnerTexts()
+    if (submitted.includes('Submitted')) return { kind: 'succeeded', detail: 'Submitted' }
+    const alerts = await sessionWorkspace.getByRole('alert').allInnerTexts()
+    const unknown = alerts.find(message => message.includes('Submit outcome unknown'))
+    if (unknown !== undefined) {
+      const composer = sessionWorkspace.getByRole('textbox', { name: /Message / })
+      if (await composer.inputValue() !== prompt) throw new Error('outcome-unknown submit did not preserve its prompt')
+      if (!await sessionWorkspace.getByRole('button', { name: 'Send', exact: true }).isDisabled()) {
+        throw new Error('outcome-unknown submit left retry enabled')
+      }
+      if (await sessionWorkspace.getByRole('button', { name: 'I checked the transcript; allow retry' }).count() !== 1) {
+        throw new Error('outcome-unknown submit did not require authoritative transcript acknowledgment')
+      }
+      return { kind: 'outcome_unknown', detail: unknown }
+    }
+    const failed = alerts.find(message => message.includes('Submission failed'))
+    if (failed !== undefined) throw new Error(`live submission was presented as safely retryable: ${failed}`)
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 200))
+  }
+  const statuses = await sessionWorkspace.locator('[aria-label="Submission status"] strong').allInnerTexts()
+  throw new Error(`live submission outcome was not observed; current statuses: ${JSON.stringify(statuses)}`)
+}
+
 async function writeCertificate(result, error) {
   const certificate = {
     schema_version: 'gastownhall.deepseek-harness-ui.live-certificate.v1',
@@ -132,13 +187,39 @@ async function writeCertificate(result, error) {
       version: supervisorHealth.version,
       build_id: supervisorHealth.build_id,
     },
+    fixture: {
+      city_created_by: 'gc init',
+      beads_provider: process.env.GC_LIVE_BEADS_PROVIDER,
+    },
     city,
     sessions: certifiedSessions,
+    browser_diagnostics: {
+      errors: browserErrors,
+      http_failures: browserHttpFailures,
+      request_failures: browserRequestFailures,
+      expected_stream_cancellations: browserStreamCancellations,
+      responses: browserResponses,
+      ...(browserFailureState === undefined ? {} : { failure_state: browserFailureState }),
+    },
     cleanup_remaining_session_ids: remainingSessionIds,
     ...(error === undefined ? {} : { failure: error instanceof Error ? error.message : String(error) }),
   }
   await mkdir(dirname(certificateOutput), { recursive: true })
   await writeFile(certificateOutput, `${JSON.stringify(certificate, null, 2)}\n`)
+}
+
+async function captureBrowserFailure(error) {
+  if (page === undefined || browserFailureState !== undefined) return
+  const failureScreenshot = resolve(dirname(certificateOutput), 'live-browser-failure.png')
+  await mkdir(dirname(failureScreenshot), { recursive: true })
+  await page.screenshot({ path: failureScreenshot, fullPage: true })
+  browserFailureState = {
+    error: error instanceof Error ? error.message : String(error),
+    url: page.url(),
+    visible_text: (await page.locator('body').innerText()).slice(0, 8_000),
+    submission_statuses: await page.locator('[aria-label="Submission status"] strong').allInnerTexts(),
+    screenshot: failureScreenshot,
+  }
 }
 
 let operationError
@@ -175,7 +256,7 @@ try {
     const cleanup = await closeRunOwnedSessions(createdSessions, {
       getSession: readSession,
       async closeSession(id) {
-        await gatewayJson(`${sessionBase(id)}/close`, {
+        await gatewayJson(`${sessionBase(id)}/close?delete=true`, {
           method: 'POST',
           label: `close session ${id}`,
         })
@@ -188,22 +269,42 @@ try {
     }
   })
 
-  const page = await browser.newPage()
+  page = await browser.newPage()
   const browserRequests = []
   page.on('pageerror', error => browserErrors.push(error.message))
   page.on('console', message => {
-    if (message.type() === 'error') browserErrors.push(message.text())
+    if (message.type() === 'error' && !isBrowserHttpConsoleNoise(message.text())) {
+      browserErrors.push(message.text())
+    }
   })
   page.on('request', request => browserRequests.push(request.url()))
+  page.on('requestfailed', request => {
+    if (!request.url().includes('/api/gas-city/')) return
+    const errorText = request.failure()?.errorText ?? 'failed'
+    if (errorText === 'net::ERR_ABORTED' && request.url().includes('/stream')) {
+      browserStreamCancellations += 1
+      return
+    }
+    const diagnostic = `${request.method()} ${request.url()} ${errorText}`
+    browserRequestFailures.push(diagnostic)
+    process.stdout.write(`[browser request failed] ${diagnostic}\n`)
+  })
+  page.on('response', response => {
+    if (!response.url().includes('/api/gas-city/')) return
+    const observed = {
+      method: response.request().method(),
+      status: response.status(),
+      url: response.url(),
+    }
+    const diagnostic = `${observed.method} ${observed.status} ${observed.url}`
+    browserResponses.push(diagnostic)
+    process.stdout.write(`[browser response] ${diagnostic}\n`)
+    if (observed.status >= 400 && !isExpectedClosedSessionNotFound(observed, closedSessionUrls)) {
+      browserHttpFailures.push(diagnostic)
+    }
+  })
   await page.goto(stack.url)
-  const testingNotice = page.getByRole('button', { name: 'Continue' })
-  if (await testingNotice.isVisible()) {
-    await testingNotice.click()
-    await page.getByRole('button', { name: 'Configure later' }).waitFor({ state: 'visible', timeout: 5_000 })
-  }
-  const configureLater = page.getByRole('button', { name: 'Configure later' })
-  if (await configureLater.isVisible()) await configureLater.click()
-  await page.getByRole('button', { name: 'Gas City' }).click()
+  await openGasCityWorkspace(page)
   await page.getByRole('button', { name: connectionLabel }).click()
   await page.getByRole('button', { name: city, exact: true }).click()
 
@@ -213,7 +314,12 @@ try {
     await page.getByRole('textbox', { name: `Message ${agent}` }).fill(`Reply briefly with this exact nonce: ${nonce}`)
     await page.getByRole('button', { name: 'Start session' }).click()
     const sessionWorkspace = page.locator('main.gc-session')
-    await sessionWorkspace.waitFor({ state: 'visible', timeout: 150_000 })
+    try {
+      await sessionWorkspace.waitFor({ state: 'visible', timeout: 330_000 })
+    } catch (error) {
+      await captureBrowserFailure(error)
+      throw new Error(`${error instanceof Error ? error.message : String(error)}\nVisible UI: ${browserFailureState.visible_text}`)
+    }
     const sessionId = await sessionWorkspace.getAttribute('data-session-id')
     if (sessionId === null || sessionId === '') throw new Error(`created ${agent} session has no canonical ID`)
     createdSessions.push(sessionId)
@@ -225,11 +331,10 @@ try {
     })
 
     const toolNonce = `tool-${randomUUID()}`
-    await sessionWorkspace.getByRole('textbox', { name: /Message / }).fill(
-      `Use one harmless read-only tool, then reply with this exact nonce: ${toolNonce}`,
-    )
+    const toolPrompt = `Use one harmless read-only tool, then reply with this exact nonce: ${toolNonce}`
+    await sessionWorkspace.getByRole('textbox', { name: /Message / }).fill(toolPrompt)
     await sessionWorkspace.getByRole('button', { name: 'Send', exact: true }).click()
-    await sessionWorkspace.getByText('Submitted').waitFor({ state: 'visible' })
+    const submissionObservation = waitForSubmissionOutcome(sessionWorkspace, toolPrompt)
     const afterTool = await waitForEvidence(
       sessionId,
       agent,
@@ -237,6 +342,7 @@ try {
       toolNonce,
       evidence => newCompletedToolCallIds(initial, evidence).length > 0,
     )
+    const submissionOutcome = await submissionObservation
     const completedToolDelta = newCompletedToolCallIds(initial, afterTool)
     await sessionWorkspace.locator('[aria-label^="Tool call "]').last().waitFor({ state: 'visible', timeout: 30_000 })
     await sessionWorkspace.locator('[aria-label^="Tool result "]').last().waitFor({ state: 'visible', timeout: 30_000 })
@@ -248,10 +354,13 @@ try {
       schema_version: afterTool.schemaVersion,
       assistant_message_count: afterTool.assistantMessageIds.length,
       completed_tool_call_delta: completedToolDelta.length,
+      submission_outcome: submissionOutcome.kind,
+      submission_detail: submissionOutcome.detail,
       tool_use_count: afterTool.toolUseCount,
       tool_result_count: afterTool.toolResultCount,
     })
     page.once('dialog', dialog => dialog.accept())
+    closedSessionUrls.add(new URL(sessionBase(sessionId), stack.url).toString())
     await sessionWorkspace.getByRole('button', { name: 'Close permanently' }).click()
     await waitForClosed(sessionId)
   }
@@ -260,8 +369,16 @@ try {
   const foreignRequests = browserRequests.filter(url => new URL(url).origin !== dshOrigin)
   if (foreignRequests.length > 0) throw new Error(`browser made ${foreignRequests.length} request(s) outside stock DSH origin`)
   if (browserErrors.length > 0) throw new Error(`browser errors: ${browserErrors.join(' | ')}`)
+  if (browserHttpFailures.length > 0) throw new Error(`browser HTTP failures: ${browserHttpFailures.join(' | ')}`)
 } catch (error) {
-  operationError = error
+  operationError = interruptController.signal.aborted ? interruptController.signal.reason : error
+  if (!interruptController.signal.aborted) {
+    try {
+      await captureBrowserFailure(error)
+    } catch (captureError) {
+      browserErrors.push(`failed to capture browser failure state: ${captureError instanceof Error ? captureError.message : String(captureError)}`)
+    }
+  }
 }
 
 let finalError
@@ -277,6 +394,7 @@ if (finalError !== undefined) {
   if (remainingSessionIds.length > 0) {
     process.stderr.write(`manual cleanup required for sessions: ${remainingSessionIds.join(', ')}\n`)
   }
-  throw finalError
+  if (interruptedSignal === undefined) throw finalError
+  process.exitCode = 130
 }
-process.stdout.write(`live multi-provider certificate: ${certificateOutput}\n`)
+if (finalError === undefined) process.stdout.write(`live multi-provider certificate: ${certificateOutput}\n`)

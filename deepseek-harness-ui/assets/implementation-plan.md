@@ -1,6 +1,6 @@
 # `deepseek-harness-ui` implementation plan
 
-Status: implemented release-candidate plan. Production telemetry remains a follow-up; live multi-provider certification is an explicit release gate and is not currently proven on the audit machine.
+Status: implemented production-ready release candidate for the documented v1 boundary. The isolated stock-DSH certificate passed against real Claude and Codex sessions on the audited Gas City baseline. Production telemetry and release publication remain follow-ups.
 
 Research baseline: Gas City `1807cf018045e9f225993d97cf6daea37e2ce6e9`, Gasworks GUI `44812f2e656fc880a986b03a418a93348a8dc1ad`, DeepSeek Harness `dsh-v0.1.1-rc.2` / `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`, and `gascity-packs` `aab8030d397c211be6a4d460e9ce8de39e867a09`.
 
@@ -10,7 +10,7 @@ The pack now contains the two-sided stock-DSH plugin, fixed same-origin REST/SSE
 
 The adversarial-review corrections are implemented: unique list-slot IDs; `./package.json` export; no Supervisor-wide stream; master `sessions?state=all` inventory grouped in the browser; implicit default submit intent; **Close permanently** terminology and fail-closed lifecycle matrix; transcript-first buffered handoff; authoritative pending replacement; same-ID semantic ledger; uint64 city event IDs kept as decimal strings/`BigInt`; bounded EOF/network/contract recovery; deterministic access-profile selection; redirect refusal; strict request schemas; loopback-only DSH; and credential/TLS/grant handling confined to the host.
 
-The release candidate is verified by 129 plugin tests, 23 pack/install tests, TypeScript checking, production builds, ShellCheck, `gc lint`, deterministic artifact byte comparison, and a checked-in headless-Chrome contract against an isolated exact stock `dsh web` profile and random-port Supervisor fixture. Live certification remains separate and fails **UNPROVEN** without two real, distinct ready providers.
+The release candidate is verified by 138 plugin tests, 28 pack/install tests, TypeScript checking, production builds, ShellCheck, `gc lint`, deterministic artifact byte comparison, and checked-in headless-Chrome contract/uncertainty/soak runs against an isolated exact stock `dsh web` profile and random-port Supervisor fixture. The separate isolated live certificate also passed with two real, distinct providers after normal `gc init` started the disposable Supervisor and city.
 
 ## 1. Decision summary
 
@@ -150,6 +150,7 @@ All routes live under `/api/gas-city/v1`. Dynamic segments are parsed as individ
 | `GET /connections/{c}/health` | `GET /health` | Version and capability entry point |
 | `GET /connections/{c}/cities` | `GET /v0/cities` | City discovery/readiness |
 | `GET /connections/{c}/city/{city}/events/stream` | `GET /v0/city/{city}/events/stream` | Async create/submit result correlation |
+| `GET /connections/{c}/city/{city}/config` | `GET /v0/city/{city}/config` | Expanded configured-agent inventory, including cold pools |
 | `GET /connections/{c}/city/{city}/rigs` | `GET /v0/city/{city}/rigs` | Rig discovery |
 | `GET /connections/{c}/city/{city}/agents` | `GET /v0/city/{city}/agents?rig=...` | Configured-agent discovery |
 | `GET /connections/{c}/city/{city}/providers/public` | `GET /v0/city/{city}/providers/public` | Browser-safe option schemas/defaults |
@@ -167,12 +168,13 @@ For ordinary REST, preserve the Supervisor status, `application/problem+json` bo
 
 ## 6. Exact Supervisor behavior
 
-The current per-city route registration includes agents, rigs, the browser-safe provider projection, all required session endpoints, and the structured session stream: [agent, provider, and rig routes](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/supervisor_city_routes.go#L55-L124) and [session routes](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/supervisor_city_routes.go#L361-L428). `providers/public` intentionally omits provider commands, arguments, environment, and prompt-delivery details while retaining option schemas/defaults: [public provider DTO](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_types_providers.go#L16-L47). At build time, generate or validate TypeScript wire types from the pinned `/openapi.json`; at runtime, capability-probe required routes and schema discriminants.
+The current per-city route registration includes expanded config, agents, rigs, the browser-safe provider projection, all required session endpoints, and the structured session stream: [expanded config projection](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_handlers_config.go#L14-L76), [agent, provider, and rig routes](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/supervisor_city_routes.go#L55-L124), and [session routes](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/supervisor_city_routes.go#L361-L428). `providers/public` intentionally omits provider commands, arguments, environment, and prompt-delivery details while retaining option schemas/defaults: [public provider DTO](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_types_providers.go#L16-L47). At build time, generate or validate TypeScript wire types from the pinned `/openapi.json`; at runtime, capability-probe required routes and schema discriminants.
 
 ### 6.1 Discovery
 
 - Load `GET .../sessions?state=all` as the master inventory and fetch later pages on demand with the opaque `next_cursor`; never pull an unbounded history just to build the hierarchy.
-- Fetch agents by `rig` where useful, but do not rely on a server-side session-template filter. Group the master session inventory beneath configured agents in the browser.
+- Load both `GET .../agents` and `GET .../config`. The live agent list can omit an unlimited pool while it has no running instance; synthesize an available configured target from each non-suspended config agent whose qualified identity is not already represented by a live agent name or `pool`. Reconstruct rig-qualified identities as `<dir>/<name>` exactly as Gasworks does. A synthesized target is a launch choice, not a claim that its provider command is ready; session creation remains authoritative.
+- Fetch agents by `rig` where useful, but do not rely on a server-side session-template filter. Group the master session inventory beneath the merged configured/live agent projection in the browser.
 - Project each loaded session beneath its matching configured agent. Put provider-created sessions, removed-agent sessions, and any other unmatched session in an explicit **Other sessions** group under the city so every discovered session remains attachable.
 - Treat the hierarchy as a presentation projection, not a new GC object model.
 - Fetch `providers/public` per selected city, cache it by the response's GC index/refresh generation, and match `session.provider` to its browser-safe option schema. If the provider or `permission_mode` choice schema is absent, hide/disable that control. Never expose the admin `/providers` or `/provider/{name}` DTOs, which include command and environment details.
@@ -195,11 +197,11 @@ Selecting a configured agent creates only a local draft. The first non-whitespac
 A successful HTTP response is `202` with `request_id` and `event_cursor`, not a created session. The current create-session contract has no `Idempotency-Key`, so a lost response is ambiguous and an automatic retry could create a duplicate. Send exactly one HTTP attempt. After receiving `202`, subscribe to the city event stream with `after_seq=<event_cursor>` and show **Starting…**. Match only the accepted `request_id` until:
 
 - `request.result.session.create`: resolve the returned session ID, select it, then bootstrap its feed;
-- `request.failed`: show the typed failure and retain the draft text for retry;
+- `request.failed`: conservatively show **Create outcome unknown**, include the typed Supervisor detail, preserve the draft, refresh authoritative session inventory, and block retry until the user acknowledges that inspection is required; the accepted create worker can report failure before or after observable side effects, and the event does not disambiguate them;
 - city stops or readiness is lost: show a recoverable lifecycle error;
 - the server's bounded create window expires: show the emitted failure, not a locally invented timeout success.
 
-If the connection fails before the client receives the `202`, show **Create outcome unknown**, preserve the draft, refresh the session list, and let the user inspect plausible new sessions. Do not guess a match or resubmit on the user's behalf. A later explicit retry is a new user decision and may duplicate a session. True exactly-once first-send behavior is blocked on upstream create-session idempotency.
+If transport fails before the client receives the `202`, show **Create outcome unknown**, preserve the draft, refresh the session list, and let the user inspect plausible new sessions. A received pre-acceptance HTTP rejection is a known failure. Do not guess a match or resubmit on the user's behalf. A later explicit retry is a new user decision and may duplicate a session. True exactly-once first-send behavior is blocked on upstream create-session idempotency.
 
 Gas City resolves the configured agent, creates in the background, waits up to 120 seconds for commandability, and then emits the result: [create resolution and readiness](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_handlers_sessions_command.go#L39-L74), [completion](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_handlers_sessions_command.go#L127-L229), and [event contract](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/docs/reference/api.md#L288-L300).
 
@@ -213,7 +215,7 @@ Send subsequent prompts to `POST .../session/{id}/submit`. Keep the default beha
 
 Only the alternative actions add an explicit `"intent": "follow_up"` or `"intent": "interrupt_now"`, and only when listed by `session.submission_capabilities`. Track the accepted `request_id` on the city event stream through `request.result.session.submit` or `request.failed`. Do not duplicate the user's message optimistically in the authoritative transcript; show a separate transient submission state until the session stream projects it.
 
-Submit also lacks an idempotency key. Send one HTTP attempt. A failure before `202` is **Submit outcome unknown**: keep the transcript, retain the prompt in an operation card, refresh session state, and do not resend or inject an optimistic user message.
+Submit also lacks an idempotency key. Send one HTTP attempt. A transport failure before `202` is **Submit outcome unknown**; a received pre-acceptance HTTP rejection is known. After `202`, `request.failed` with `error_code: resolve_failed` is a known pre-delivery failure, but any other reported failure is conservatively **Submit outcome unknown** because delivery may already have occurred. In every unknown case, keep the transcript, retain and disable the prompt, display the exact Supervisor diagnostic, refresh authoritative session state/transcript, require user acknowledgement before retry, and never resend or inject an optimistic user message.
 
 ### 6.4 Interactions
 
@@ -243,7 +245,7 @@ Map UI language to Supervisor semantics exactly:
 | Kill runtime | `POST .../kill` | Terminate runtime; a controller may later restart it |
 | Suspend | `POST .../suspend` | Enter suspended lifecycle state |
 | Wake | `POST .../wake` | Resume/relaunch through normal lifecycle |
-| Close permanently | `POST .../close` | Close the session permanently; destructive `?delete=true` is not exposed in v1 |
+| Close permanently | `POST .../close?delete=true` | Close the session and permanently delete its session bead |
 | Rename/title | `POST .../rename` | Send one nonempty `title`; apply the returned session without an optimistic rename |
 | Permission mode | `POST .../permission-mode` | Only while legal; values come from the provider option schema |
 
@@ -257,7 +259,7 @@ Create and submit completion use the city event stream, whose sequence is indepe
 
 1. Construct the watcher from the accepted `{operation, request_id, event_cursor}` before doing any other asynchronous work.
 2. Connect to `.../events/stream?after_seq=<event_cursor>`. Validate that every `event` frame has a numeric, monotonically advancing SSE ID and a well-formed envelope.
-3. Ignore heartbeats for cursor advancement. For a data event, first commit any matching terminal result/failure, then commit its sequence ID.
+3. Accept the Supervisor's named `event: heartbeat` frames and ignore them for cursor advancement. For a data event, first commit any matching terminal result/failure, then commit its sequence ID.
 4. Match both `request_id` and expected operation family. Ignore unrelated events; they never complete this request.
 5. On disconnect, keep the operation visibly pending and reconnect with `Last-Event-ID: <last committed event sequence>` using the same 500 ms-to-15 second jittered backoff policy. If no data event was committed, reconnect from the original `after_seq`.
 6. Reject a malformed/nonmonotonic stream and perform one reconnect from the last committed sequence. If replay is unavailable, the stream repeatedly closes before reaching a terminal event, the city is unregistered, or the contract failure recurs, mark the operation **Outcome unknown**. There is no request-status endpoint from which to reconstruct a missed terminal event.
@@ -540,27 +542,23 @@ Doctors return actionable success/warning/failure results for:
 
 ### End-to-end tests
 
-The PR-blocking deterministic browser contract uses a stateful mock only to prove packaging, BFF routing, UI behavior, and stream semantics. It rebuilds and byte-compares the artifact, installs it through the pack command into isolated GC/DSH homes, launches exact stock DSH on a random loopback port, drives Chrome through the public UI, proves created-session identity and its own stream, forces EOF/resume/reset, exercises all interaction shapes and submit intents, uninstalls, and verifies owned-state cleanup plus GC/profile preservation. It is never described as multi-provider certification.
+The PR-blocking deterministic browser contract uses a stateful mock only to prove packaging, BFF routing, UI behavior, and stream semantics. It rebuilds and byte-compares the artifact, installs it through the pack command into isolated GC/DSH homes, launches exact stock DSH on a random loopback port, drives Chrome through the public UI, merges a cold configured pool without duplicating its running member, creates from that cold pool, proves created-session identity and its own stream, forces EOF/resume/reset, exercises all interaction shapes and submit intents, injects ambiguous mutation outcomes, runs reconnect soak, uninstalls, and verifies owned-state cleanup plus GC/profile preservation. It is never described as multi-provider certification.
 
-The credentialed release certificate then repeats the shared stock-DSH UI path for at least two different real GC session providers:
+The credentialed release certificate then exercises the shared stock-DSH UI path for at least two different real GC session providers:
 
-1. Install the tarball with the pack command into a clean DSH home.
-2. Start stock loopback `dsh web`.
-3. Open Gas City from the sidebar.
-4. Discover a city/rig/agent and attach to an existing session.
-5. Select an agent, send the first prompt, observe **Starting…**, and transition on the terminal city event.
-6. Verify partial assistant text updates in place, reasoning toggle behavior, tool call/result rendering, and activity.
-7. Submit all advertised intents.
-8. Answer each approval alias, a free-text question, and a validated choice, waiting for `pending_cleared` each time.
-9. Interrupt a turn and exercise safe lifecycle controls.
-10. Break/recover the network, expire a cursor, restart Supervisor, and verify bounded recovery.
-11. Uninstall and prove the DSH profile and GC configuration are otherwise unchanged.
+1. Create a disposable city through `gc init` without `--no-start`; wait for Supervisor health and prove that exact city is `running: true` before DSH starts.
+2. Import two pack-owned on-demand agents backed by distinct real providers, reload, and verify their authoritative provider identities.
+3. Install the tarball with the pack command into a clean DSH home and start stock loopback `dsh web`.
+4. Open Gas City from the sidebar, discover each agent, and create its session on first send through the correlated city-event lifecycle.
+5. For each provider, verify a final nonce in the authoritative structured transcript, submit a second prompt requiring a harmless read-only tool, and prove a new matching tool-use/tool-result pair both authoritatively and in the UI.
+6. Close each run-owned session permanently, uninstall the plugin, restore the DSH profile, stop the disposable city, uninstall the isolated Supervisor service, and remove only the run-owned temporary root.
+7. On failure, preserve browser errors/responses, visible DOM, screenshot, Supervisor health, city/session/agent state, recent city events, and `gc status` before cleanup.
 
 ## 16. Phased implementation and release gates
 
 ### Phase 0 — DSH packaging spike
 
-**Baseline status: implementation and deterministic compatibility gates complete; live cross-provider evidence pending.**
+**Baseline status: complete, including isolated live cross-provider evidence.**
 
 - Build the smallest two-sided package.
 - Prove sidebar action, overlay, same-origin REST, and relayed SSE in stock `0.1.1-rc.2`.
@@ -582,19 +580,19 @@ The credentialed release certificate then repeats the shared stock-DSH UI path f
 
 - Implement hierarchy, session list/state, structured bootstrap, SSE reducer, reconnection/rebootstrap, transcript renderer, activity/errors, and thinking preference.
 
-**Deterministic gate:** structured parity fixtures and stock-DSH browser recovery render correctly through reset and reconnect paths. **Release gate:** live sessions from two distinct providers remain required.
+**Deterministic gate:** structured parity fixtures and stock-DSH browser recovery render correctly through reset and reconnect paths. **Release gate:** passed with live Claude and Codex sessions through the same stock-DSH browser path.
 
 ### Phase 3 — mutations and interactions
 
-**Baseline status: implementation and deterministic interaction/control gates complete; live cross-provider evidence pending.**
+**Baseline status: complete, including live create, submit, structured tool evidence, and permanent close for two providers.**
 
 - Add draft/create-on-first-send, submit intents, pending interactions, `/respond`, and lifecycle controls.
 
-**Deterministic gate:** async request correlation/recovery, no-automatic-mutation-retry behavior, approval aliases, questions, choices, submit intents, and interruption pass in contract/browser coverage. **Release gate:** repeat those behaviors against credentialed live providers.
+**Deterministic gate:** async request correlation/recovery, no-automatic-mutation-retry behavior, approval aliases, questions, choices, submit intents, and interruption pass in contract/browser coverage. **Release gate:** live create/default-submit/tool-stream/permanent-close behavior passed for Claude and Codex; failure injection retains broader deterministic coverage.
 
 ### Phase 4 — pack delivery and release candidate
 
-**Baseline status: deterministic pack/install/doctor/browser gates complete; cross-provider live certification and release publication remain.**
+**Baseline status: implementation and all local release gates complete; release publication remains.**
 
 - Add schema-v2 manifest, commands/help, doctors, deterministic artifact, checksums, status/uninstall, compatibility matrix, and operator docs.
 
@@ -610,7 +608,9 @@ The credentialed release certificate then repeats the shared stock-DSH UI path f
 - **No connection editor:** users manage endpoints and credentials with `gc context`; the workspace refreshes that authoritative configuration.
 - **Configured agents only:** raw provider create is intentionally excluded until there is a product need and a capability-safe UX.
 - **No create/submit/respond idempotency:** the current Supervisor create, submit, and interaction-response operations have no idempotency header. The pack sends one attempt, distinguishes received HTTP rejection from transport uncertainty, disables an uncertain pending response through authoritative refresh, and reports a lost response/result as an unknown outcome. A strict exactly-once guarantee depends on an upstream GC API addition.
-- **Live provider evidence:** deterministic fixtures prove the complete UI and transport contract, not provider neutrality. Release certification requires two real provider identities through the same isolated stock-DSH/pack path and remains unproven until that operator gate produces a passing certificate.
+- **Isolated storage exception:** the live release fixture currently selects `GC_BEADS=file` because default managed-Dolt `gc init` is blocked on the audited machine by its installed `bd`/Dolt compatibility. The fixture still uses `gc init`, lets it start the isolated Supervisor/city, and proves `running: true`; it does not certify the default storage path.
+- **Live provider scope:** the isolated certificate passed for Claude and Codex through the same stock-DSH/pack path. That proves the provider-neutral boundary for two real providers on the audited baseline, not every current or future Gas City provider.
+- **macOS live-fixture path:** the certificate creates its disposable city under `~/Library/Caches`, avoiding the audited GC Codex rollout lookup's lexical `/tmp` versus `/private/tmp` `cwd` mismatch. This affects only the disposable release fixture and does not rewrite user city paths.
 - **Multi-browser fan-out:** one upstream SSE per active browser/session is an intentional v1 scope and scaling tradeoff. A shared host-side fan-out cache is a later optimization only if measurements justify its complexity; it is not an upstream dependency.
 
 ## 18. Acceptance criteria

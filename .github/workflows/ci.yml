@@ -164,7 +164,9 @@ jobs:
       - name: Run stock DSH browser contract
         working-directory: deepseek-harness-ui/assets/dsh-plugin
         timeout-minutes: 8
-        run: pnpm test:e2e:contract
+        run: |
+          pnpm test:e2e:contract
+          pnpm test:e2e:soak
 
       - name: Upload Playwright failure diagnostics
         if: ${{ failure() && !cancelled() }}

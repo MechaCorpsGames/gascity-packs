@@ -14,6 +14,7 @@ const compatibility = JSON.parse(readFileSync(process.env.GC_DEEPSEEK_HARNESS_UI
 const required = {
   '/v0/cities': ['get'],
   '/v0/city/{cityName}/events/stream': ['get'],
+  '/v0/city/{cityName}/config': ['get'],
   '/v0/city/{cityName}/rigs': ['get'],
   '/v0/city/{cityName}/agents': ['get'],
   '/v0/city/{cityName}/providers/public': ['get'],

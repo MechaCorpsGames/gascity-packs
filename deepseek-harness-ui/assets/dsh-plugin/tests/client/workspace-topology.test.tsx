@@ -30,6 +30,7 @@ describe('Gas City topology', () => {
   it('keeps city-level and mismatched-rig agents and their sessions navigable', async () => {
     const fetchBoundary = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
+      if (path.endsWith('/config')) return Response.json({ workspace: { name: 'gastown' }, agents: [], rigs: [] })
       if (path.endsWith('/connections')) return Response.json({ connections: [
         { id: 'local', label: 'Local Supervisor', cities: ['gastown'], available: true },
       ] })
@@ -71,6 +72,7 @@ describe('Gas City topology', () => {
     const fetchBoundary = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
       requested.push(path)
+      if (path.endsWith('/config')) return Response.json({ workspace: { name: 'gastown' }, agents: [], rigs: [] })
       if (path.endsWith('/connections')) return Response.json({ connections: [
         { id: 'local', label: 'Local Supervisor', cities: ['gastown'], available: true },
       ] })
@@ -111,6 +113,7 @@ describe('Gas City topology', () => {
     const fetchBoundary = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
       requested.push(path)
+      if (path.endsWith('/config')) return Response.json({ workspace: { name: 'gastown' }, agents: [], rigs: [] })
       if (path.endsWith('/connections')) return Response.json({ connections: [
         { id: 'local', label: 'Local Supervisor', cities: ['gastown'], available: true },
       ] })
@@ -162,6 +165,10 @@ describe('Gas City topology', () => {
     const oldPageBlocked = new Promise<void>(resolve => { releaseOldPage = resolve })
     const fetchBoundary = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
+      if (path.endsWith('/config')) {
+        const cityName = path.includes('/city/newtown/') ? 'newtown' : 'oldtown'
+        return Response.json({ workspace: { name: cityName }, agents: [], rigs: [] })
+      }
       if (path.endsWith('/connections')) return Response.json({ connections: [
         { id: 'local', label: 'Local Supervisor', cities: ['oldtown', 'newtown'], available: true },
       ] })
