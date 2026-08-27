@@ -1,8 +1,46 @@
 import type { CityOperationDescriptor, CityOperationPort } from './feed/index.js'
 import type { CityEventStreamRequest } from './feed/index.js'
+import { parseSessionSummary, type SessionSummary } from './api.js'
 
 export type SubmitIntent = 'default' | 'follow_up' | 'interrupt_now'
 export type SessionControl = 'stop' | 'kill' | 'suspend' | 'close' | 'wake'
+
+export class SupervisorRequestError extends Error {
+  readonly status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'SupervisorRequestError'
+    this.status = status
+  }
+}
+
+export class SupervisorOutcomeUnknownError extends Error {
+  readonly status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'SupervisorOutcomeUnknownError'
+    this.status = status
+  }
+}
+
+async function requestError(response: Response): Promise<SupervisorRequestError | SupervisorOutcomeUnknownError> {
+  let detail: string | undefined
+  let outcomeUnknown = false
+  try {
+    const problem = await response.json() as Record<string, unknown>
+    outcomeUnknown = problem.code === 'outcome_unknown'
+    if (typeof problem.detail === 'string' && problem.detail !== '') detail = problem.detail
+    else if (typeof problem.title === 'string' && problem.title !== '') detail = problem.title
+  } catch {
+    // The status is still a known HTTP result even if the body is not Problem Details.
+  }
+  const message = detail ?? `Gas City gateway returned HTTP ${response.status}`
+  return outcomeUnknown
+    ? new SupervisorOutcomeUnknownError(response.status, message)
+    : new SupervisorRequestError(response.status, message)
+}
 
 export function allowedSessionControls(state: string, activity?: string): readonly SessionControl[] {
   if (state === 'active' || state === 'awake') {
@@ -25,6 +63,9 @@ export interface SupervisorOperations {
   submitSession(sessionId: string, message: string, intent?: SubmitIntent): Promise<CityOperationDescriptor>
   createAgentSession(agentName: string, message: string): Promise<CityOperationDescriptor>
   controlSession(sessionId: string, control: SessionControl): Promise<void>
+  fetchSession(sessionId: string): Promise<SessionSummary>
+  renameSession(sessionId: string, title: string): Promise<SessionSummary>
+  setPermissionMode(sessionId: string, permissionMode: string): Promise<SessionSummary>
   cityOperationPort: CityOperationPort
 }
 
@@ -86,6 +127,19 @@ async function consumeCityEvents(
 export function createSupervisorOperations(config: SupervisorOperationsConfig): SupervisorOperations {
   const request = config.fetch ?? globalThis.fetch
   const base = `/api/gas-city/v1/connections/${encodeURIComponent(config.connectionId)}/city/${encodeURIComponent(config.cityName)}`
+  const updateSession = async (
+    sessionId: string,
+    suffix: 'rename' | 'permission-mode',
+    body: Readonly<Record<string, string>>,
+  ): Promise<SessionSummary> => {
+    const response = await request(`${base}/session/${encodeURIComponent(sessionId)}/${suffix}`, {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!response.ok) throw await requestError(response)
+    return parseSessionSummary(await response.json())
+  }
   return {
     async submitSession(sessionId, message, intent) {
       if (message.trim() === '') throw new Error('Message is required')
@@ -96,7 +150,7 @@ export function createSupervisorOperations(config: SupervisorOperationsConfig): 
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (response.status !== 202) throw new Error(`Gas City gateway returned HTTP ${response.status}`)
+      if (response.status !== 202) throw await requestError(response)
       const accepted = await response.json() as AcceptedWire
       return {
         requestId: accepted.request_id,
@@ -111,7 +165,7 @@ export function createSupervisorOperations(config: SupervisorOperationsConfig): 
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify({ kind: 'agent', name: agentName, message, async: true }),
       })
-      if (response.status !== 202) throw new Error(`Gas City gateway returned HTTP ${response.status}`)
+      if (response.status !== 202) throw await requestError(response)
       const accepted = await response.json() as AcceptedWire
       return {
         requestId: accepted.request_id,
@@ -124,7 +178,22 @@ export function createSupervisorOperations(config: SupervisorOperationsConfig): 
         method: 'POST',
         headers: { Accept: 'application/json' },
       })
-      if (!response.ok) throw new Error(`Gas City gateway returned HTTP ${response.status}`)
+      if (!response.ok) throw await requestError(response)
+    },
+    async fetchSession(sessionId) {
+      const response = await request(`${base}/session/${encodeURIComponent(sessionId)}`, {
+        headers: { Accept: 'application/json' },
+      })
+      if (!response.ok) throw await requestError(response)
+      return parseSessionSummary(await response.json())
+    },
+    async renameSession(sessionId, title) {
+      if (title.trim() === '') throw new Error('Session title is required')
+      return await updateSession(sessionId, 'rename', { title: title.trim() })
+    },
+    async setPermissionMode(sessionId, permissionMode) {
+      if (permissionMode.trim() === '') throw new Error('Permission mode is required')
+      return await updateSession(sessionId, 'permission-mode', { permission_mode: permissionMode.trim() })
     },
     cityOperationPort: {
       async openCityEventStream(callbacks) {

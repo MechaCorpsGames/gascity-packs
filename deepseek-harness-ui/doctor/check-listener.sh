@@ -51,14 +51,26 @@ function inspect(chunk) {
       response.on('data', (chunk) => { body = (body + chunk).slice(0, 65536) })
       response.on('end', () => {
         let valid = false
+        let unavailable = []
         try {
           const parsed = JSON.parse(body)
           valid = response.statusCode === 200 && Array.isArray(parsed.connections)
+          if (valid && process.env.GC_REQUIRE_AVAILABLE_CONNECTIONS === '1') {
+            unavailable = parsed.connections.filter(connection => connection?.available !== true)
+            valid = unavailable.length === 0
+          }
         } catch {}
+        const unavailableSummary = unavailable.map(connection => {
+          const label = typeof connection?.label === 'string' ? connection.label : 'unnamed connection'
+          const diagnostic = typeof connection?.diagnostic === 'string' ? connection.diagnostic : 'unavailable'
+          return `${label.replace(/[\r\n]/g, ' ')}: ${diagnostic.replace(/[\r\n]/g, ' ')}`.slice(0, 500)
+        }).join('; ')
         finish(
           valid,
           valid
             ? 'DSH loopback boot and pack route probe succeeded'
+            : unavailable.length > 0
+              ? `DSH pack route reported unavailable connections: ${unavailableSummary}`
             : 'DSH booted, but the pack connections route did not return its JSON contract',
         )
       })

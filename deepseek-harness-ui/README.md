@@ -34,18 +34,24 @@ The workspace presents this hierarchy:
 ```text
 Supervisor
   └─ City
-      └─ Rig
-          └─ Configured agent
-              └─ Sessions
+      ├─ Rig
+      │   └─ Configured agent
+      │       └─ Sessions
+      └─ City-level or unmatched configured agent
+          └─ Sessions
 ```
 
 - Selecting an existing session attaches to it without mutating it.
 - Selecting an agent opens a draft. The first send creates the GC session with that initial message through the normal asynchronous Supervisor lifecycle.
 - The transcript updates incrementally with assistant text, reasoning, tool calls, tool results, interactions, errors, and activity.
 - Ordinary **Send** leaves the Supervisor's default intent implicit. The composer adds `follow_up` and `interrupt_now` only when the session advertises them.
-- Pending approvals and questions are answered through the Supervisor's `/respond` endpoint.
+- Pending approval aliases, free-text questions, and validated choices are answered through the Supervisor's `/respond` endpoint. An uncertain response is disabled while the client refreshes authoritative pending state; it is never resent automatically.
 - Interrupt, kill, suspend, wake, and **Close permanently** are shown only when the verified session state/activity matrix permits them. Kill and close require confirmation.
 - Reconnects use the Supervisor's opaque cursor and reset semantics. The UI never invents a parallel transcript.
+- Session discovery follows opaque pagination cursors, reports partial inventories, and filters the sessions already loaded.
+- A browser-only **Show reasoning** preference reboots the feed when changed, so redacted and unredacted cursor domains never mix.
+- Rename and provider-schema permission-mode settings use their dedicated Supervisor operations; permission mode stays disabled unless the session is clearly dormant.
+- Provider-neutral prompt, system-event, usage, diagnostic, image, and attachment metadata render without fetching untrusted paths or URLs.
 
 Local discovery reuses `~/.gc/supervisor.toml`. Remote discovery reuses `~/.gc/contexts.toml`, grouping contexts that address the same Supervisor while retaining their city-specific access profiles. There is no second connection or credential editor in v1.
 
@@ -58,7 +64,7 @@ V1 deliberately does not include:
 - tmux wrappers or DSH execution sessions;
 - transcript mirroring or conversion to provider-specific JSONL;
 - raw provider session creation—the create surface is limited to configured GC agents;
-- attachment upload or local-file proxying;
+- attachment upload or local-file proxying (safe transcript metadata is displayed);
 - support for a direct read-grant-hardened Supervisor, because the current GC context contract has no read-grant client source;
 - a connection editor, city/rig/agent administration, or replacement of DSH's own screens.
 
@@ -68,17 +74,20 @@ The default supported deployment is a loopback-bound `dsh web`. Stock DSH curren
 
 The schema-v2 pack ships a prebuilt, checksum-pinned DSH plugin artifact plus explicit install, uninstall, web, status, and doctor commands. It reuses `slack-full`'s pack delivery conventions, not its connector architecture. There is no `[[service]]` block: the DSH host process itself supplies the pack-owned gateway.
 
-The audited runtime pins are in [`assets/versions.env`](assets/versions.env). Installation intentionally fails when Node, DSH, pnpm, the artifact checksum, profile composition, listener trust boundary, GC contexts, or required Supervisor capabilities do not match.
+The audited runtime pins are in [`assets/versions.env`](assets/versions.env). Installation fails when the local Node/DSH/pnpm versions, artifact checksum, profile composition, or loopback pack route do not match. `status --check` separately validates GC contexts, reports unavailable pack connections, and probes the explicitly selected direct Supervisor target (or the loopback default) against the minimized route/schema contract in [`assets/supervisor-contract.json`](assets/supervisor-contract.json).
 
 ## Verification
 
 The implementation was developed through red-green TDD and currently passes:
 
-- 100 plugin unit, contract, host-boundary, feed-recovery, and React workspace tests;
-- 20 black-box pack/install/uninstall tests;
+- 129 plugin unit, contract, host-boundary, feed-recovery, E2E-infrastructure, and React workspace tests;
+- 23 black-box pack/install/uninstall tests;
 - TypeScript no-emit checking and production host/client builds;
 - ShellCheck, `gc lint`, and the checksum doctor;
-- an isolated stock `dsh web` install in real Chrome, including connection and topology discovery, structured SSE upsert rendering, tool results, pending response, and prompt submission.
+- a checked-in, isolated stock `dsh web` browser contract in headless Chrome, including real pack install/uninstall, random-port Supervisor fixture, topology pagination, structured SSE EOF/resume/reset recovery, reasoning rebootstrap, all interaction shapes and submission intents, rename, permission mode, lifecycle control, and create-on-first-send attached to the created session's own stream;
+- a deterministic rebuild that byte-compares the produced `.tgz` with the checksum-pinned artifact.
+
+Live multi-provider certification is deliberately separate from the deterministic fixture gate. The `pnpm test:e2e:live` operator gate fails as **UNPROVEN** unless explicitly authorized credentials identify at least two configured agents backed by distinct provider identities. Machine-specific provider readiness belongs in the generated certificate/run log, not in this README.
 
 See [the implementation plan](assets/implementation-plan.md) for the verified APIs, state machines, security model, proposed pack tree, tests, phases, and immutable source citations.
 

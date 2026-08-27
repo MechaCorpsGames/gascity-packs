@@ -41,7 +41,7 @@ jobs:
         run: python3 validate_registry.py --require-git
 
       - name: Run Python pack tests
-        run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests oversight-rig/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests -q
+        run: python3 -m pytest tests contributing/tests gascity/tests discord/tests github/tests oversight-rig/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests deepseek-harness-ui/tests -q
 
       - name: Lint and exercise shared role prompt composition
         run: |
@@ -58,7 +58,7 @@ jobs:
           # pinning them would waive findings most contributors never see.
           # Refute: gc lint oversight-rig  (0 findings on main, 4 on v1.4.1)
           for pack in gascity gascity/roles bmad compound-engineering gstack superpowers profiler \
-                      pr-pipeline slack-channel slack-full slack-mini; do
+                      pr-pipeline slack-channel slack-full slack-mini deepseek-harness-ui; do
             "$GC_BIN" lint "$pack"
           done
           GC_TEST_BIN="$GC_BIN" python3 -m pytest tests/test_gc_role_prompt_integration.py -q
@@ -125,3 +125,54 @@ jobs:
         run: |
           go install github.com/gastownhall/gascity/cmd/gc@latest
           GC_BIN="$(go env GOPATH)/bin/gc" ./conformance.sh
+
+  deepseek-harness-ui:
+    name: DeepSeek Harness UI browser contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.19.0
+
+      - name: Install exact pnpm
+        run: npm install --global pnpm@11.7.0
+
+      - name: Install exact dependencies
+        working-directory: deepseek-harness-ui/assets/dsh-plugin
+        timeout-minutes: 8
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        working-directory: deepseek-harness-ui/assets/dsh-plugin
+        timeout-minutes: 12
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run unit, type, build, and deterministic artifact gates
+        working-directory: deepseek-harness-ui/assets/dsh-plugin
+        timeout-minutes: 8
+        run: |
+          pnpm test
+          pnpm typecheck
+          pnpm build
+          pnpm test:e2e:install
+
+      - name: Run stock DSH browser contract
+        working-directory: deepseek-harness-ui/assets/dsh-plugin
+        timeout-minutes: 8
+        run: pnpm test:e2e:contract
+
+      - name: Upload Playwright failure diagnostics
+        if: ${{ failure() && !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: deepseek-harness-ui-playwright-${{ github.run_id }}
+          path: |
+            deepseek-harness-ui/assets/dsh-plugin/playwright-report/
+            deepseek-harness-ui/assets/dsh-plugin/test-results/
+          retention-days: 7
+          if-no-files-found: ignore

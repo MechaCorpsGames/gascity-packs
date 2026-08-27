@@ -5,4 +5,5 @@ assets/dsh-plugin/lib/
 # Local test and coverage output.
 assets/dsh-plugin/coverage/
 assets/dsh-plugin/.vitest/
-
+assets/dsh-plugin/test-results/
+assets/dsh-plugin/playwright-report/

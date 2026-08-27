@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import type { ComponentType } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -44,6 +44,7 @@ describe('Gas City create on first send', () => {
       if (path.endsWith('/agents')) return Response.json({ items: [
         { name: 'main/crew', rig: 'main', provider: 'codex', running: true, suspended: false, available: true, state: 'running' },
       ], total: 1 })
+      if (path.endsWith('/providers/public')) return Response.json({ items: [], total: 0 })
       if (path.endsWith('/sessions?state=all')) return Response.json({ items: [], total: 0 })
       if (path.endsWith('/city/gastown/sessions') && init?.method === 'POST') return Response.json({
         status: 'accepted', request_id: 'create-1', event_cursor: '77',
@@ -88,6 +89,16 @@ describe('Gas City create on first send', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Start session' }))
 
     expect(await screen.findByRole('heading', { name: 'Start repair' })).toBeTruthy()
+    const topology = screen.getByRole('navigation', { name: 'Gas City topology' })
+    const createdSession = within(topology).getByRole('button', { name: 'Start repair' })
+    expect(createdSession.getAttribute('aria-pressed')).toBe('true')
+    expect(within(topology).getByText('Loaded 1 of 1 sessions')).toBeTruthy()
+
+    fireEvent.click(within(topology).getByRole('button', { name: 'main/crew' }))
+    expect(screen.getByRole('heading', { name: 'New session with main/crew' })).toBeTruthy()
+    fireEvent.click(within(topology).getByRole('button', { name: 'Start repair' }))
+    expect(screen.getByRole('heading', { name: 'Start repair' })).toBeTruthy()
+    expect(within(topology).getAllByRole('button', { name: 'Start repair' })).toHaveLength(1)
     const creates = calls.filter(call => call.path.endsWith('/city/gastown/sessions') && call.init?.method === 'POST')
     expect(creates).toHaveLength(1)
     expect(creates[0]?.init?.body).toBe(JSON.stringify({

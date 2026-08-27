@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "baseline": "gascity@1807cf018045e9f225993d97cf6daea37e2ce6e9",
+  "required_schema_literals": [
+    "session.structured.v1",
+    "snapshot",
+    "upsert",
+    "reset",
+    "resume_invalid",
+    "stream_changed",
+    "cursor_invalidated",
+    "history_rewritten",
+    "unknown",
+    "partial",
+    "final",
+    "superseded",
+    "default",
+    "follow_up",
+    "interrupt_now",
+    "structured",
+    "activity",
+    "pending",
+    "pending_cleared"
+  ]
+}

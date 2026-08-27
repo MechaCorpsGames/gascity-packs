@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { createProductionBoundary } from './boundary.js'
+import { createProductionBoundary, GatewayDispatchError } from './boundary.js'
 
 const routePrefix = '/api/gas-city/v1'
 
@@ -97,6 +97,7 @@ function writeProblem(
   status: number,
   title: string,
   detail: string,
+  code?: string,
 ): void {
   response.statusCode = status
   response.setHeader('Content-Type', 'application/problem+json; charset=utf-8')
@@ -105,6 +106,7 @@ function writeProblem(
     title,
     status,
     detail,
+    ...(code === undefined ? {} : { code }),
   }))
 }
 
@@ -550,15 +552,27 @@ export function apply(ctx: Context, config: Config = {}): void {
             writeProblem(response, 400, 'Invalid request', 'The request body or content type is not accepted by this route')
             return
           }
+          let upstreamReceived = false
           try {
-            await relayResponse(await boundary.proxy(gatewayRequest), response)
+            const upstream = await boundary.proxy(gatewayRequest)
+            upstreamReceived = true
+            await relayResponse(upstream, response)
           } catch (error) {
             if (response.headersSent) {
               response.destroy()
               return
             }
             const failure = gatewayFailure(error)
-            writeProblem(response, failure.status, failure.title, failure.detail)
+            const mutationOutcomeUnknown = mapped.method !== 'GET'
+              && failure.status === 502
+              && (upstreamReceived || error instanceof GatewayDispatchError)
+            writeProblem(
+              response,
+              failure.status,
+              failure.title,
+              failure.detail,
+              ...(mutationOutcomeUnknown ? ['outcome_unknown'] : []),
+            )
           }
           return
         }

@@ -13,6 +13,13 @@ import type {
 } from './index.js'
 import { ProcessAuthHelpers } from './helpers.js'
 
+export class GatewayDispatchError extends Error {
+  constructor(cause: unknown) {
+    super('Supervisor transport failed after dispatch began', { cause })
+    this.name = 'GatewayDispatchError'
+  }
+}
+
 interface AccessProfile {
   name: string
   endpoint: string
@@ -399,7 +406,11 @@ class ProductionBoundary implements HostBoundary {
         ...(request.body === undefined ? {} : { body: request.body }),
         ...(dispatcher === undefined ? {} : { dispatcher }),
       }
-      return this.fetchFn(`${profile.endpoint}${request.path}${query}`, init as RequestInit)
+      try {
+        return await this.fetchFn(`${profile.endpoint}${request.path}${query}`, init as RequestInit)
+      } catch (cause) {
+        throw new GatewayDispatchError(cause)
+      }
     }
     let response = await call(false)
     const isSSE = request.headers.accept === 'text/event-stream'

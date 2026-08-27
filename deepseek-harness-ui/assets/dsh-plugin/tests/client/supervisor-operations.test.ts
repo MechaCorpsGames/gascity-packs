@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { allowedSessionControls, createSupervisorOperations } from '../../src/client/index.js'
+import { allowedSessionControls, createSupervisorOperations, SupervisorRequestError } from '../../src/client/index.js'
 
 describe('Supervisor operations', () => {
   it('fails closed while exposing the exact supported lifecycle matrix', () => {
@@ -114,6 +114,94 @@ describe('Supervisor operations', () => {
         method: 'POST',
         headers: { Accept: 'application/json' },
       },
+    )
+  })
+
+  it('reads the authoritative session after a synchronous mutation', async () => {
+    const authoritative = {
+      id: 'session-1', template: 'main/crew', state: 'suspended', title: 'Repair alerts',
+      provider: 'codex', session_name: 'crew', created_at: '2026-08-26T00:00:00Z', running: false,
+      activity: 'idle', options: { permission_mode: 'plan' },
+    }
+    const fetchBoundary = vi.fn(async () => Response.json(authoritative))
+    const operations = createSupervisorOperations({
+      connectionId: 'local', cityName: 'gastown', fetch: fetchBoundary,
+    })
+
+    await expect(operations.fetchSession('session-1')).resolves.toEqual(authoritative)
+    expect(fetchBoundary).toHaveBeenCalledWith(
+      '/api/gas-city/v1/connections/local/city/gastown/session/session-1',
+      { headers: { Accept: 'application/json' } },
+    )
+  })
+
+  it('renames sessions through the dedicated Supervisor operation', async () => {
+    const updated = {
+      id: 'session-1', template: 'main/crew', state: 'suspended', title: 'Release repair',
+      provider: 'codex', session_name: 'crew', created_at: '2026-08-26T00:00:00Z', running: false,
+    }
+    const fetchBoundary = vi.fn(async () => Response.json(updated))
+    const operations = createSupervisorOperations({
+      connectionId: 'local', cityName: 'gastown', fetch: fetchBoundary,
+    })
+
+    await expect(operations.renameSession('session-1', 'Release repair')).resolves.toEqual(updated)
+    expect(fetchBoundary).toHaveBeenCalledWith(
+      '/api/gas-city/v1/connections/local/city/gastown/session/session-1/rename',
+      {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'Release repair' }),
+      },
+    )
+  })
+
+  it('updates permission mode only with an explicit schema value', async () => {
+    const updated = {
+      id: 'session-1', template: 'main/crew', state: 'suspended', title: 'Repair alerts',
+      provider: 'codex', session_name: 'crew', created_at: '2026-08-26T00:00:00Z', running: false,
+      options: { permission_mode: 'plan' },
+    }
+    const fetchBoundary = vi.fn(async () => Response.json(updated))
+    const operations = createSupervisorOperations({
+      connectionId: 'local', cityName: 'gastown', fetch: fetchBoundary,
+    })
+
+    await expect(operations.setPermissionMode('session-1', 'plan')).resolves.toEqual(updated)
+    expect(fetchBoundary).toHaveBeenCalledWith(
+      '/api/gas-city/v1/connections/local/city/gastown/session/session-1/permission-mode',
+      {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ permission_mode: 'plan' }),
+      },
+    )
+  })
+
+  it('preserves a received Problem Details rejection as a known HTTP failure', async () => {
+    const fetchBoundary = vi.fn(async () => Response.json({
+      type: 'https://docs.gascity.com/problems/conflict',
+      title: 'Session conflict',
+      status: 409,
+      detail: 'Session is closed',
+    }, { status: 409 }))
+    const operations = createSupervisorOperations({
+      connectionId: 'local', cityName: 'gastown', fetch: fetchBoundary,
+    })
+
+    const failure = operations.submitSession('session-1', 'Try once')
+    await expect(failure).rejects.toBeInstanceOf(SupervisorRequestError)
+    await expect(failure).rejects.toMatchObject({ status: 409, message: 'Session is closed' })
+  })
+
+  it('leaves transport loss distinguishable from a received rejection', async () => {
+    const fetchBoundary = vi.fn(async () => { throw new TypeError('fetch failed') })
+    const operations = createSupervisorOperations({
+      connectionId: 'local', cityName: 'gastown', fetch: fetchBoundary,
+    })
+
+    await expect(operations.createAgentSession('main/crew', 'Try once')).rejects.toEqual(
+      expect.objectContaining({ name: 'TypeError', message: 'fetch failed' }),
     )
   })
 })

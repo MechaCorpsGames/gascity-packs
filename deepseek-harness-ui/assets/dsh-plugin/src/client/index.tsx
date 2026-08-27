@@ -1,16 +1,19 @@
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
-import { useEffect, useState, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 
 import {
   loadCities,
   loadCityTopology,
   loadConnectionInventory,
+  loadSessionPage,
+  parseSessionSummary,
   type CityInventory,
   type CityTopology,
   type ConnectionInventory,
   type AgentSummary,
+  type ProviderPublicSummary,
   type SessionSummary,
 } from './api.js'
 import {
@@ -25,6 +28,8 @@ import { createSupervisorFeedPort } from './supervisor-feed-port.js'
 import {
   allowedSessionControls,
   createSupervisorOperations,
+  SupervisorOutcomeUnknownError,
+  SupervisorRequestError,
   type SessionControl,
   type SubmitIntent,
 } from './supervisor-operations.js'
@@ -33,6 +38,8 @@ export { createSupervisorFeedPort, type SupervisorFeedPortConfig } from './super
 export {
   allowedSessionControls,
   createSupervisorOperations,
+  SupervisorOutcomeUnknownError,
+  SupervisorRequestError,
   type SubmitIntent,
   type SupervisorOperationsConfig,
 } from './supervisor-operations.js'
@@ -40,7 +47,35 @@ export {
 export const inject = ['slots']
 
 const GAS_CITY_HASH = '#/gas-city'
+const THINKING_PREFERENCE_KEY = 'gastownhall.deepseek-harness-ui.show-reasoning'
 let previousHash = '#/'
+
+function readThinkingPreference(): boolean {
+  try {
+    return window.localStorage.getItem(THINKING_PREFERENCE_KEY) === 'true'
+  } catch {
+    return false
+  }
+}
+
+function writeThinkingPreference(value: boolean): void {
+  try {
+    window.localStorage.setItem(THINKING_PREFERENCE_KEY, String(value))
+  } catch {
+    // Storage can be unavailable in hardened or ephemeral browser profiles.
+  }
+}
+
+function mutationFailure(action: string, reason: unknown): { message: string; refresh: boolean } {
+  const detail = reason instanceof Error ? reason.message : String(reason)
+  if (reason instanceof SupervisorRequestError) {
+    return { message: `${action} rejected: ${detail}`, refresh: false }
+  }
+  if (reason instanceof SupervisorOutcomeUnknownError) {
+    return { message: `${action} outcome unknown: ${detail}`, refresh: true }
+  }
+  return { message: `${action} outcome unknown: ${detail}`, refresh: true }
+}
 
 const gasCityStyles = `
 .gc-launch {
@@ -94,6 +129,11 @@ const gasCityStyles = `
   background: var(--dsw-specific-sidebar, var(--dsw-alias-bg-layer-1, #fff)); overflow-y: auto;
 }
 .gc-topology > p { margin: 8px; color: var(--dsw-alias-label-tertiary, #81858c); font-size: 12px; }
+.gc-topology-search {
+  width: calc(100% - 16px); height: 32px; margin: 8px; padding: 5px 9px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.1)); border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; font: inherit; font-size: 12px;
+}
 .gc-topology > section { margin-bottom: 10px; }
 .gc-topology section section { margin: 2px 0 2px 10px; padding-left: 8px; border-left: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.1)); }
 .gc-topology h2 {
@@ -113,6 +153,15 @@ const gasCityStyles = `
 .gc-session-controls { flex: none; display: flex; flex-wrap: wrap; gap: 5px; padding: 0 28px 12px; }
 .gc-session-controls button { color: var(--dsw-alias-label-secondary, #61666b); }
 .gc-session-controls button:last-child { color: var(--dsw-alias-state-error-primary, #d44); }
+.gc-session-controls label { display: flex; align-items: center; gap: 6px; padding: 4px 7px; color: var(--dsw-alias-label-secondary, #61666b); font-size: 12px; }
+.gc-session-settings {
+  flex: none; display: flex; flex-wrap: wrap; align-items: end; gap: 8px; padding: 0 32px 12px;
+}
+.gc-session-settings label { display: grid; gap: 4px; color: var(--dsw-alias-label-tertiary, #81858c); font-size: 11px; }
+.gc-session-settings input, .gc-session-settings select {
+  height: 32px; min-width: 180px; padding: 5px 8px; border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.1));
+  border-radius: 8px; background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; font: inherit; font-size: 12px;
+}
 .gc-transcript { flex: 1; min-height: 0; overflow-y: auto; padding: 14px max(32px, calc((100% - 820px) / 2)) 40px; }
 .gc-message {
   width: min(100%, 820px); margin: 0 auto 18px; padding: 18px 20px;
@@ -212,6 +261,9 @@ function GasCityWorkspace(): React.JSX.Element {
   const [selectedAgent, setSelectedAgent] = useState<AgentSummary | null>(null)
   const [selectedSession, setSelectedSession] = useState<SessionSummary | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [topologySearch, setTopologySearch] = useState('')
+  const [loadingMoreSessions, setLoadingMoreSessions] = useState(false)
+  const loadMoreAbortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     const abort = new AbortController()
@@ -229,6 +281,7 @@ function GasCityWorkspace(): React.JSX.Element {
     setTopology(null)
     setSelectedAgent(null)
     setSelectedSession(null)
+    setTopologySearch('')
     setError(null)
     loadCities(selectedConnectionId, abort.signal).then(setCities, (reason: unknown) => {
       if (!abort.signal.aborted) setError(reason instanceof Error ? reason.message : String(reason))
@@ -242,11 +295,19 @@ function GasCityWorkspace(): React.JSX.Element {
     setTopology(null)
     setSelectedAgent(null)
     setSelectedSession(null)
+    setTopologySearch('')
     setError(null)
     loadCityTopology(selectedConnectionId, selectedCityName, abort.signal).then(setTopology, (reason: unknown) => {
       if (!abort.signal.aborted) setError(reason instanceof Error ? reason.message : String(reason))
     })
     return () => abort.abort()
+  }, [selectedCityName, selectedConnectionId])
+
+  useEffect(() => {
+    loadMoreAbortRef.current?.abort()
+    loadMoreAbortRef.current = null
+    setLoadingMoreSessions(false)
+    return () => loadMoreAbortRef.current?.abort()
   }, [selectedCityName, selectedConnectionId])
 
   const matchedSessionIds = new Set<string>()
@@ -256,6 +317,106 @@ function GasCityWorkspace(): React.JSX.Element {
         if (session.template === agent.name) matchedSessionIds.add(session.id)
       }
     }
+  }
+  const normalizedSearch = topologySearch.trim().toLocaleLowerCase()
+  const sessionMatchesSearch = (session: SessionSummary): boolean => normalizedSearch === '' || [
+    session.title,
+    session.id,
+    session.provider,
+    session.template,
+  ].some(value => value.toLocaleLowerCase().includes(normalizedSearch))
+  const agentMatchesSearch = (agent: AgentSummary): boolean => normalizedSearch === ''
+    || agent.name.toLocaleLowerCase().includes(normalizedSearch)
+    || topology?.sessions.some(session => session.template === agent.name && sessionMatchesSearch(session)) === true
+  const rigNames = new Set(topology?.rigs.map(rig => rig.name) ?? [])
+  const otherAgents = topology?.agents.filter(agent => (agent.rig === undefined || !rigNames.has(agent.rig)) && agentMatchesSearch(agent)) ?? []
+  const renderAgent = (agent: AgentSummary): React.JSX.Element => (
+    <section key={agent.name} aria-label={`Agent ${agent.name}`}>
+      <button
+        type="button"
+        disabled={!agent.available}
+        aria-pressed={selectedAgent?.name === agent.name}
+        onClick={() => {
+          setSelectedSession(null)
+          setSelectedAgent(agent)
+        }}
+      >
+        {agent.name}
+      </button>
+      {topology?.sessions.filter(session => session.template === agent.name && sessionMatchesSearch(session)).map(session => (
+        <button key={session.id} type="button" aria-pressed={selectedSession?.id === session.id} onClick={() => {
+          setSelectedAgent(null)
+          setSelectedSession(session)
+        }}>
+          {session.title || session.id}
+        </button>
+      ))}
+    </section>
+  )
+
+  const loadMoreSessions = async (): Promise<void> => {
+    if (selectedConnectionId === null || selectedCityName === null || topology?.nextSessionCursor === undefined || loadingMoreSessions) return
+    const abort = new AbortController()
+    loadMoreAbortRef.current?.abort()
+    loadMoreAbortRef.current = abort
+    setLoadingMoreSessions(true)
+    setError(null)
+    try {
+      const page = await loadSessionPage(
+        selectedConnectionId,
+        selectedCityName,
+        topology.nextSessionCursor,
+        abort.signal,
+      )
+      if (loadMoreAbortRef.current !== abort) return
+      setTopology(current => {
+        if (current === null) return current
+        const sessions = new Map(current.sessions.map(session => [session.id, session]))
+        for (const session of page.sessions) sessions.set(session.id, session)
+        const { nextSessionCursor: _previousCursor, ...withoutCursor } = current
+        return {
+          ...withoutCursor,
+          sessions: [...sessions.values()],
+          sessionTotal: page.total,
+          sessionPartial: current.sessionPartial || page.partial,
+          sessionPartialErrors: [...new Set([...current.sessionPartialErrors, ...page.partialErrors])],
+          ...(page.nextSessionCursor === undefined ? {} : { nextSessionCursor: page.nextSessionCursor }),
+        }
+      })
+    } catch (reason) {
+      if (!abort.signal.aborted && loadMoreAbortRef.current === abort) {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      }
+    } finally {
+      if (loadMoreAbortRef.current === abort) {
+        loadMoreAbortRef.current = null
+        setLoadingMoreSessions(false)
+      }
+    }
+  }
+
+  const updateSelectedSession = (updated: SessionSummary): void => {
+    setSelectedSession(updated)
+    setTopology(current => current === null
+      ? current
+      : { ...current, sessions: current.sessions.map(session => session.id === updated.id ? updated : session) })
+  }
+
+  const selectCreatedSession = (created: SessionSummary): void => {
+    setSelectedAgent(null)
+    setSelectedSession(created)
+    setTopology(current => {
+      if (current === null) return current
+      const alreadyLoaded = current.sessions.some(session => session.id === created.id)
+      const sessions = alreadyLoaded
+        ? current.sessions.map(session => session.id === created.id ? created : session)
+        : [...current.sessions, created]
+      return {
+        ...current,
+        sessions,
+        sessionTotal: Math.max(sessions.length, current.sessionTotal + (alreadyLoaded ? 0 : 1)),
+      }
+    })
   }
 
   return (
@@ -298,38 +459,33 @@ function GasCityWorkspace(): React.JSX.Element {
           </button>
         ))}
         {selectedCityName !== null && topology === null && error === null && <p>Loading city topology…</p>}
+        {topology !== null && (
+          <input
+            className="gc-topology-search"
+            type="search"
+            aria-label="Search agents and sessions"
+            placeholder="Search agents and sessions"
+            value={topologySearch}
+            onChange={event => setTopologySearch(event.currentTarget.value)}
+          />
+        )}
         {topology?.rigs.map(rig => (
           <section key={rig.name} aria-label={`Rig ${rig.name}`}>
             <h2>{rig.name}</h2>
-            {topology.agents.filter(agent => agent.rig === rig.name).map(agent => (
-              <section key={agent.name} aria-label={`Agent ${agent.name}`}>
-                <button
-                  type="button"
-                  disabled={!agent.available}
-                  onClick={() => {
-                    setSelectedSession(null)
-                    setSelectedAgent(agent)
-                  }}
-                >
-                  {agent.name}
-                </button>
-                {topology.sessions.filter(session => session.template === agent.name).map(session => (
-                  <button key={session.id} type="button" onClick={() => {
-                    setSelectedAgent(null)
-                    setSelectedSession(session)
-                  }}>
-                    {session.title || session.id}
-                  </button>
-                ))}
-              </section>
-            ))}
+            {topology.agents.filter(agent => agent.rig === rig.name && agentMatchesSearch(agent)).map(renderAgent)}
           </section>
         ))}
-        {topology !== null && topology.sessions.some(session => !matchedSessionIds.has(session.id)) && (
+        {otherAgents.length > 0 && (
+          <section role="region" aria-label="City and other agents">
+            <h2>City and other agents</h2>
+            {otherAgents.map(renderAgent)}
+          </section>
+        )}
+        {topology !== null && topology.sessions.some(session => !matchedSessionIds.has(session.id) && sessionMatchesSearch(session)) && (
           <section role="region" aria-label="Other sessions">
             <h2>Other sessions</h2>
-            {topology.sessions.filter(session => !matchedSessionIds.has(session.id)).map(session => (
-              <button key={session.id} type="button" onClick={() => {
+            {topology.sessions.filter(session => !matchedSessionIds.has(session.id) && sessionMatchesSearch(session)).map(session => (
+              <button key={session.id} type="button" aria-pressed={selectedSession?.id === session.id} onClick={() => {
                 setSelectedAgent(null)
                 setSelectedSession(session)
               }}>
@@ -338,6 +494,23 @@ function GasCityWorkspace(): React.JSX.Element {
             ))}
           </section>
         )}
+        {topology?.nextSessionCursor !== undefined && (
+          <button type="button" disabled={loadingMoreSessions} onClick={() => void loadMoreSessions()}>
+            {loadingMoreSessions ? 'Loading more sessions…' : 'Load more sessions'}
+          </button>
+        )}
+        {topology !== null && (
+          <p role="status">Loaded {topology.sessions.length} of {topology.sessionTotal} sessions</p>
+        )}
+        {topology?.sessionPartial === true && (
+          <p role="alert">
+            Session inventory is partial{topology.sessionPartialErrors.length === 0 ? '' : `: ${topology.sessionPartialErrors.join('; ')}`}
+          </p>
+        )}
+        {topology !== null && normalizedSearch !== ''
+          && !topology.sessions.some(sessionMatchesSearch)
+          && !topology.agents.some(agentMatchesSearch)
+          && <p>No loaded agents or sessions match this filter.</p>}
       </nav>
       {selectedConnectionId !== null && selectedCityName !== null && selectedAgent !== null && (
         <DraftSessionWorkspace
@@ -345,10 +518,7 @@ function GasCityWorkspace(): React.JSX.Element {
           connectionId={selectedConnectionId}
           cityName={selectedCityName}
           agent={selectedAgent}
-          onCreated={session => {
-            setSelectedAgent(null)
-            setSelectedSession(session)
-          }}
+          onCreated={selectCreatedSession}
         />
       )}
       {selectedConnectionId !== null && selectedCityName !== null && selectedSession !== null && (
@@ -357,6 +527,8 @@ function GasCityWorkspace(): React.JSX.Element {
           connectionId={selectedConnectionId}
           cityName={selectedCityName}
           session={selectedSession}
+          provider={topology?.providers.find(provider => provider.name === selectedSession.provider)}
+          onSessionChanged={updateSelectedSession}
         />
       )}
     </section>
@@ -391,7 +563,10 @@ function DraftSessionWorkspace({
       setOperation({ watcher, prompt })
       await watcher.start()
     } catch (reason) {
-      setCreateError(`Create outcome unknown: ${reason instanceof Error ? reason.message : String(reason)}`)
+      const detail = reason instanceof Error ? reason.message : String(reason)
+      setCreateError(reason instanceof SupervisorRequestError
+        ? `Session failed to start: ${detail}`
+        : `Create outcome unknown: ${detail}`)
     } finally {
       setCreating(false)
     }
@@ -437,17 +612,22 @@ function CreateOperation({
   onCreated: (session: SessionSummary) => void
 }): React.JSX.Element {
   const snapshot = useSyncExternalStore(watcher.subscribe, watcher.getSnapshot)
+  const [terminalError, setTerminalError] = useState<string | null>(null)
   useEffect(() => () => watcher.dispose(), [watcher])
   useEffect(() => {
     if (snapshot.phase !== 'succeeded' || snapshot.terminal === null) return
     const payload = snapshot.terminal.payload
     if (typeof payload !== 'object' || payload === null || !('session' in payload)) return
     const session = payload.session
-    if (typeof session === 'object' && session !== null && 'id' in session && typeof session.id === 'string') {
-      onCreated(session as unknown as SessionSummary)
+    try {
+      onCreated(parseSessionSummary(session, 'session create result'))
+    } catch (reason) {
+      setTerminalError(reason instanceof Error ? reason.message : String(reason))
     }
   }, [onCreated, snapshot.phase, snapshot.terminal])
-  const label = snapshot.phase === 'succeeded'
+  const label = terminalError !== null
+    ? 'Session result incompatible'
+    : snapshot.phase === 'succeeded'
     ? 'Session started'
     : snapshot.phase === 'failed'
       ? 'Session failed to start'
@@ -458,22 +638,67 @@ function CreateOperation({
     <aside className="gc-operation" aria-label="Session creation status">
       <strong>{label}</strong>
       <p>{prompt}</p>
+      {terminalError !== null && <p role="alert">{terminalError}</p>}
     </aside>
   )
 }
 
 function messageBlocks(message: StructuredMessage): React.JSX.Element[] {
   const rendered: React.JSX.Element[] = []
+  if (message.user_prompt !== undefined) {
+    if (typeof message.user_prompt.text === 'string' && message.user_prompt.text !== '') {
+      rendered.push(<p key={`${message.id}:prompt`}>{message.user_prompt.text}</p>)
+    }
+    for (const [index, file] of (message.user_prompt.uploaded_files ?? []).entries()) {
+      const name = file.original_name || file.file_path || `Attachment ${index + 1}`
+      const details = [file.mime_type, file.size].filter(value => typeof value === 'string' && value !== '').join(' · ')
+      rendered.push(
+        <section key={`${message.id}:attachment:${index}`} role="region" aria-label={`Attachment ${name}`}>
+          <strong>{name}</strong>
+          {details !== '' && <span>{details}</span>}
+          {file.file_path !== undefined && file.file_path !== name && <pre>{file.file_path}</pre>}
+        </section>,
+      )
+    }
+    if ((message.user_prompt.opened_files?.length ?? 0) > 0) {
+      rendered.push(
+        <section key={`${message.id}:opened-files`}>
+          <strong>Opened files</strong>
+          <pre>{message.user_prompt.opened_files?.join('\n')}</pre>
+        </section>,
+      )
+    }
+    const selections = message.user_prompt.selections?.map(selection => selection.text).filter(
+      (value): value is string => typeof value === 'string' && value !== '',
+    ) ?? []
+    if (selections.length > 0) {
+      rendered.push(
+        <section key={`${message.id}:selections`}>
+          <strong>IDE selections</strong>
+          <pre>{selections.join('\n\n')}</pre>
+        </section>,
+      )
+    }
+  }
+  if (message.system_event !== undefined) {
+    const label = message.system_event.message
+      || message.system_event.code
+      || message.system_event.kind
+      || 'System event'
+    rendered.push(<p key={`${message.id}:system-event`}>{label}</p>)
+  }
   for (const [index, block] of (message.blocks ?? []).entries()) {
     if (block.type === 'text' && typeof block.text === 'string') {
       rendered.push(<p key={`${message.id}:text:${index}`}>{block.text}</p>)
-    } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
-      rendered.push(
-        <details key={`${message.id}:thinking:${index}`}>
-          <summary>Reasoning</summary>
-          <p>{block.thinking}</p>
-        </details>,
-      )
+    } else if (block.type === 'thinking') {
+      if (typeof block.thinking === 'string' && block.thinking !== '') {
+        rendered.push(
+          <details key={`${message.id}:thinking:${index}`}>
+            <summary>Reasoning</summary>
+            <p>{block.thinking}</p>
+          </details>,
+        )
+      }
     } else if (block.type === 'tool_use') {
       const name = typeof block.name === 'string' && block.name !== '' ? block.name : 'Unknown tool'
       rendered.push(
@@ -492,10 +717,22 @@ function messageBlocks(message: StructuredMessage): React.JSX.Element[] {
         </section>,
       )
     } else if (block.type === 'image') {
+      const details = [block.mime_type, block.file_path, block.image_url]
+        .filter(value => typeof value === 'string' && value !== '')
+        .join('\n')
       rendered.push(
-        <section key={`${message.id}:image:${index}`}>
-          <strong>Image attachment</strong>
-          {typeof block.file_path === 'string' && <span>{block.file_path}</span>}
+        <section key={`${message.id}:image:${index}`} role="region" aria-label="Image metadata">
+          <strong>Image metadata</strong>
+          {details !== '' && <pre>{details}</pre>}
+        </section>,
+      )
+    } else if (block.type === 'interaction' && block.interaction !== null && typeof block.interaction === 'object') {
+      const interaction = block.interaction as Record<string, unknown>
+      rendered.push(
+        <section key={`${message.id}:interaction:${index}`} role="region" aria-label="Interaction history">
+          <strong>{typeof interaction.kind === 'string' && interaction.kind !== '' ? interaction.kind : 'Interaction'}</strong>
+          {typeof interaction.prompt === 'string' && interaction.prompt !== '' && <p>{interaction.prompt}</p>}
+          {typeof interaction.state === 'string' && interaction.state !== '' && <span>{interaction.state}</span>}
         </section>,
       )
     } else {
@@ -507,6 +744,15 @@ function messageBlocks(message: StructuredMessage): React.JSX.Element[] {
       )
     }
   }
+  const metadata = [
+    message.model === undefined || message.model === '' ? undefined : `model ${message.model}`,
+    message.stop_reason === undefined || message.stop_reason === '' ? undefined : `stop ${message.stop_reason}`,
+    message.usage === undefined ? undefined : Object.entries(message.usage)
+      .filter(([, value]) => value > 0)
+      .map(([key, value]) => `${key} ${value}`)
+      .join(' · '),
+  ].filter((value): value is string => value !== undefined && value !== '')
+  if (metadata.length > 0) rendered.push(<small key={`${message.id}:metadata`}>{metadata.join(' · ')}</small>)
   return rendered
 }
 
@@ -515,6 +761,11 @@ function normalizedPendingKind(kind: string): 'approval' | 'question' | 'choice'
   if (kind === 'question') return 'question'
   if (kind === 'choice') return 'choice'
   return 'unknown'
+}
+
+export function canChangePermissionMode(state: string, activity?: string): boolean {
+  if ((state === 'asleep' || state === 'drained' || state === 'failed-create') && activity === 'idle') return true
+  return state === 'suspended' && (activity === 'idle' || activity === 'hold')
 }
 
 function PendingInteractions({
@@ -540,6 +791,9 @@ function PendingInteractions({
         return (
           <article key={interaction.requestId}>
             <p>{interaction.prompt}</p>
+            {interaction.responseState === 'outcome_unknown' && (
+              <p role="alert">Response outcome unknown. Waiting for Gas City to clear or retain this interaction; do not resend it.</p>
+            )}
             {kind === 'approval' && (
               <div>
                 <button type="button" disabled={!enabled} onClick={() => respond({ action: 'approve' })}>Approve</button>
@@ -606,17 +860,22 @@ function SessionWorkspace({
   connectionId,
   cityName,
   session,
+  provider,
+  onSessionChanged,
 }: {
   connectionId: string
   cityName: string
   session: SessionSummary
+  provider: ProviderPublicSummary | undefined
+  onSessionChanged: (session: SessionSummary) => void
 }): React.JSX.Element {
-  const [controller] = useState(() => createStructuredFeedController(createSupervisorFeedPort({
+  const [includeThinking, setIncludeThinking] = useState(readThinkingPreference)
+  const controller = useMemo(() => createStructuredFeedController(createSupervisorFeedPort({
     connectionId,
     cityName,
-    includeThinking: false,
-  })))
-  const [operations] = useState(() => createSupervisorOperations({ connectionId, cityName }))
+    includeThinking,
+  })), [cityName, connectionId, includeThinking])
+  const operations = useMemo(() => createSupervisorOperations({ connectionId, cityName }), [cityName, connectionId])
   const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot)
   const [bootstrapError, setBootstrapError] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
@@ -626,13 +885,28 @@ function SessionWorkspace({
   const [controlBusy, setControlBusy] = useState<SessionControl | null>(null)
   const [controlNotice, setControlNotice] = useState<string | null>(null)
   const [controlError, setControlError] = useState<string | null>(null)
+  const [renaming, setRenaming] = useState(false)
+  const [titleDraft, setTitleDraft] = useState(session.title || session.id)
+  const [settingsBusy, setSettingsBusy] = useState<'rename' | 'permission' | null>(null)
+  const [settingsNotice, setSettingsNotice] = useState<string | null>(null)
+  const [settingsError, setSettingsError] = useState<string | null>(null)
+  const permissionOption = provider?.options_schema?.find(option => option.key === 'permission_mode')
+  const currentPermissionMode = session.options?.permission_mode
+    ?? provider?.effective_defaults?.permission_mode
+    ?? permissionOption?.default
+    ?? ''
+  const [permissionDraft, setPermissionDraft] = useState(currentPermissionMode)
 
   useEffect(() => {
+    setBootstrapError(null)
     void controller.bootstrap({ sessionId: session.id }).catch((reason: unknown) => {
       setBootstrapError(reason instanceof Error ? reason.message : String(reason))
     })
     return () => controller.dispose()
   }, [controller, session.id])
+
+  useEffect(() => setTitleDraft(session.title || session.id), [session.id, session.title])
+  useEffect(() => setPermissionDraft(currentPermissionMode), [currentPermissionMode])
 
   const submit = async (intent?: SubmitIntent): Promise<void> => {
     if (draft.trim() === '' || sending) return
@@ -646,7 +920,10 @@ function SessionWorkspace({
       setDraft('')
       await watcher.start()
     } catch (reason) {
-      setSubmitError(reason instanceof Error ? reason.message : String(reason))
+      const detail = reason instanceof Error ? reason.message : String(reason)
+      setSubmitError(reason instanceof SupervisorRequestError
+        ? `Submission rejected: ${detail}`
+        : `Submit outcome unknown: ${detail}`)
     } finally {
       setSending(false)
     }
@@ -670,6 +947,11 @@ function SessionWorkspace({
     snapshot.session?.state ?? session.state,
     snapshot.activity ?? session.activity,
   )
+  const refreshAuthoritativeSession = async (): Promise<SessionSummary> => {
+    const refreshed = await operations.fetchSession(session.id)
+    onSessionChanged(refreshed)
+    return refreshed
+  }
 
   const controlSession = async (control: SessionControl): Promise<void> => {
     if (controlBusy !== null) return
@@ -680,16 +962,99 @@ function SessionWorkspace({
     setControlError(null)
     try {
       await operations.controlSession(session.id, control)
+      try {
+        await refreshAuthoritativeSession()
+      } catch (reason) {
+        const detail = reason instanceof Error ? reason.message : String(reason)
+        setControlNotice(controlNotices[control])
+        setControlError(`${controlNotices[control]}, but session refresh failed: ${detail}`)
+        return
+      }
       setControlNotice(controlNotices[control])
     } catch (reason) {
-      setControlError(reason instanceof Error ? reason.message : String(reason))
+      const failure = mutationFailure(controlLabels[control], reason)
+      if (failure.refresh) {
+        try {
+          await refreshAuthoritativeSession()
+        } catch (refreshReason) {
+          const detail = refreshReason instanceof Error ? refreshReason.message : String(refreshReason)
+          failure.message = `${failure.message}; session refresh failed: ${detail}`
+        }
+      }
+      setControlError(failure.message)
     } finally {
       setControlBusy(null)
     }
   }
 
+  const renameSession = async (): Promise<void> => {
+    if (settingsBusy !== null || titleDraft.trim() === '') return
+    setSettingsBusy('rename')
+    setSettingsError(null)
+    setSettingsNotice(null)
+    try {
+      const accepted = await operations.renameSession(session.id, titleDraft)
+      try {
+        await refreshAuthoritativeSession()
+      } catch (reason) {
+        onSessionChanged(accepted)
+        const detail = reason instanceof Error ? reason.message : String(reason)
+        setSettingsError(`Session renamed, but authoritative refresh failed: ${detail}`)
+      }
+      setRenaming(false)
+      setSettingsNotice('Session renamed')
+    } catch (reason) {
+      const failure = mutationFailure('Rename', reason)
+      if (failure.refresh) {
+        try {
+          await refreshAuthoritativeSession()
+        } catch (refreshReason) {
+          const detail = refreshReason instanceof Error ? refreshReason.message : String(refreshReason)
+          failure.message = `${failure.message}; session refresh failed: ${detail}`
+        }
+      }
+      setSettingsError(failure.message)
+    } finally {
+      setSettingsBusy(null)
+    }
+  }
+
+  const permissionState = snapshot.session?.state ?? session.state
+  const permissionActivity = snapshot.activity ?? session.activity
+  const permissionModeLegal = canChangePermissionMode(permissionState, permissionActivity)
+  const updatePermissionMode = async (): Promise<void> => {
+    if (settingsBusy !== null || permissionDraft === '' || permissionDraft === currentPermissionMode) return
+    setSettingsBusy('permission')
+    setSettingsError(null)
+    setSettingsNotice(null)
+    try {
+      const accepted = await operations.setPermissionMode(session.id, permissionDraft)
+      try {
+        await refreshAuthoritativeSession()
+      } catch (reason) {
+        onSessionChanged(accepted)
+        const detail = reason instanceof Error ? reason.message : String(reason)
+        setSettingsError(`Permission mode updated, but authoritative refresh failed: ${detail}`)
+      }
+      setSettingsNotice('Permission mode updated; it applies on the next launch')
+    } catch (reason) {
+      const failure = mutationFailure('Permission mode', reason)
+      if (failure.refresh) {
+        try {
+          await refreshAuthoritativeSession()
+        } catch (refreshReason) {
+          const detail = refreshReason instanceof Error ? refreshReason.message : String(refreshReason)
+          failure.message = `${failure.message}; session refresh failed: ${detail}`
+        }
+      }
+      setSettingsError(failure.message)
+    } finally {
+      setSettingsBusy(null)
+    }
+  }
+
   return (
-    <main className="gc-main gc-session" aria-label={`Session ${session.title || session.id}`}>
+    <main className="gc-main gc-session" data-session-id={session.id} aria-label={`Session ${session.title || session.id}`}>
       <header>
         <div>
           <h2>{session.title || session.id}</h2>
@@ -698,6 +1063,20 @@ function SessionWorkspace({
         <span>{snapshot.activity ?? snapshot.phase}</span>
       </header>
       <section className="gc-session-controls" aria-label="Session controls">
+        <label>
+          <input
+            type="checkbox"
+            checked={includeThinking}
+            onChange={event => {
+              writeThinkingPreference(event.currentTarget.checked)
+              setIncludeThinking(event.currentTarget.checked)
+            }}
+          />
+          Show reasoning
+        </label>
+        <button type="button" disabled={settingsBusy !== null} onClick={() => setRenaming(current => !current)}>
+          Rename session
+        </button>
         {availableControls.map(control => (
           <button
             key={control}
@@ -709,9 +1088,92 @@ function SessionWorkspace({
           </button>
         ))}
       </section>
+      {provider?.compatibility_error !== undefined && (
+        <p role="alert">Provider settings unavailable: {provider.compatibility_error}</p>
+      )}
+      {(renaming || (permissionOption !== undefined && permissionOption.choices.length > 0)) && (
+        <section className="gc-session-settings" aria-label="Session settings">
+          {renaming && (
+            <>
+              <label>
+                New session title
+                <input
+                  aria-label="New session title"
+                  value={titleDraft}
+                  disabled={settingsBusy !== null}
+                  onChange={event => setTitleDraft(event.currentTarget.value)}
+                />
+              </label>
+              <button
+                type="button"
+                disabled={settingsBusy !== null || titleDraft.trim() === '' || titleDraft.trim() === session.title}
+                onClick={() => void renameSession()}
+              >
+                Save title
+              </button>
+              <button
+                type="button"
+                disabled={settingsBusy !== null}
+                onClick={() => {
+                  setTitleDraft(session.title || session.id)
+                  setRenaming(false)
+                }}
+              >
+                Cancel rename
+              </button>
+            </>
+          )}
+          {permissionOption !== undefined && permissionOption.choices.length > 0 && (
+            <>
+              <label>
+                {permissionOption.label || 'Permission mode'}
+                <select
+                  aria-label="Permission mode"
+                  value={permissionDraft}
+                  disabled={settingsBusy !== null || !permissionModeLegal}
+                  onChange={event => setPermissionDraft(event.currentTarget.value)}
+                >
+                  {permissionOption.choices.map(choice => (
+                    <option key={choice.value} value={choice.value}>{choice.label || choice.value}</option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                disabled={settingsBusy !== null || !permissionModeLegal || permissionDraft === '' || permissionDraft === currentPermissionMode}
+                onClick={() => void updatePermissionMode()}
+              >
+                Apply permission mode
+              </button>
+              <span>
+                {permissionModeLegal
+                  ? 'Applies on the next launch or wake.'
+                  : 'Suspend the idle session before changing a mode that applies on the next launch.'}
+              </span>
+            </>
+          )}
+        </section>
+      )}
+      {settingsNotice !== null && <p role="status">{settingsNotice}</p>}
+      {settingsError !== null && <p role="alert">{settingsError}</p>}
       {controlNotice !== null && <p role="status">{controlNotice}</p>}
       {controlError !== null && <p role="alert">{controlError}</p>}
       {bootstrapError !== null && <p role="alert">{bootstrapError}</p>}
+      {snapshot.issue !== undefined && <p role="alert">Transcript stream: {snapshot.issue.message}</p>}
+      {snapshot.resetNotice !== null && <p role="status">Transcript reset: {snapshot.resetNotice.reason}</p>}
+      {snapshot.transcript?.degraded === true && (
+        <p role="alert">Transcript degraded{snapshot.transcript.degradedReason === undefined ? '' : `: ${snapshot.transcript.degradedReason}`}</p>
+      )}
+      {(snapshot.transcript?.diagnostics?.length ?? 0) > 0 && (
+        <aside className="gc-operation" aria-label="Transcript diagnostics">
+          {snapshot.transcript?.diagnostics?.map(diagnostic => (
+            <p key={diagnostic.code}>
+              {diagnostic.code}{diagnostic.message === undefined ? '' : `: ${diagnostic.message}`}
+              {diagnostic.count === undefined ? '' : ` (${diagnostic.count})`}
+            </p>
+          ))}
+        </aside>
+      )}
       <section className="gc-transcript" aria-label="Transcript">
         {snapshot.transcript?.messages.map(message => (
           <article className="gc-message" key={message.id} data-role={message.role} data-status={message.status}>

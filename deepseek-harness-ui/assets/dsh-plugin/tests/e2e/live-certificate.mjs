@@ -1,0 +1,282 @@
+import { chromium } from '@playwright/test'
+import { randomUUID } from 'node:crypto'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+
+import {
+  closeRunOwnedSessions,
+  newCompletedToolCallIds,
+  sessionEvidence,
+} from './support/live-evidence.mjs'
+import { CleanupStack } from './support/owned-process.mjs'
+import { startOwnedLiveStack } from './support/owned-stack.mjs'
+
+const required = ['DSH_E2E_ALLOW_MUTATION', 'GC_LIVE_CITY', 'GC_LIVE_AGENT_MATRIX']
+const missing = required.filter(name => process.env[name] === undefined || process.env[name] === '')
+if (process.env.DSH_E2E_ALLOW_MUTATION !== '1' || missing.length > 0) {
+  process.stderr.write(`UNPROVEN: live multi-provider certification requires ${required.join(', ')}\n`)
+  process.exit(2)
+}
+
+let matrix
+try {
+  matrix = JSON.parse(process.env.GC_LIVE_AGENT_MATRIX)
+} catch {
+  process.stderr.write('UNPROVEN: GC_LIVE_AGENT_MATRIX must be JSON mapping agent names to provider identities\n')
+  process.exit(2)
+}
+if (matrix === null || Array.isArray(matrix) || typeof matrix !== 'object') {
+  process.stderr.write('UNPROVEN: GC_LIVE_AGENT_MATRIX must be a JSON object\n')
+  process.exit(2)
+}
+const entries = Object.entries(matrix)
+if (entries.some(([agent, provider]) => agent === '' || typeof provider !== 'string' || provider === '')) {
+  process.stderr.write('UNPROVEN: every live agent and provider identity must be a nonempty string\n')
+  process.exit(2)
+}
+if (entries.length < 2 || new Set(entries.map(([, provider]) => provider)).size < 2) {
+  process.stderr.write('UNPROVEN: provide at least two agents backed by two distinct providers\n')
+  process.exit(2)
+}
+
+const city = process.env.GC_LIVE_CITY
+const connectionLabel = process.env.GC_LIVE_CONNECTION_LABEL ?? 'Local Supervisor'
+const certificateOutput = resolve(process.env.GC_LIVE_CERTIFICATE ?? 'test-results/live-certificate.json')
+const gcHome = resolve(process.env.GC_HOME ?? join(homedir(), '.gc'))
+const startedAt = new Date().toISOString()
+const createdSessions = []
+const certifiedSessions = []
+const resources = new CleanupStack()
+let browser
+let stack
+let connection
+let browserVersion
+let supervisorHealth
+let browserErrors = []
+let remainingSessionIds = []
+
+function pathPart(value) {
+  return encodeURIComponent(value)
+}
+
+function sessionBase(sessionId) {
+  return `/api/gas-city/v1/connections/${pathPart(connection.id)}/city/${pathPart(city)}/session/${pathPart(sessionId)}`
+}
+
+async function gatewayJson(path, options = {}) {
+  const response = await fetch(new URL(path, stack.url), {
+    ...options,
+    headers: {
+      Accept: 'application/json',
+      Origin: stack.url,
+      'Sec-Fetch-Site': 'same-origin',
+      ...options.headers,
+    },
+    redirect: 'error',
+    signal: AbortSignal.timeout(options.timeoutMs ?? 15_000),
+  })
+  if (!response.ok) throw new Error(`${options.label ?? path} returned HTTP ${response.status}`)
+  if (response.status === 204) return undefined
+  return await response.json()
+}
+
+async function readSession(sessionId) {
+  return await gatewayJson(sessionBase(sessionId), { label: `session ${sessionId}` })
+}
+
+async function readTranscript(sessionId) {
+  return await gatewayJson(`${sessionBase(sessionId)}/transcript?format=structured&include_thinking=true&tail=500`, {
+    label: `transcript ${sessionId}`,
+  })
+}
+
+async function waitForEvidence(sessionId, expectedTemplate, expectedProvider, nonce, predicate = () => true) {
+  const deadline = Date.now() + 180_000
+  let lastError
+  while (Date.now() < deadline) {
+    try {
+      const [session, transcript] = await Promise.all([readSession(sessionId), readTranscript(sessionId)])
+      const evidence = sessionEvidence(session, transcript, { expectedTemplate, expectedProvider, nonce })
+      if (predicate(evidence)) return evidence
+      lastError = new Error('authoritative transcript has not reached the required tool delta')
+    } catch (error) {
+      lastError = error
+    }
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 1_000))
+  }
+  throw new Error(`timed out waiting for authoritative provider evidence: ${lastError?.message ?? 'no evidence'}`)
+}
+
+async function waitForClosed(sessionId) {
+  const deadline = Date.now() + 30_000
+  let last
+  while (Date.now() < deadline) {
+    last = await readSession(sessionId)
+    if (last?.state === 'closed') return last
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 500))
+  }
+  throw new Error(`${sessionId} remained ${last?.state ?? '<missing>'} after close`)
+}
+
+async function writeCertificate(result, error) {
+  const certificate = {
+    schema_version: 'gastownhall.deepseek-harness-ui.live-certificate.v1',
+    result,
+    started_at: startedAt,
+    completed_at: new Date().toISOString(),
+    artifact_sha256: stack?.artifactSha,
+    dsh_version: stack?.dshVersion,
+    browser_version: browserVersion,
+    supervisor: supervisorHealth === undefined ? undefined : {
+      version: supervisorHealth.version,
+      build_id: supervisorHealth.build_id,
+    },
+    city,
+    sessions: certifiedSessions,
+    cleanup_remaining_session_ids: remainingSessionIds,
+    ...(error === undefined ? {} : { failure: error instanceof Error ? error.message : String(error) }),
+  }
+  await mkdir(dirname(certificateOutput), { recursive: true })
+  await writeFile(certificateOutput, `${JSON.stringify(certificate, null, 2)}\n`)
+}
+
+let operationError
+try {
+  stack = await startOwnedLiveStack({
+    gcHome,
+    progress: message => process.stdout.write(`${message}\n`),
+  })
+  resources.defer('isolated stock DSH stack', () => stack.close())
+  connection = stack.inventory.connections.find(candidate => candidate.label === connectionLabel)
+  if (connection === undefined || connection.available !== true) {
+    throw new Error(`live connection ${connectionLabel} is not available through the installed gateway`)
+  }
+  const cityBase = `/api/gas-city/v1/connections/${pathPart(connection.id)}/city/${pathPart(city)}`
+  const [health, agents] = await Promise.all([
+    gatewayJson(`/api/gas-city/v1/connections/${pathPart(connection.id)}/health`, { label: 'Supervisor health' }),
+    gatewayJson(`${cityBase}/agents`, { label: 'configured agent inventory' }),
+  ])
+  supervisorHealth = health
+  for (const [agentName, expectedProvider] of entries) {
+    const authoritativeAgent = agents.items?.find(agent => agent.name === agentName)
+    if (authoritativeAgent?.available !== true || authoritativeAgent.provider !== expectedProvider) {
+      throw new Error(`agent ${agentName} is not ready with authoritative provider ${expectedProvider}`)
+    }
+  }
+
+  browser = await chromium.launch({
+    headless: true,
+    ...(process.env.CI === 'true' ? {} : { channel: 'chrome' }),
+  })
+  browserVersion = browser.version()
+  resources.defer('live certificate browser', () => browser.close())
+  resources.defer('run-owned live sessions', async () => {
+    const cleanup = await closeRunOwnedSessions(createdSessions, {
+      getSession: readSession,
+      async closeSession(id) {
+        await gatewayJson(`${sessionBase(id)}/close`, {
+          method: 'POST',
+          label: `close session ${id}`,
+        })
+        await waitForClosed(id)
+      },
+    })
+    remainingSessionIds = cleanup.remainingSessionIds
+    if (cleanup.errors.length > 0) {
+      throw new AggregateError(cleanup.errors, `live session cleanup failed; remaining IDs: ${remainingSessionIds.join(', ')}`)
+    }
+  })
+
+  const page = await browser.newPage()
+  const browserRequests = []
+  page.on('pageerror', error => browserErrors.push(error.message))
+  page.on('console', message => {
+    if (message.type() === 'error') browserErrors.push(message.text())
+  })
+  page.on('request', request => browserRequests.push(request.url()))
+  await page.goto(stack.url)
+  const testingNotice = page.getByRole('button', { name: 'Continue' })
+  if (await testingNotice.isVisible()) {
+    await testingNotice.click()
+    await page.getByRole('button', { name: 'Configure later' }).waitFor({ state: 'visible', timeout: 5_000 })
+  }
+  const configureLater = page.getByRole('button', { name: 'Configure later' })
+  if (await configureLater.isVisible()) await configureLater.click()
+  await page.getByRole('button', { name: 'Gas City' }).click()
+  await page.getByRole('button', { name: connectionLabel }).click()
+  await page.getByRole('button', { name: city, exact: true }).click()
+
+  for (const [agent, expectedProvider] of entries) {
+    const nonce = `dsh-gc-release-${randomUUID()}`
+    await page.getByRole('button', { name: agent, exact: true }).click()
+    await page.getByRole('textbox', { name: `Message ${agent}` }).fill(`Reply briefly with this exact nonce: ${nonce}`)
+    await page.getByRole('button', { name: 'Start session' }).click()
+    const sessionWorkspace = page.locator('main.gc-session')
+    await sessionWorkspace.waitFor({ state: 'visible', timeout: 150_000 })
+    const sessionId = await sessionWorkspace.getAttribute('data-session-id')
+    if (sessionId === null || sessionId === '') throw new Error(`created ${agent} session has no canonical ID`)
+    createdSessions.push(sessionId)
+    await sessionWorkspace.getByText(expectedProvider, { exact: true }).waitFor({ state: 'visible' })
+    const initial = await waitForEvidence(sessionId, agent, expectedProvider, nonce)
+    await sessionWorkspace.locator('.gc-message[data-role="assistant"]').getByText(nonce, { exact: false }).waitFor({
+      state: 'visible',
+      timeout: 30_000,
+    })
+
+    const toolNonce = `tool-${randomUUID()}`
+    await sessionWorkspace.getByRole('textbox', { name: /Message / }).fill(
+      `Use one harmless read-only tool, then reply with this exact nonce: ${toolNonce}`,
+    )
+    await sessionWorkspace.getByRole('button', { name: 'Send', exact: true }).click()
+    await sessionWorkspace.getByText('Submitted').waitFor({ state: 'visible' })
+    const afterTool = await waitForEvidence(
+      sessionId,
+      agent,
+      expectedProvider,
+      toolNonce,
+      evidence => newCompletedToolCallIds(initial, evidence).length > 0,
+    )
+    const completedToolDelta = newCompletedToolCallIds(initial, afterTool)
+    await sessionWorkspace.locator('[aria-label^="Tool call "]').last().waitFor({ state: 'visible', timeout: 30_000 })
+    await sessionWorkspace.locator('[aria-label^="Tool result "]').last().waitFor({ state: 'visible', timeout: 30_000 })
+
+    certifiedSessions.push({
+      session_id: sessionId,
+      agent,
+      provider: afterTool.provider,
+      schema_version: afterTool.schemaVersion,
+      assistant_message_count: afterTool.assistantMessageIds.length,
+      completed_tool_call_delta: completedToolDelta.length,
+      tool_use_count: afterTool.toolUseCount,
+      tool_result_count: afterTool.toolResultCount,
+    })
+    page.once('dialog', dialog => dialog.accept())
+    await sessionWorkspace.getByRole('button', { name: 'Close permanently' }).click()
+    await waitForClosed(sessionId)
+  }
+
+  const dshOrigin = new URL(stack.url).origin
+  const foreignRequests = browserRequests.filter(url => new URL(url).origin !== dshOrigin)
+  if (foreignRequests.length > 0) throw new Error(`browser made ${foreignRequests.length} request(s) outside stock DSH origin`)
+  if (browserErrors.length > 0) throw new Error(`browser errors: ${browserErrors.join(' | ')}`)
+} catch (error) {
+  operationError = error
+}
+
+let finalError
+try {
+  await resources.close(operationError)
+} catch (error) {
+  finalError = error
+}
+
+await writeCertificate(finalError === undefined ? 'passed' : 'unproven', finalError)
+if (finalError !== undefined) {
+  process.stderr.write(`UNPROVEN: ${finalError.message}\n`)
+  if (remainingSessionIds.length > 0) {
+    process.stderr.write(`manual cleanup required for sessions: ${remainingSessionIds.join(', ')}\n`)
+  }
+  throw finalError
+}
+process.stdout.write(`live multi-provider certificate: ${certificateOutput}\n`)

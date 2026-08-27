@@ -135,15 +135,17 @@ class StatusTests(unittest.TestCase):
         self.assertIn("live Supervisor checks: skipped", result.stdout)
 
     def test_check_status_runs_gc_and_live_supervisor_diagnostics(self) -> None:
+        required_literals = json.loads(
+            (PACK_DIR / "assets" / "supervisor-contract.json").read_text(encoding="utf-8")
+        )["required_schema_literals"]
         required_paths = {
             "/v0/cities": {"get": {}},
-            "/v0/events/stream": {"get": {}},
             "/v0/city/{cityName}/events/stream": {"get": {}},
             "/v0/city/{cityName}/rigs": {"get": {}},
             "/v0/city/{cityName}/agents": {"get": {}},
             "/v0/city/{cityName}/providers/public": {"get": {}},
             "/v0/city/{cityName}/sessions": {"get": {}, "post": {}},
-            "/v0/city/{cityName}/session/{id}": {"get": {}, "patch": {}},
+            "/v0/city/{cityName}/session/{id}": {"get": {}},
             "/v0/city/{cityName}/session/{id}/transcript": {"get": {}},
             "/v0/city/{cityName}/session/{id}/pending": {"get": {}},
             "/v0/city/{cityName}/session/{id}/stream": {"get": {}},
@@ -163,7 +165,11 @@ class StatusTests(unittest.TestCase):
                 if self.path == "/health":
                     body = {"status": "ok"}
                 elif self.path == "/openapi.json":
-                    body = {"openapi": "3.1.0", "paths": required_paths}
+                    body = {
+                        "openapi": "3.1.0",
+                        "paths": required_paths,
+                        "components": {"schemas": {"PackContract": {"enum": required_literals}}},
+                    }
                 elif self.path == "/v0/cities":
                     body = {"items": [{"name": "alpha", "running": True}]}
                 elif self.path == "/v0/city/alpha/rigs":
@@ -210,9 +216,13 @@ class StatusTests(unittest.TestCase):
                     "NODE_NEXT_MIN=24.0.0\n",
                     encoding="utf-8",
                 )
+                shutil.copy2(
+                    PACK_DIR / "assets" / "supervisor-contract.json",
+                    pack_dir / "assets" / "supervisor-contract.json",
+                )
                 for name in (
                     "node", "dsh", "pnpm", "artifact", "profile",
-                    "gc-contexts", "supervisor", "read-grant",
+                    "gc-contexts", "listener", "supervisor", "read-grant",
                 ):
                     shutil.copy2(
                         PACK_DIR / "doctor" / f"check-{name}.sh",
@@ -251,10 +261,30 @@ class StatusTests(unittest.TestCase):
                 write_executable(bin_dir, "pnpm", "printf '11.7.0\\n'")
                 write_executable(
                     bin_dir,
+                    "dsh-web-fixture",
+                    "exec python3 - <<'PY'\n"
+                    "import http.server, json, socketserver\n"
+                    "class Handler(http.server.BaseHTTPRequestHandler):\n"
+                    "    def do_GET(self):\n"
+                    "        body = json.dumps({'connections': []}).encode()\n"
+                    "        self.send_response(200)\n"
+                    "        self.send_header('Content-Type', 'application/json')\n"
+                    "        self.end_headers()\n"
+                    "        self.wfile.write(body)\n"
+                    "    def log_message(self, *args):\n"
+                    "        pass\n"
+                    "with socketserver.TCPServer(('127.0.0.1', 0), Handler) as server:\n"
+                    "    print(f'http://127.0.0.1:{server.server_address[1]}', flush=True)\n"
+                    "    server.serve_forever()\n"
+                    "PY",
+                )
+                write_executable(
+                    bin_dir,
                     "dsh",
                     "case \"$*\" in\n"
                     "  --version) printf '0.1.1-rc.2\\n' ;;\n"
                     "  '--profile web --dump-config') printf '# == @gastownhall/deepseek-harness-ui\\n' ;;\n"
+                    "  web*) exec dsh-web-fixture ;;\n"
                     "  *) exit 97 ;;\n"
                     "esac",
                 )
@@ -286,6 +316,7 @@ class StatusTests(unittest.TestCase):
             server.server_close()
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("loopback boot and pack route probe succeeded", result.stdout)
         self.assertIn("required OpenAPI capabilities are present", result.stdout)
         self.assertIn("do not require an unsupported direct read grant", result.stdout)
 

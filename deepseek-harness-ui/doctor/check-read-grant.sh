@@ -53,7 +53,7 @@ try {
     }
   }
   if (!response.ok) throw new Error('city read probe failed')
-  console.log('Supervisor city reads do not require an unsupported direct read grant')
+  console.log(`Supervisor city reads do not require an unsupported direct read grant (direct target ${base})`)
 } catch {
   console.log('Supervisor direct read-grant diagnostic could not complete')
   process.exit(2)

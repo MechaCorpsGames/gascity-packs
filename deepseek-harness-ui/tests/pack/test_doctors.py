@@ -224,6 +224,36 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("loopback boot and pack route probe succeeded", result.stdout)
         self.assertIn("web --host 127.0.0.1 --port 0 --no-open", calls)
 
+    def test_listener_doctor_live_mode_rejects_unavailable_configured_connections(self) -> None:
+        fake_dsh = (
+            "exec python3 - <<'PY'\n"
+            "import http.server, json, socketserver\n"
+            "class Handler(http.server.BaseHTTPRequestHandler):\n"
+            "    def do_GET(self):\n"
+            "        body = json.dumps({'connections': [{\n"
+            "            'id': 'remote', 'label': 'Remote', 'cities': ['alpha'],\n"
+            "            'available': False, 'diagnostic': 'credential helper failed'\n"
+            "        }]}).encode()\n"
+            "        self.send_response(200)\n"
+            "        self.send_header('Content-Type', 'application/json')\n"
+            "        self.end_headers()\n"
+            "        self.wfile.write(body)\n"
+            "    def log_message(self, *_args):\n"
+            "        pass\n"
+            "with socketserver.TCPServer(('127.0.0.1', 0), Handler) as server:\n"
+            "    print(f'http://127.0.0.1:{server.server_address[1]}', flush=True)\n"
+            "    server.serve_forever()\n"
+            "PY"
+        )
+        result = run_doctor(
+            "listener",
+            {"dsh": fake_dsh},
+            extra_env={"GC_REQUIRE_AVAILABLE_CONNECTIONS": "1"},
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Remote: credential helper failed", result.stdout)
+
     def test_gc_contexts_doctor_uses_gc_validation_without_invoking_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             gc_home = pathlib.Path(raw_dir)
@@ -249,13 +279,82 @@ class DoctorTests(unittest.TestCase):
     def test_supervisor_doctor_requires_the_pack_api_capability_matrix(self) -> None:
         required = {
             "/v0/cities": {"get": {}},
-            "/v0/events/stream": {"get": {}},
             "/v0/city/{cityName}/events/stream": {"get": {}},
             "/v0/city/{cityName}/rigs": {"get": {}},
             "/v0/city/{cityName}/agents": {"get": {}},
             "/v0/city/{cityName}/providers/public": {"get": {}},
             "/v0/city/{cityName}/sessions": {"get": {}, "post": {}},
-            "/v0/city/{cityName}/session/{id}": {"get": {}, "patch": {}},
+            "/v0/city/{cityName}/session/{id}": {"get": {}},
+            "/v0/city/{cityName}/session/{id}/transcript": {"get": {}},
+            "/v0/city/{cityName}/session/{id}/pending": {"get": {}},
+            "/v0/city/{cityName}/session/{id}/stream": {"get": {}},
+            "/v0/city/{cityName}/session/{id}/submit": {"post": {}},
+            "/v0/city/{cityName}/session/{id}/respond": {"post": {}},
+            "/v0/city/{cityName}/session/{id}/permission-mode": {"post": {}},
+            "/v0/city/{cityName}/session/{id}/rename": {"post": {}},
+            "/v0/city/{cityName}/session/{id}/stop": {"post": {}},
+            "/v0/city/{cityName}/session/{id}/kill": {"post": {}},
+            "/v0/city/{cityName}/session/{id}/suspend": {"post": {}},
+            "/v0/city/{cityName}/session/{id}/close": {"post": {}},
+            "/v0/city/{cityName}/session/{id}/wake": {"post": {}},
+        }
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/health":
+                    body = b'{"status":"ok"}'
+                elif self.path == "/openapi.json":
+                    body = json.dumps({
+                        "openapi": "3.1.0",
+                        "paths": required,
+                        "components": {"schemas": {"PackContract": {"enum": [
+                            "session.structured.v1", "snapshot", "upsert", "reset",
+                            "resume_invalid", "stream_changed", "cursor_invalidated", "history_rewritten",
+                            "unknown", "partial", "final", "superseded",
+                            "default", "follow_up", "interrupt_now",
+                            "structured", "activity", "pending", "pending_cleared",
+                        ]}}},
+                    }).encode()
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = run_doctor(
+                "supervisor",
+                {},
+                extra_env={
+                    "GC_SUPERVISOR_URL": f"http://127.0.0.1:{server.server_port}"
+                },
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Supervisor health and required OpenAPI capabilities are present", result.stdout)
+
+    def test_supervisor_doctor_rejects_routes_without_the_structured_contract(self) -> None:
+        required = {
+            "/v0/cities": {"get": {}},
+            "/v0/city/{cityName}/events/stream": {"get": {}},
+            "/v0/city/{cityName}/rigs": {"get": {}},
+            "/v0/city/{cityName}/agents": {"get": {}},
+            "/v0/city/{cityName}/providers/public": {"get": {}},
+            "/v0/city/{cityName}/sessions": {"get": {}, "post": {}},
+            "/v0/city/{cityName}/session/{id}": {"get": {}},
             "/v0/city/{cityName}/session/{id}/transcript": {"get": {}},
             "/v0/city/{cityName}/session/{id}/pending": {"get": {}},
             "/v0/city/{cityName}/session/{id}/stream": {"get": {}},
@@ -295,17 +394,15 @@ class DoctorTests(unittest.TestCase):
             result = run_doctor(
                 "supervisor",
                 {},
-                extra_env={
-                    "GC_SUPERVISOR_URL": f"http://127.0.0.1:{server.server_port}"
-                },
+                extra_env={"GC_SUPERVISOR_URL": f"http://127.0.0.1:{server.server_port}"},
             )
         finally:
             server.shutdown()
             thread.join()
             server.server_close()
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Supervisor health and required OpenAPI capabilities are present", result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("required OpenAPI capability probe failed", result.stdout)
 
     def test_read_grant_doctor_reports_the_unsupported_direct_gate(self) -> None:
         class Handler(http.server.BaseHTTPRequestHandler):

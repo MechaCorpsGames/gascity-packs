@@ -1,19 +1,24 @@
 #!/bin/sh
 set -eu
 
+pack_dir="${GC_PACK_DIR:-$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)}"
+GC_DEEPSEEK_HARNESS_UI_CONTRACT="$pack_dir/assets/supervisor-contract.json"
+export GC_DEEPSEEK_HARNESS_UI_CONTRACT
+
 exec node - <<'NODE'
+const { readFileSync } = await import('node:fs')
 const rawBase = process.env.GC_SUPERVISOR_URL ?? 'http://127.0.0.1:8372'
 const bearer = process.env.GC_SUPERVISOR_BEARER
+const compatibility = JSON.parse(readFileSync(process.env.GC_DEEPSEEK_HARNESS_UI_CONTRACT, 'utf8'))
 
 const required = {
   '/v0/cities': ['get'],
-  '/v0/events/stream': ['get'],
   '/v0/city/{cityName}/events/stream': ['get'],
   '/v0/city/{cityName}/rigs': ['get'],
   '/v0/city/{cityName}/agents': ['get'],
   '/v0/city/{cityName}/providers/public': ['get'],
   '/v0/city/{cityName}/sessions': ['get', 'post'],
-  '/v0/city/{cityName}/session/{id}': ['get', 'patch'],
+  '/v0/city/{cityName}/session/{id}': ['get'],
   '/v0/city/{cityName}/session/{id}/transcript': ['get'],
   '/v0/city/{cityName}/session/{id}/pending': ['get'],
   '/v0/city/{cityName}/session/{id}/stream': ['get'],
@@ -46,6 +51,19 @@ async function getJson(base, suffix) {
   return response.json()
 }
 
+function collectSchemaLiterals(value, literals) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectSchemaLiterals(item, literals)
+    return
+  }
+  if (value === null || typeof value !== 'object') return
+  if (typeof value.const === 'string') literals.add(value.const)
+  if (Array.isArray(value.enum)) {
+    for (const item of value.enum) if (typeof item === 'string') literals.add(item)
+  }
+  for (const item of Object.values(value)) collectSchemaLiterals(item, literals)
+}
+
 try {
   const parsed = new URL(rawBase)
   if (parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('invalid URL')
@@ -71,7 +89,13 @@ try {
       if (operations[method] === undefined) throw new Error(`missing ${method.toUpperCase()} ${path}`)
     }
   }
-  console.log('Supervisor health and required OpenAPI capabilities are present')
+  if (!Array.isArray(compatibility.required_schema_literals)) throw new Error('pack compatibility contract is invalid')
+  const literals = new Set()
+  collectSchemaLiterals(specification, literals)
+  for (const literal of compatibility.required_schema_literals) {
+    if (typeof literal !== 'string' || !literals.has(literal)) throw new Error(`missing schema literal ${literal}`)
+  }
+  console.log(`Supervisor health and required OpenAPI capabilities are present (direct target ${base})`)
 } catch {
   console.log('Supervisor health or required OpenAPI capability probe failed')
   process.exit(2)

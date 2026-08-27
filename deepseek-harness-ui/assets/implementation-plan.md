@@ -1,6 +1,6 @@
 # `deepseek-harness-ui` implementation plan
 
-Status: implemented baseline plus forward plan. Sections that describe broader search, pagination, rename, permission-mode, thinking preference, and production telemetry remain product follow-ups unless the checkpoint below says otherwise.
+Status: implemented release-candidate plan. Production telemetry remains a follow-up; live multi-provider certification is an explicit release gate and is not currently proven on the audit machine.
 
 Research baseline: Gas City `1807cf018045e9f225993d97cf6daea37e2ce6e9`, Gasworks GUI `44812f2e656fc880a986b03a418a93348a8dc1ad`, DeepSeek Harness `dsh-v0.1.1-rc.2` / `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`, and `gascity-packs` `aab8030d397c211be6a4d460e9ce8de39e867a09`.
 
@@ -10,7 +10,7 @@ The pack now contains the two-sided stock-DSH plugin, fixed same-origin REST/SSE
 
 The adversarial-review corrections are implemented: unique list-slot IDs; `./package.json` export; no Supervisor-wide stream; master `sessions?state=all` inventory grouped in the browser; implicit default submit intent; **Close permanently** terminology and fail-closed lifecycle matrix; transcript-first buffered handoff; authoritative pending replacement; same-ID semantic ledger; uint64 city event IDs kept as decimal strings/`BigInt`; bounded EOF/network/contract recovery; deterministic access-profile selection; redirect refusal; strict request schemas; loopback-only DSH; and credential/TLS/grant handling confined to the host.
 
-The release candidate is verified by 100 plugin tests, 20 pack/install tests, TypeScript checking, production builds, ShellCheck, `gc lint`, artifact checksum verification, and real-Chrome automation against an isolated stock `dsh web` profile and controlled Supervisor fixture.
+The release candidate is verified by 129 plugin tests, 23 pack/install tests, TypeScript checking, production builds, ShellCheck, `gc lint`, deterministic artifact byte comparison, and a checked-in headless-Chrome contract against an isolated exact stock `dsh web` profile and random-port Supervisor fixture. Live certification remains separate and fails **UNPROVEN** without two real, distinct ready providers.
 
 ## 1. Decision summary
 
@@ -244,8 +244,10 @@ Map UI language to Supervisor semantics exactly:
 | Suspend | `POST .../suspend` | Enter suspended lifecycle state |
 | Wake | `POST .../wake` | Resume/relaunch through normal lifecycle |
 | Close permanently | `POST .../close` | Close the session permanently; destructive `?delete=true` is not exposed in v1 |
-| Rename/title | `PATCH .../session/{id}` or `POST .../rename` | Use the schema-appropriate field/operation |
+| Rename/title | `POST .../rename` | Send one nonempty `title`; apply the returned session without an optimistic rename |
 | Permission mode | `POST .../permission-mode` | Only while legal; values come from the provider option schema |
+
+The permission control is visible only when `providers/public` declares nonempty `permission_mode` choices. It is enabled fail-closed for idle `asleep`, `drained`, or `failed-create` sessions and idle/hold `suspended` sessions; all active, transitional, archived, and unknown states remain disabled. Gas City still performs the authoritative runtime/wake-in-flight check.
 
 Confirm destructive or runtime-ending actions. Refresh session state after mutation; stream state is authoritative when available. The stop/kill distinction and lifecycle handlers are in [stop/kill](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_handlers_sessions_command.go#L851-L903), [suspend/close](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_handlers_sessions_command.go#L939-L1005), and [wake](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_handlers_sessions_command.go#L1010-L1037).
 
@@ -374,7 +376,7 @@ Required controls:
 - Reimplement DSH's `/api` request trust checks on the more-specific pack route: validate `Host`, `Origin`, and `Sec-Fetch-Site`; accept loopback or the configured DSH host only; reject DNS rebinding and cross-site requests. The audited logic is [here](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/client/connection/src/api-request-trust.ts#L90-L123).
 - Refuse supported startup when DSH is configured for `0.0.0.0`, unless a future version adds an authenticated/TLS front door and a deliberate opt-in. Stock DSH documents no TLS or authentication: [web server boundary](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/docs/subsystems/web-server.md#L41-L47).
 - Accept only known connection IDs and exact operation templates. No arbitrary destination, redirect, method, path, query, or headers.
-- Retry safe reads after transport/auth recovery. Never automatically retry a mutation unless that exact Supervisor operation declares idempotency and the client retained its key; create and submit do not currently qualify.
+- Retry safe reads after transport/auth recovery. Never automatically retry a mutation unless that exact Supervisor operation declares idempotency and the client retained its key; create, submit, and respond do not currently qualify.
 - Reject upstream redirects. Defend against DNS rebinding/TOCTOU for remote resolution; apply GC's rule that cleartext HTTP is loopback-only.
 - Treat commands loaded from owner-only GC context files as trusted local code, matching `gc` itself. Never accept a helper command from the browser or Supervisor, and reject context files with unsafe ownership/permissions.
 - Enforce body, header, event-line, event-size, and concurrent-stream bounds chosen from observed API contracts and documented as implementation safety limits.
@@ -395,6 +397,7 @@ deepseek-harness-ui/
 ├── assets/
 │   ├── implementation-plan.md
 │   ├── versions.env
+│   ├── supervisor-contract.json # minimized required OpenAPI literals
 │   ├── dsh-plugin/
 │   │   ├── package.json
 │   │   ├── cordis.patch.yml
@@ -402,6 +405,8 @@ deepseek-harness-ui/
 │   │   │   ├── host/            # gateway, discovery, auth, TLS, relay
 │   │   │   ├── client/          # slots, workspace, feed, rendering
 │   │   ├── tests/
+│   │   │   └── e2e/            # deterministic stock-DSH gate + live certificate
+│   │   ├── playwright.config.mjs
 │   │   └── build configuration
 │   └── dist/
 │       └── gastownhall-deepseek-harness-ui-<version>.tgz
@@ -448,7 +453,7 @@ Do not add `[[service]]` to `pack.toml`. Reuse `slack-full` only for schema-v2 i
 4. Verify `dsh --profile web --dump-config` contains exactly one pack layer and no route collision.
 5. Print the explicit `gc <binding> web` launch command.
 
-`gc <binding> web` execs the pinned compatible `dsh web`/profile invocation and defaults to loopback. `status` is read-only: by default it reports local plugin/profile/version/config facts without invoking credential helpers; an explicit `--check` adds authenticated Supervisor health and capability probes. Neither mode mints a write grant. `uninstall` uses `dsh plugin --profile web remove <package>` and removes only this bundle from the DSH profile; it does not touch GC contexts or cities.
+`gc <binding> web` execs the pinned compatible `dsh web`/profile invocation and defaults to loopback. `status` is read-only: by default it reports local plugin/profile/version/config facts without invoking credential helpers; an explicit `--check` boots the real pack route, rejects unavailable configured connections, and adds authenticated health plus minimized OpenAPI route/schema probes for the direct `GC_SUPERVISOR_URL` target (or loopback default). Neither mode mints a write grant. `uninstall` uses `dsh plugin --profile web remove <package>` and removes only this bundle from the DSH profile; it does not touch GC contexts or cities.
 
 ## 13. Compatibility and version gates
 
@@ -462,7 +467,7 @@ Do not add `[[service]]` to `pack.toml`. Reuse `slack-full` only for schema-v2 i
 
 ### Gas City
 
-- Record `1807cf...` as the first tested baseline, but gate at runtime by `/health` plus `/openapi.json` capabilities.
+- Record `1807cf...` as the first tested baseline, but gate at runtime by `/health`, `/openapi.json`, the checked-in minimized compatibility contract, and parsers at every browser-facing JSON/SSE trust boundary.
 - Require the exact routes used in section 5; `session.structured.v1`; `snapshot|upsert|reset`; reset reasons; stable message IDs/statuses; structured/activity/pending/pending_cleared/heartbeat SSE events; submit intents; Problem Details; and async request result events.
 - Unknown additive fields are tolerated and preserved only where safe. Missing or changed required discriminants disable the affected capability with an upgrade diagnostic.
 - Treat generated OpenAPI v0 as authoritative, as the API reference specifies: [versioning](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/docs/reference/api.md#L337-L341).
@@ -535,7 +540,9 @@ Doctors return actionable success/warning/failure results for:
 
 ### End-to-end tests
 
-For at least two different GC session providers:
+The PR-blocking deterministic browser contract uses a stateful mock only to prove packaging, BFF routing, UI behavior, and stream semantics. It rebuilds and byte-compares the artifact, installs it through the pack command into isolated GC/DSH homes, launches exact stock DSH on a random loopback port, drives Chrome through the public UI, proves created-session identity and its own stream, forces EOF/resume/reset, exercises all interaction shapes and submit intents, uninstalls, and verifies owned-state cleanup plus GC/profile preservation. It is never described as multi-provider certification.
+
+The credentialed release certificate then repeats the shared stock-DSH UI path for at least two different real GC session providers:
 
 1. Install the tarball with the pack command into a clean DSH home.
 2. Start stock loopback `dsh web`.
@@ -553,7 +560,7 @@ For at least two different GC session providers:
 
 ### Phase 0 — DSH packaging spike
 
-**Baseline status: complete.**
+**Baseline status: implementation and deterministic compatibility gates complete; live cross-provider evidence pending.**
 
 - Build the smallest two-sided package.
 - Prove sidebar action, overlay, same-origin REST, and relayed SSE in stock `0.1.1-rc.2`.
@@ -571,23 +578,23 @@ For at least two different GC session providers:
 
 ### Phase 2 — read-only workspace and feed
 
-**Baseline status: core complete; thinking preference and broader navigation polish remain follow-ups.**
+**Baseline status: complete.**
 
 - Implement hierarchy, session list/state, structured bootstrap, SSE reducer, reconnection/rebootstrap, transcript renderer, activity/errors, and thinking preference.
 
-**Gate:** parity fixtures and live sessions from two providers render correctly through resets and reconnects.
+**Deterministic gate:** structured parity fixtures and stock-DSH browser recovery render correctly through reset and reconnect paths. **Release gate:** live sessions from two distinct providers remain required.
 
 ### Phase 3 — mutations and interactions
 
-**Baseline status: create, submit, interactions, and core lifecycle controls complete; rename and permission-mode UI remain follow-ups.**
+**Baseline status: implementation and deterministic interaction/control gates complete; live cross-provider evidence pending.**
 
 - Add draft/create-on-first-send, submit intents, pending interactions, `/respond`, and lifecycle controls.
 
-**Gate:** async request correlation/recovery, no-automatic-create-retry behavior, grant hardening, approvals/questions, and interruption E2E pass.
+**Deterministic gate:** async request correlation/recovery, no-automatic-mutation-retry behavior, approval aliases, questions, choices, submit intents, and interruption pass in contract/browser coverage. **Release gate:** repeat those behaviors against credentialed live providers.
 
 ### Phase 4 — pack delivery and release candidate
 
-**Baseline status: pack/install/doctor/browser gates complete; cross-provider live certification and release publication remain.**
+**Baseline status: deterministic pack/install/doctor/browser gates complete; cross-provider live certification and release publication remain.**
 
 - Add schema-v2 manifest, commands/help, doctors, deterministic artifact, checksums, status/uninstall, compatibility matrix, and operator docs.
 
@@ -597,13 +604,14 @@ For at least two different GC session providers:
 
 - **DSH RC extension stability:** the needed host route and UI slots are public in source/docs, but the release is an RC and its external browser build preset is unpublished. Exact pinning is mandatory initially.
 - **No direct read grants:** support requires Gas City to publish a read-grant source in its client-context/helper contract. Do not invent an incompatible pack-only mint format.
-- **Attachments:** Gasworks upload/cache is Gasworks-owned, while GC create/submit is text-only. V1 neither uploads nor proxies local attachments. See [Gasworks upload](https://github.com/gascity/gasworks-gui/blob/44812f2e656fc880a986b03a418a93348a8dc1ad/src/api/upload.ts#L39-L83) and [GC submit schema](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_types_sessions.go#L152-L180).
+- **Attachments:** Gasworks upload/cache is Gasworks-owned, while GC create/submit is text-only. V1 renders safe attachment/image metadata but neither uploads, links, fetches, nor proxies attachment paths/URLs. See [Gasworks upload](https://github.com/gascity/gasworks-gui/blob/44812f2e656fc880a986b03a418a93348a8dc1ad/src/api/upload.ts#L39-L83) and [GC submit schema](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_types_sessions.go#L152-L180).
 - **Provider-specific content:** the UI can display only content projected into `session.structured.v1`. Unknown blocks get a safe fallback; the pack does not read provider logs to fill gaps.
 - **DSH network exposure:** supported v1 operation is loopback only because stock DSH has no TLS/auth boundary.
 - **No connection editor:** users manage endpoints and credentials with `gc context`; the workspace refreshes that authoritative configuration.
 - **Configured agents only:** raw provider create is intentionally excluded until there is a product need and a capability-safe UX.
-- **No create idempotency:** the current Supervisor create-session operation has no idempotency header. The pack sends one attempt and reports a lost response as an unknown outcome. A strict exactly-once guarantee depends on an upstream GC API addition.
-- **Multi-browser fan-out:** v1 may open one upstream SSE per active browser/session. A shared host-side fan-out cache is a later optimization only if measurements justify its complexity.
+- **No create/submit/respond idempotency:** the current Supervisor create, submit, and interaction-response operations have no idempotency header. The pack sends one attempt, distinguishes received HTTP rejection from transport uncertainty, disables an uncertain pending response through authoritative refresh, and reports a lost response/result as an unknown outcome. A strict exactly-once guarantee depends on an upstream GC API addition.
+- **Live provider evidence:** deterministic fixtures prove the complete UI and transport contract, not provider neutrality. Release certification requires two real provider identities through the same isolated stock-DSH/pack path and remains unproven until that operator gate produces a passing certificate.
+- **Multi-browser fan-out:** one upstream SSE per active browser/session is an intentional v1 scope and scaling tradeoff. A shared host-side fan-out cache is a later optimization only if measurements justify its complexity; it is not an upstream dependency.
 
 ## 18. Acceptance criteria
 

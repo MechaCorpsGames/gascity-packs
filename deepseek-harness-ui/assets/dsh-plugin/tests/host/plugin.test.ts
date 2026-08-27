@@ -627,6 +627,102 @@ city = "alpha"
     expect(proxy).not.toHaveBeenCalled()
   })
 
+  it('marks a dispatched Supervisor mutation transport failure as an unknown outcome', async () => {
+    const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
+    tempDirs.push(gcHome)
+    await writeFile(join(gcHome, 'contexts.toml'), `
+[[context]]
+name = "remote"
+url = "https://example.test"
+city = "acme"
+`, { mode: 0o600 })
+    const fetchSupervisor = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/health')) return new Response('{}')
+      if (url.endsWith('/v0/cities')) {
+        return new Response('{"items":[{"name":"acme","running":true}]}')
+      }
+      throw new TypeError('fetch failed')
+    }) as typeof fetch
+    const { baseUrl } = await mount(undefined, { gcHome, fetch: fetchSupervisor })
+    const inventory = await fetch(`${baseUrl}/api/gas-city/v1/connections`).then(
+      response => response.json() as Promise<{ connections: Array<{ id: string; label: string }> }>,
+    )
+    const connection = inventory.connections.find(item => item.label === 'remote')
+    expect(connection).toBeDefined()
+
+    const response = await fetch(
+      `${baseUrl}/api/gas-city/v1/connections/${connection?.id}/city/acme/session/session-1/submit`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'Try once' }),
+      },
+    )
+
+    expect(response.status).toBe(502)
+    await expect(response.json()).resolves.toMatchObject({ code: 'outcome_unknown' })
+  })
+
+  it.each([
+    ['credential helper', 'credential'],
+    ['write-grant helper', 'grant'],
+    ['TLS CA', 'ca'],
+  ] as const)('keeps a %s failure classified as known-not-sent', async (_label, failure) => {
+    const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
+    tempDirs.push(gcHome)
+    const credentialLine = failure === 'credential' ? 'credential_command = "mint-bearer"' : ''
+    const grantLine = failure === 'grant' ? 'grant_command = "mint-write-grant"' : ''
+    const caLine = failure === 'ca' ? `ca_file = "${join(gcHome, 'missing-ca.pem')}"` : ''
+    await writeFile(join(gcHome, 'contexts.toml'), `
+[[context]]
+name = "remote"
+url = "https://example.test"
+city = "acme"
+${credentialLine}
+${grantLine}
+${caLine}
+`, { mode: 0o600 })
+    const fetchSupervisor = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/health')) return new Response('{}')
+      if (url.endsWith('/v0/cities')) {
+        return new Response('{"items":[{"name":"acme","running":true}]}')
+      }
+      return new Response('{"status":"accepted"}', { status: 202 })
+    }) as typeof fetch
+    const helpers = {
+      credential: vi.fn(async () => {
+        if (failure === 'credential') throw new Error('credential helper failed')
+        return { token: 'opaque-bearer', expirationTimestamp: '2099-01-01T00:00:00Z' }
+      }),
+      grant: vi.fn(async () => {
+        if (failure === 'grant') throw new Error('write-grant helper failed')
+        return `${Buffer.from('{}').toString('base64url')}.${Buffer.alloc(64).toString('base64url')}`
+      }),
+      provider: vi.fn(),
+    }
+    const { baseUrl } = await mount(undefined, { gcHome, fetch: fetchSupervisor, helpers } as never)
+    const inventory = await fetch(`${baseUrl}/api/gas-city/v1/connections`).then(
+      response => response.json() as Promise<{ connections: Array<{ id: string; label: string }> }>,
+    )
+    const connection = inventory.connections.find(item => item.label === 'remote')
+    expect(connection).toBeDefined()
+
+    const response = await fetch(
+      `${baseUrl}/api/gas-city/v1/connections/${connection?.id}/city/acme/session/session-1/submit`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'Try once' }),
+      },
+    )
+    const problem = await response.json() as Record<string, unknown>
+
+    expect(response.status).toBe(502)
+    expect(problem).not.toHaveProperty('code')
+  })
+
   it('fails closed before Supervisor-wide probes when access profiles conflict', async () => {
     const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
     tempDirs.push(gcHome)

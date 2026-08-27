@@ -14,6 +14,29 @@ export interface StructuredMessage {
   readonly id: string;
   readonly role: string;
   readonly status: StructuredMessageStatus;
+  readonly provider?: string;
+  readonly timestamp?: string;
+  readonly model?: string;
+  readonly stop_reason?: string;
+  readonly usage?: Readonly<Record<string, number>>;
+  readonly user_prompt?: {
+    readonly text?: string;
+    readonly opened_files?: readonly string[];
+    readonly uploaded_files?: readonly {
+      readonly original_name?: string;
+      readonly size?: string;
+      readonly mime_type?: string;
+      readonly file_path?: string;
+      readonly preview_url?: string;
+    }[];
+    readonly selections?: readonly { readonly text?: string }[];
+  };
+  readonly system_event?: {
+    readonly kind?: string;
+    readonly category?: string;
+    readonly code?: string;
+    readonly message?: string;
+  };
   readonly blocks?: readonly Readonly<Record<string, unknown>>[];
 }
 
@@ -170,12 +193,24 @@ export interface TranscriptBootstrap {
   readonly transcriptStreamId: string;
   readonly resumeToken: string;
   readonly messages: readonly StructuredMessage[];
+  readonly diagnostics?: readonly TranscriptDiagnostic[];
+  readonly degraded?: boolean;
+  readonly degradedReason?: string;
+  readonly continuityStatus?: string;
+  readonly continuityNote?: string;
+}
+
+export interface TranscriptDiagnostic {
+  readonly code: string;
+  readonly message?: string;
+  readonly count?: number;
 }
 
 export type PendingResponseState =
   | "enabled"
   | "submitting"
-  | "awaiting_clear";
+  | "awaiting_clear"
+  | "outcome_unknown";
 
 export interface PendingInteraction {
   readonly requestId: string;
@@ -199,6 +234,11 @@ export type SessionStreamEvent =
       readonly transcriptStreamId: string;
       readonly resumeToken: string;
       readonly messages: readonly StructuredMessage[];
+      readonly diagnostics?: readonly TranscriptDiagnostic[];
+      readonly degraded?: boolean;
+      readonly degradedReason?: string;
+      readonly continuityStatus?: string;
+      readonly continuityNote?: string;
       readonly resetReason?: StructuredResetReason;
     }
   | {
@@ -237,6 +277,22 @@ export interface FeedStreamError {
   readonly status?: number;
 }
 
+export class FeedMutationError extends Error {
+  readonly outcome: "rejected" | "unknown";
+  readonly status: number;
+
+  constructor(
+    outcome: "rejected" | "unknown",
+    status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "FeedMutationError";
+    this.outcome = outcome;
+    this.status = status;
+  }
+}
+
 export interface SessionStreamHandle {
   close(): void;
 }
@@ -259,6 +315,11 @@ export interface FeedTranscriptSnapshot {
   readonly transcriptStreamId: string;
   readonly resumeToken: string;
   readonly messages: readonly StructuredMessage[];
+  readonly diagnostics?: readonly TranscriptDiagnostic[];
+  readonly degraded?: boolean;
+  readonly degradedReason?: string;
+  readonly continuityStatus?: string;
+  readonly continuityNote?: string;
 }
 
 export interface StructuredFeedSnapshot {
@@ -321,6 +382,9 @@ function freezeSnapshot(
         : Object.freeze({
             ...snapshot.transcript,
             messages: Object.freeze([...snapshot.transcript.messages]),
+            ...(snapshot.transcript.diagnostics === undefined
+              ? {}
+              : { diagnostics: Object.freeze(snapshot.transcript.diagnostics.map(diagnostic => Object.freeze({ ...diagnostic }))) }),
           }),
     pending: Object.freeze(snapshot.pending.map(freezeInteraction)),
     resetNotice:
@@ -342,7 +406,11 @@ function reducePendingEvent(
   }
   const interaction = {
     ...event.interaction,
-    responseState: "enabled" as const,
+    responseState: pending.find(
+      (item) => item.requestId === event.interaction.requestId,
+    )?.responseState === "outcome_unknown"
+      ? "outcome_unknown" as const
+      : "enabled" as const,
   };
   const index = pending.findIndex(
     (item) => item.requestId === interaction.requestId,
@@ -432,6 +500,11 @@ function reduceFeedEvent(
         transcriptStreamId: event.transcriptStreamId,
         resumeToken: event.resumeToken,
         messages,
+        ...(event.diagnostics === undefined ? {} : { diagnostics: event.diagnostics }),
+        ...(event.degraded === undefined ? {} : { degraded: event.degraded }),
+        ...(event.degradedReason === undefined ? {} : { degradedReason: event.degradedReason }),
+        ...(event.continuityStatus === undefined ? {} : { continuityStatus: event.continuityStatus }),
+        ...(event.continuityNote === undefined ? {} : { continuityNote: event.continuityNote }),
       },
       resetNotice,
     },
@@ -605,6 +678,11 @@ export function createStructuredFeedController(
       const generation = ++selectionGeneration;
       const connectionGeneration = ++streamGeneration;
       const retainLedger = selectedSessionId === sessionId;
+      const uncertainResponseIds = retainLedger
+        ? new Set(snapshot.pending
+            .filter(interaction => interaction.responseState === "outcome_unknown")
+            .map(interaction => interaction.requestId))
+        : new Set<string>();
       selectedSessionId = sessionId;
       stream?.close();
       publish({
@@ -704,10 +782,17 @@ export function createStructuredFeedController(
           transcriptStreamId: transcript.transcriptStreamId,
           resumeToken: transcript.resumeToken,
           messages: transcript.messages,
+          ...(transcript.diagnostics === undefined ? {} : { diagnostics: transcript.diagnostics }),
+          ...(transcript.degraded === undefined ? {} : { degraded: transcript.degraded }),
+          ...(transcript.degradedReason === undefined ? {} : { degradedReason: transcript.degradedReason }),
+          ...(transcript.continuityStatus === undefined ? {} : { continuityStatus: transcript.continuityStatus }),
+          ...(transcript.continuityNote === undefined ? {} : { continuityNote: transcript.continuityNote }),
         },
         pending: pending.map((interaction) => ({
           ...interaction,
-          responseState: "enabled" as const,
+          responseState: uncertainResponseIds.has(interaction.requestId)
+            ? "outcome_unknown" as const
+            : "enabled" as const,
         })),
         activity: null,
         resetNotice: null,
@@ -729,6 +814,9 @@ export function createStructuredFeedController(
       const generation = selectionGeneration;
       const connectionGeneration = ++streamGeneration;
       const sessionId = selectedSessionId;
+      const uncertainResponseIds = new Set(snapshot.pending
+        .filter(interaction => interaction.responseState === "outcome_unknown")
+        .map(interaction => interaction.requestId));
       stream?.close();
       publish({ ...snapshot, phase: "reconnecting" });
 
@@ -807,7 +895,9 @@ export function createStructuredFeedController(
         session,
         pending: pending.map((interaction) => ({
           ...interaction,
-          responseState: "enabled" as const,
+          responseState: uncertainResponseIds.has(interaction.requestId)
+            ? "outcome_unknown" as const
+            : "enabled" as const,
         })),
       };
       let installedLedger = semanticLedger;
@@ -834,6 +924,8 @@ export function createStructuredFeedController(
       if (current === undefined || current.responseState !== "enabled") {
         throw new Error(`Pending interaction ${requestId} is not actionable`);
       }
+      const responseSessionId = selectedSessionId;
+      const responseGeneration = selectionGeneration;
       publish({
         ...snapshot,
         pending: snapshot.pending.map((interaction) =>
@@ -843,17 +935,28 @@ export function createStructuredFeedController(
         ),
       });
       try {
-        await port.respond(selectedSessionId, requestId, response);
+        await port.respond(responseSessionId, requestId, response);
       } catch (error) {
+        if (responseGeneration !== selectionGeneration || responseSessionId !== selectedSessionId) {
+          throw error;
+        }
+        const outcomeUnknown = error instanceof FeedMutationError && error.outcome === "unknown";
         publish({
           ...snapshot,
           pending: snapshot.pending.map((interaction) =>
             interaction.requestId === requestId &&
             interaction.responseState === "submitting"
-              ? { ...interaction, responseState: "enabled" }
+              ? { ...interaction, responseState: outcomeUnknown ? "outcome_unknown" : "enabled" }
               : interaction,
           ),
         });
+        if (outcomeUnknown) {
+          try {
+            await controller.reconnect();
+          } catch {
+            // Preserve the original mutation uncertainty when its authoritative refresh also fails.
+          }
+        }
         throw error;
       }
       publish({

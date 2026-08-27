@@ -18,7 +18,9 @@ for check in node dsh pnpm artifact profile; do
   "$pack_dir/doctor/check-$check.sh"
 done
 if [ "$live" = true ]; then
-  for check in gc-contexts supervisor read-grant; do
+  "$pack_dir/doctor/check-gc-contexts.sh"
+  GC_REQUIRE_AVAILABLE_CONNECTIONS=1 "$pack_dir/doctor/check-listener.sh"
+  for check in supervisor read-grant; do
     "$pack_dir/doctor/check-$check.sh"
   done
   echo "live Supervisor checks: complete"

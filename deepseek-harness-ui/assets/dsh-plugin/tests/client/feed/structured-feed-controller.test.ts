@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createStructuredFeedController,
+  FeedMutationError,
   type FeedPort,
   type PendingInteraction,
   type SessionStreamEvent,
@@ -300,7 +301,7 @@ describe("structured feed controller", () => {
     ]);
   });
 
-  it("re-enables an interaction when its response request fails", async () => {
+  it("re-enables an interaction after a received response rejection", async () => {
     const accepted = deferred<void>();
     const port: FeedPort = {
       async fetchTranscript() {
@@ -334,12 +335,77 @@ describe("structured feed controller", () => {
     await controller.bootstrap({ sessionId: "session-1" });
 
     const responding = controller.respond("request-1", { action: "deny" });
-    accepted.reject(new Error("network unavailable"));
+    accepted.reject(new FeedMutationError("rejected", 409, "interaction conflict"));
 
-    await expect(responding).rejects.toThrow("network unavailable");
+    await expect(responding).rejects.toThrow("interaction conflict");
     expect(controller.getSnapshot().pending).toMatchObject([
       { requestId: "request-1", responseState: "enabled" },
     ]);
+  });
+
+  it("keeps an interaction uncertain and refreshes authoritative state after a lost response outcome", async () => {
+    const calls: string[] = [];
+    let streamNumber = 0;
+    const port: FeedPort = {
+      async fetchTranscript() {
+        calls.push("transcript");
+        return {
+          sessionId: "session-1",
+          transcriptStreamId: "stream-1",
+          resumeToken: "cursor-1",
+          messages: [],
+        };
+      },
+      async openSessionStream() {
+        streamNumber += 1;
+        calls.push(`stream:${streamNumber}`);
+        return { close() {} };
+      },
+      async fetchPending() {
+        calls.push("pending");
+        return [
+          {
+            requestId: "request-1",
+            kind: "approval",
+            prompt: "Proceed?",
+          },
+        ];
+      },
+      async fetchSession() {
+        calls.push("session");
+        return { id: "session-1", state: "active", closed: false };
+      },
+      async respond() {
+        calls.push("respond");
+        throw new FeedMutationError(
+          "unknown",
+          502,
+          "the interaction response may have been accepted",
+        );
+      },
+    };
+    const controller = createStructuredFeedController(port);
+    await controller.bootstrap({ sessionId: "session-1" });
+
+    const responding = controller.respond("request-1", { action: "approve" });
+
+    await expect(responding).rejects.toThrow("may have been accepted");
+    expect(calls).toEqual([
+      "transcript",
+      "stream:1",
+      "pending",
+      "session",
+      "respond",
+      "stream:2",
+      "pending",
+      "session",
+    ]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "live",
+      pending: [
+        { requestId: "request-1", responseState: "outcome_unknown" },
+      ],
+    });
   });
 
   it("keeps a same-id replacement actionable when an older response resolves", async () => {
