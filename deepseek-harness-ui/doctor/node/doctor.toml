@@ -1,0 +1,2 @@
+description = "node satisfies the DSH runtime requirement"
+run = "../check-node.sh"

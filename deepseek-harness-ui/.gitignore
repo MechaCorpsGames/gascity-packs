@@ -1,0 +1,8 @@
+# Local JavaScript dependency installs and generated plugin build output.
+assets/dsh-plugin/node_modules/
+assets/dsh-plugin/lib/
+
+# Local test and coverage output.
+assets/dsh-plugin/coverage/
+assets/dsh-plugin/.vitest/
+

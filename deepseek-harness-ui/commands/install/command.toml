@@ -1,0 +1,2 @@
+description = "Install the pinned Gas City workspace plugin into the DSH web profile"
+run = "../install.sh"

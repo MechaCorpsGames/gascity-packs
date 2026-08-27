@@ -1,0 +1,2 @@
+description = "pnpm matches the DSH plugin-management toolchain"
+run = "../check-pnpm.sh"

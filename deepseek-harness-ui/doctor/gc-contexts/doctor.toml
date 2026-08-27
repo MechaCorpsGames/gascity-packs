@@ -1,0 +1,2 @@
+description = "GC context configuration is private and passes GC's validator"
+run = "../check-gc-contexts.sh"

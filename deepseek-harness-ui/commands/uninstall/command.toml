@@ -1,0 +1,2 @@
+description = "Remove the Gas City workspace plugin from the DSH web profile"
+run = "../uninstall.sh"

@@ -1,0 +1,2 @@
+description = "Supervisor health and required OpenAPI operations are available"
+run = "../check-supervisor.sh"

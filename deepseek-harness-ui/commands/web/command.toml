@@ -1,0 +1,2 @@
+description = "Launch the pinned DSH web profile on a loopback listener"
+run = "../web.sh"

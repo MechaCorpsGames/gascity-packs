@@ -1,0 +1,2 @@
+description = "DSH boots on loopback and registers the pack route without collision"
+run = "../check-listener.sh"

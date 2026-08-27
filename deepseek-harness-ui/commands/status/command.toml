@@ -1,0 +1,2 @@
+description = "Report local plugin/profile status, with optional live checks"
+run = "../status.sh"

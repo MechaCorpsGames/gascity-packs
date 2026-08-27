@@ -1,0 +1,2 @@
+description = "DSH web profile exists and contains the exact pack bundle"
+run = "../check-profile.sh"

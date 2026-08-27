@@ -1,0 +1,4 @@
+[pack]
+name = "deepseek-harness-ui"
+version = "0.1.0"
+schema = 2

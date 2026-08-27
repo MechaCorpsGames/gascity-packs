@@ -1,0 +1,2 @@
+description = "detect unsupported direct X-GC-City-Read grant hardening"
+run = "../check-read-grant.sh"

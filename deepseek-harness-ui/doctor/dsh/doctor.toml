@@ -1,0 +1,2 @@
+description = "dsh matches the exact audited release"
+run = "../check-dsh.sh"

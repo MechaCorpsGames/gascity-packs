@@ -1,0 +1,2 @@
+description = "pack-owned DSH plugin artifact exists and matches its SHA-256 pin"
+run = "../check-artifact.sh"
