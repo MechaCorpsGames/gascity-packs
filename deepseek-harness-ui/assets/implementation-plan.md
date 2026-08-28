@@ -1,6 +1,6 @@
 # `deepseek-harness-ui` implementation plan
 
-Status: implemented production-ready release candidate for the documented v1 boundary. The isolated stock-DSH certificate passed against real Claude and Codex sessions on the audited Gas City baseline. Production telemetry and release publication remain follow-ups.
+Status: implemented release candidate for the documented v1 boundary. Deterministic, stock-browser, SSH, and soak gates pass. An earlier artifact passed the isolated real-Claude/real-Codex certificate, but the final artifact still needs a fresh complete two-provider pass after bounded reruns encountered alternating external provider startup stalls. Production telemetry and release publication remain follow-ups.
 
 Research baseline: Gas City `1807cf018045e9f225993d97cf6daea37e2ce6e9`, Gasworks GUI `44812f2e656fc880a986b03a418a93348a8dc1ad`, DeepSeek Harness `dsh-v0.1.1-rc.2` / `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`, and `gascity-packs` `aab8030d397c211be6a4d460e9ce8de39e867a09`.
 
@@ -10,7 +10,7 @@ The pack now contains the two-sided stock-DSH plugin, fixed same-origin REST/SSE
 
 The adversarial-review corrections are implemented: unique list-slot IDs; `./package.json` export; no Supervisor-wide stream; master `sessions?state=all` inventory grouped in the browser; implicit default submit intent; **Close permanently** terminology and fail-closed lifecycle matrix; transcript-first buffered handoff; authoritative pending replacement; same-ID semantic ledger; uint64 city event IDs kept as decimal strings/`BigInt`; bounded EOF/network/contract recovery; deterministic access-profile selection; redirect refusal; strict request schemas; loopback-only DSH; and credential/TLS/grant handling confined to the host.
 
-The release candidate is verified by 138 plugin tests, 28 pack/install tests, TypeScript checking, production builds, ShellCheck, `gc lint`, deterministic artifact byte comparison, and checked-in headless-Chrome contract/uncertainty/soak runs against an isolated exact stock `dsh web` profile and random-port Supervisor fixture. The separate isolated live certificate also passed with two real, distinct providers after normal `gc init` started the disposable Supervisor and city.
+The release candidate is verified by 146 plugin tests, 40 pack/install tests, TypeScript checking, production builds, ShellCheck, `gc lint`, deterministic artifact byte comparison, and checked-in headless-Chrome contract/uncertainty/soak runs against an isolated exact stock `dsh web` profile and random-port Supervisor fixture. The separate isolated live certificate has historical two-provider evidence, but its final-artifact rerun is currently **UNPROVEN** because the real provider CLIs stalled after session creation; release requires a fresh complete pass.
 
 ## 1. Decision summary
 
@@ -345,8 +345,8 @@ Do not fetch `file:`, arbitrary local paths, or arbitrary remote URLs through th
 
 For each access profile, support the mutually exclusive current GC modes:
 
-- **Credential command**: port `gascity.dev/client-auth/v1`. Preserve GC's configured-command semantics (`sh -c`) and pass request JSON only through `GC_EXEC_INFO`, after stripping inherited `GC_*_INFO` values. Bound execution; cap captured output; require token and expiry; cache until refresh skew; redact output from browser responses and logs; force-mint once after 401.
-- **Credential provider tuple**: port `gascity.dev/credential-provider/v1`. Use the exact audience, required scopes, and org from the context. Resolve provider argv from `GC_CREDENTIAL_PROVIDER`, defaulting to `gasworks credential-provider`; execute directly with minimal environment; validate audience/scopes/expiry; coalesce and cache mints; force refresh once after 401.
+- **Credential command**: port `gascity.dev/client-auth/v1`. Preserve GC's configured-command semantics (`sh -c`) and pass request JSON only through `GC_EXEC_INFO`, after stripping inherited `GC_*_INFO` values. Bound execution; cap captured output; require token and expiry; coalesce/cache mints until refresh skew; redact output from browser responses and logs; force-mint once only after a replay-safe read receives a bearer 401.
+- **Credential provider tuple**: port `gascity.dev/credential-provider/v1`. Use the exact audience, required scopes, and org from the context. Resolve provider argv from `GC_CREDENTIAL_PROVIDER`, defaulting to `gasworks credential-provider`; execute directly with minimal environment; validate audience/scopes/expiry; coalesce and cache mints; force refresh once only after a replay-safe read receives a bearer 401.
 - **No bearer**: valid for loopback or an otherwise unfronted Supervisor.
 
 GC's bearer behavior is documented in [client auth](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientauth/clientauth.go#L1-L31), including its exact [shell and environment contract](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientauth/clientauth.go#L207-L242). Provider-mode behavior must be contract-tested against GC's v1 protocol, not imported from an internal Go package.
@@ -359,11 +359,11 @@ Every mutation gets:
 - a stable `Idempotency-Key` where the operation supports it;
 - a fresh `X-GC-City-Write` minted by `grant_command` when configured.
 
-Port `gascity.dev/city-write-grant/v1`. Preserve GC's configured-command semantics (`sh -c`), carry the binding only in `GC_GRANT_INFO`, and strip inherited `GC_*_INFO` values. Bind each grant to city, method, normalized path, body SHA-256, and request digest exactly as GC does. Despite its field name, `canonical_query` must contain the request's raw URL query bytes; GC's digest function performs canonicalization. A grant is single-use: never cache it and never automatically retry a mutation with the same grant. Mint a new grant for an explicitly safe idempotent retry. See [write-grant contract](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientgrant/clientgrant.go#L1-L15), [fresh request binding](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientgrant/clientgrant.go#L72-L115), and [helper execution](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientgrant/clientgrant.go#L145-L173).
+Port `gascity.dev/city-write-grant/v1`. Preserve GC's configured-command semantics (`sh -c`), carry the binding only in `GC_GRANT_INFO`, and strip inherited `GC_*_INFO` values. Bind each grant to city, method, normalized path, body SHA-256, and request digest exactly as GC does. Despite its field name, `canonical_query` must contain the request's raw URL query bytes; GC's digest function performs canonicalization. A grant is single-use: never cache it. V1 never automatically retries a mutation after dispatch, including after a bearer 401; the browser reconciles ambiguous outcomes from authoritative request/session state. See [write-grant contract](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientgrant/clientgrant.go#L1-L15), [fresh request binding](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientgrant/clientgrant.go#L72-L115), and [helper execution](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientgrant/clientgrant.go#L145-L173).
 
 ### 9.3 Read-grant hardening
 
-A direct read-grant-hardened Supervisor requires a fresh, exact-request `X-GC-City-Read` grant on every city-scoped GET/HEAD, including every SSE reconnect. GC contexts currently have no read-grant command/source, and current GC clients do not mint one. V1 must detect the 401/Problem Details response and explain that this deployment needs an upstream GC client contract before it can be supported. Bearer-fronted Supervisors remain supported. Evidence: [read-auth boundary](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/readauth.go#L15-L38), [SSE reconnect requirement](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/readauth.go#L40-L67), and [context fields](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientcontext/clientcontext.go#L31-L50).
+A direct read-grant-hardened Supervisor requires a fresh, exact-request `X-GC-City-Read` grant on every city-scoped GET/HEAD, including every SSE reconnect. GC contexts currently have no read-grant command/source, and current GC clients do not mint one. V1 detects the exact 401/Problem Details response, preserves it for the UI, and does not misclassify it as a stale bearer or invoke a forced bearer refresh. Inspection of that untrusted body is capped at 16 KiB, 256 chunks, and one 500 ms wall-clock deadline so a slow-drip response cannot hold stream admission open. The diagnostic explains that the deployment needs an upstream GC client contract before direct access can be supported. Bearer-fronted Supervisors remain supported. Evidence: [read-auth boundary](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/readauth.go#L15-L38), [SSE reconnect requirement](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/readauth.go#L40-L67), and [context fields](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/clientcontext/clientcontext.go#L31-L50).
 
 ### 9.4 DSH configuration
 
@@ -398,6 +398,7 @@ deepseek-harness-ui/
 ├── pack.toml
 ├── assets/
 │   ├── implementation-plan.md
+│   ├── dsh-compatibility.json  # certified/minimum/known-incompatible hosts
 │   ├── versions.env
 │   ├── supervisor-contract.json # minimized required OpenAPI literals
 │   ├── dsh-plugin/
@@ -407,7 +408,7 @@ deepseek-harness-ui/
 │   │   │   ├── host/            # gateway, discovery, auth, TLS, relay
 │   │   │   ├── client/          # slots, workspace, feed, rendering
 │   │   ├── tests/
-│   │   │   └── e2e/            # deterministic stock-DSH gate + live certificate
+│   │   │   └── e2e/            # local/SSH stock-DSH gates + live certificate
 │   │   ├── playwright.config.mjs
 │   │   └── build configuration
 │   └── dist/
@@ -440,7 +441,7 @@ Do not add `[[service]]` to `pack.toml`. Reuse `slack-full` only for schema-v2 i
 
 ### Build/release
 
-- Build and test the npm artifact in CI against the exact DSH release.
+- Build the npm artifact reproducibly against one exact DSH toolchain. Each pack release lists exactly that browser-tested DSH runtime as certified; a guard fails if the compatibility manifest claims a runtime not exercised by the stock-browser gates.
 - Pack it as a deterministic `.tgz`; record its SHA-256 and dependency lock.
 - Ship the prebuilt artifact so installation does not depend on the DSH monorepo's unpublished bundle preset or arbitrary `prepare` scripts.
 - Run license, provenance, package-content, secret, and dependency audits before release.
@@ -455,16 +456,17 @@ Do not add `[[service]]` to `pack.toml`. Reuse `slack-full` only for schema-v2 i
 4. Verify `dsh --profile web --dump-config` contains exactly one pack layer and no route collision.
 5. Print the explicit `gc <binding> web` launch command.
 
-`gc <binding> web` execs the pinned compatible `dsh web`/profile invocation and defaults to loopback. `status` is read-only: by default it reports local plugin/profile/version/config facts without invoking credential helpers; an explicit `--check` boots the real pack route, rejects unavailable configured connections, and adds authenticated health plus minimized OpenAPI route/schema probes for the direct `GC_SUPERVISOR_URL` target (or loopback default). Neither mode mints a write grant. `uninstall` uses `dsh plugin --profile web remove <package>` and removes only this bundle from the DSH profile; it does not touch GC contexts or cities.
+`gc <binding> web` execs the compatible `dsh web` profile and binds it to loopback. Local browsers open that address directly; remote browsers reach the same loopback listener through DSH's documented SSH-client/editor port-forwarding flow. `status` is read-only: by default it reports local plugin/profile/version/config facts without invoking credential helpers; an explicit `--check` boots the real pack route, rejects unavailable configured connections, and adds authenticated health plus minimized OpenAPI route/schema probes for the direct `GC_SUPERVISOR_URL` target (or loopback default). Neither mode mints a write grant. `uninstall` uses `dsh plugin --profile web remove <package>` and removes only this bundle from the DSH profile; it does not touch GC contexts or cities.
 
 ## 13. Compatibility and version gates
 
 ### DSH
 
-- Initial exact support: `@deepseek-ai/dsh` `0.1.1-rc.2`, commit `b150a...`.
+- First certified host and exact build dependency: `@deepseek-ai/dsh` `0.1.1-rc.2`, commit `b150a...`.
 - Require Node `22.19+` or `>=24`, matching the audited DSH release; use its expected pnpm toolchain only at build time.
-- Exact-pin all DSH peer packages. RC internals and the client artifact format are not semver-stable.
-- Gate on successful host-route registration, browser module load, slot presence, React compatibility, request-trust behavior, and stock-profile E2E—not version text alone.
+- Keep all DSH development/build dependencies exact, but do not publish type-only DSH packages as exact runtime peers. The prebuilt browser artifact has React as its only shared runtime dependency.
+- Maintain minimum, the release-certified runtime, and known-incompatible hosts in `dsh-compatibility.json`. A newer untested host receives a provisional warning and may continue through profile composition and the host-route probe, but its browser loader/slot compatibility is explicitly unverified; a below-minimum or known-bad host fails precisely.
+- Certify a host only after successful profile composition, host-route registration, browser module load, slot presence, React compatibility, request-trust behavior, local browser E2E, and SSH-forwarded browser E2E—not from version text alone.
 - The DSH docs' external `turtle-ui` example was unavailable during the audit; do not depend on it.
 
 ### Gas City
@@ -551,14 +553,14 @@ The credentialed release certificate then exercises the shared stock-DSH UI path
 3. Install the tarball with the pack command into a clean DSH home and start stock loopback `dsh web`.
 4. Open Gas City from the sidebar, discover each agent, and create its session on first send through the correlated city-event lifecycle.
 5. For each provider, verify a final nonce in the authoritative structured transcript, submit a second prompt requiring a harmless read-only tool, and prove a new matching tool-use/tool-result pair both authoritatively and in the UI.
-6. Close each run-owned session permanently, uninstall the plugin, restore the DSH profile, stop the disposable city, uninstall the isolated Supervisor service, and remove only the run-owned temporary root.
+6. Close each run-owned session permanently, uninstall the plugin, restore the DSH profile, uninstall the isolated Supervisor service, force-stop the disposable city, verify/kill only the uniquely named run-owned tmux server if GC left it behind, and remove only the run-owned temporary root.
 7. On failure, preserve browser errors/responses, visible DOM, screenshot, Supervisor health, city/session/agent state, recent city events, and `gc status` before cleanup.
 
 ## 16. Phased implementation and release gates
 
 ### Phase 0 — DSH packaging spike
 
-**Baseline status: complete, including isolated live cross-provider evidence.**
+**Baseline status: deterministic packaging complete; final-artifact live cross-provider recertification pending.**
 
 - Build the smallest two-sided package.
 - Prove sidebar action, overlay, same-origin REST, and relayed SSE in stock `0.1.1-rc.2`.
@@ -600,16 +602,16 @@ The credentialed release certificate then exercises the shared stock-DSH UI path
 
 ## 17. Known limitations and upstream dependencies
 
-- **DSH RC extension stability:** the needed host route and UI slots are public in source/docs, but the release is an RC and its external browser build preset is unpublished. Exact pinning is mandatory initially.
-- **No direct read grants:** support requires Gas City to publish a read-grant source in its client-context/helper contract. Do not invent an incompatible pack-only mint format.
+- **DSH preview extension stability:** the needed host route and UI slots are public in source/docs, but the external browser build preset remains unpublished. Exact build pins plus per-host certification are mandatory; runtime support is not artificially locked to the build version.
+- **No direct read-grant minter:** authority-fronted Supervisors are supported through existing GC transport-bearer contexts. A direct hardened Supervisor still requires a concrete host-only read-grant source/helper contract; DSH credential storage cannot invent that protocol. Do not embed a signing key in browser/settings state or cache single-use grants.
 - **Attachments:** Gasworks upload/cache is Gasworks-owned, while GC create/submit is text-only. V1 renders safe attachment/image metadata but neither uploads, links, fetches, nor proxies attachment paths/URLs. See [Gasworks upload](https://github.com/gascity/gasworks-gui/blob/44812f2e656fc880a986b03a418a93348a8dc1ad/src/api/upload.ts#L39-L83) and [GC submit schema](https://github.com/gastownhall/gascity/blob/1807cf018045e9f225993d97cf6daea37e2ce6e9/internal/api/huma_types_sessions.go#L152-L180).
 - **Provider-specific content:** the UI can display only content projected into `session.structured.v1`. Unknown blocks get a safe fallback; the pack does not read provider logs to fill gaps.
-- **DSH network exposure:** supported v1 operation is loopback only because stock DSH has no TLS/auth boundary.
+- **DSH network exposure:** local and SSH-forwarded operation are supported; the DSH listener itself remains loopback-only because stock DSH has no TLS/auth boundary.
 - **No connection editor:** users manage endpoints and credentials with `gc context`; the workspace refreshes that authoritative configuration.
 - **Configured agents only:** raw provider create is intentionally excluded until there is a product need and a capability-safe UX.
 - **No create/submit/respond idempotency:** the current Supervisor create, submit, and interaction-response operations have no idempotency header. The pack sends one attempt, distinguishes received HTTP rejection from transport uncertainty, disables an uncertain pending response through authoritative refresh, and reports a lost response/result as an unknown outcome. A strict exactly-once guarantee depends on an upstream GC API addition.
 - **Isolated storage exception:** the live release fixture currently selects `GC_BEADS=file` because default managed-Dolt `gc init` is blocked on the audited machine by its installed `bd`/Dolt compatibility. The fixture still uses `gc init`, lets it start the isolated Supervisor/city, and proves `running: true`; it does not certify the default storage path.
-- **Live provider scope:** the isolated certificate passed for Claude and Codex through the same stock-DSH/pack path. That proves the provider-neutral boundary for two real providers on the audited baseline, not every current or future Gas City provider.
+- **Live provider scope and availability:** an earlier audited artifact passed for Claude and Codex through the same stock-DSH/pack path. Final-artifact reruns reached authoritative GC session creation and completed one real provider before the other external CLI stalled; neither bounded attempt is a passing two-provider certificate. This external availability gate must pass before release, and even then it certifies only the named providers on the audited baseline.
 - **macOS live-fixture path:** the certificate creates its disposable city under `~/Library/Caches`, avoiding the audited GC Codex rollout lookup's lexical `/tmp` versus `/private/tmp` `cwd` mismatch. This affects only the disposable release fixture and does not rewrite user city paths.
 - **Multi-browser fan-out:** one upstream SSE per active browser/session is an intentional v1 scope and scaling tradeoff. A shared host-side fan-out cache is a later optimization only if measurements justify its complexity; it is not an upstream dependency.
 
@@ -625,7 +627,7 @@ The pack is ready for a v1 release only when all of these statements are demonst
 - Partial text, same-ID updates, reset, pending, activity, errors, EOF, reconnect, and cursor expiry pass contract/E2E tests.
 - All supported mutations use GC CSRF/auth/grant contracts; no secret reaches browser state or logs.
 - The gateway cannot be used as a general HTTP proxy.
-- Loopback exposure and unsupported read-grant hardening are diagnosed honestly.
+- Local/SSH loopback exposure and the direct-read-grant versus authority-fronted distinction are diagnosed honestly.
 - Attachment limitations and unknown provider content degrade safely.
 - Install, status, doctor, launch, upgrade, and uninstall work from the pack without source changes to any audited repository.
 

@@ -19,6 +19,13 @@ def write_executable(directory: pathlib.Path, name: str, body: str) -> None:
     path.chmod(0o755)
 
 
+def copy_dsh_compatibility(pack_dir: pathlib.Path) -> None:
+    shutil.copy2(
+        PACK_DIR / "assets" / "dsh-compatibility.json",
+        pack_dir / "assets" / "dsh-compatibility.json",
+    )
+
+
 class InstallTests(unittest.TestCase):
     def test_install_rejects_a_tampered_artifact_before_plugin_add(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -35,19 +42,27 @@ class InstallTests(unittest.TestCase):
                 "PLUGIN_PACKAGE=@gastownhall/deepseek-harness-ui\n"
                 "PLUGIN_ARTIFACT=plugin.tgz\n"
                 "PLUGIN_SHA256=" + "0" * 64 + "\n"
-                "DSH_VERSION=0.1.1-rc.2\n"
+                "DSH_BUILD_VERSION=0.1.1-rc.2\n"
                 "PNPM_VERSION=11.7.0\n"
                 "NODE_22_MIN=22.19.0\n"
                 "NODE_NEXT_MIN=24.0.0\n",
                 encoding="utf-8",
             )
+            copy_dsh_compatibility(pack_dir)
             for name in ("node", "dsh", "pnpm", "artifact"):
                 shutil.copy2(
                     PACK_DIR / "doctor" / f"check-{name}.sh",
                     pack_dir / "doctor" / f"check-{name}.sh",
                 )
 
-            write_executable(bin_dir, "node", "printf 'v22.19.0\\n'")
+            real_node = shutil.which("node")
+            self.assertIsNotNone(real_node)
+            write_executable(
+                bin_dir,
+                "node",
+                "if [ \"${1:-}\" = --version ]; then printf 'v22.19.0\\n'; exit 0; fi\n"
+                f"exec {shlex.quote(real_node)} \"$@\"",
+            )
             write_executable(bin_dir, "pnpm", "printf '11.7.0\\n'")
             write_executable(
                 bin_dir,
@@ -79,7 +94,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn("checksum mismatch", result.stdout)
         self.assertNotIn("plugin --profile web add", calls)
 
-    def test_install_adds_the_exact_tarball_then_validates_composition(self) -> None:
+    def test_install_allows_a_newer_dsh_with_an_explicit_unverified_browser_warning(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = pathlib.Path(raw_dir)
             pack_dir = root / "pack"
@@ -96,12 +111,13 @@ class InstallTests(unittest.TestCase):
                 "PLUGIN_PACKAGE=@gastownhall/deepseek-harness-ui\n"
                 "PLUGIN_ARTIFACT=plugin.tgz\n"
                 f"PLUGIN_SHA256={digest}\n"
-                "DSH_VERSION=0.1.1-rc.2\n"
+                "DSH_BUILD_VERSION=0.1.1-rc.2\n"
                 "PNPM_VERSION=11.7.0\n"
                 "NODE_22_MIN=22.19.0\n"
                 "NODE_NEXT_MIN=24.0.0\n",
                 encoding="utf-8",
             )
+            copy_dsh_compatibility(pack_dir)
             for name in ("node", "dsh", "pnpm", "artifact", "profile", "listener"):
                 shutil.copy2(
                     PACK_DIR / "doctor" / f"check-{name}.sh",
@@ -122,7 +138,7 @@ class InstallTests(unittest.TestCase):
                 "dsh",
                 "printf '%s\\n' \"$*\" >> \"$DSH_TEST_LOG\"\n"
                 "case \"$*\" in\n"
-                "  --version) printf '0.1.1-rc.2\\n' ;;\n"
+                "  --version) printf '0.1.2-rc.1\\n' ;;\n"
                 "  'plugin --profile web add --save-exact '*)\n"
                 "    mkdir -p \"$DSH_HOME/profiles/web\"\n"
                 "    printf '%s\\n' '{\"dependencies\":{\"@gastownhall/deepseek-harness-ui\":\"file:plugin.tgz\"},\"dsh\":{\"profile\":{\"bundles\":[\"@deepseek-ai/dsh-base\",\"@deepseek-ai/dsh-web-app\",\"@gastownhall/deepseek-harness-ui\"]}}}' > \"$DSH_HOME/profiles/web/package.json\" ;;\n"
@@ -177,6 +193,8 @@ class InstallTests(unittest.TestCase):
         )
         self.assertIn("--profile web --dump-config", calls)
         self.assertIn("web --host 127.0.0.1 --port 0 --no-open", calls)
+        self.assertIn("not yet certified", result.stdout)
+        self.assertIn("browser compatibility is unverified", result.stdout)
         self.assertIn("gc <binding> web", result.stdout)
 
 

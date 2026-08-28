@@ -10,6 +10,7 @@ import {
   runOwnedCommand,
   spawnOwnedCommand,
 } from './owned-process.mjs'
+import { startLoopbackForward } from './loopback-forward.mjs'
 
 const pluginDir = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
 const packDir = resolve(pluginDir, '../..')
@@ -73,7 +74,7 @@ async function readVersions() {
   const value = name => new RegExp(`^${name}=(.+)$`, 'm').exec(text)?.[1]
   const versions = {
     artifactSha: value('PLUGIN_SHA256'),
-    dshVersion: value('DSH_VERSION'),
+    dshVersion: value('DSH_BUILD_VERSION'),
     packageName: value('PLUGIN_PACKAGE'),
   }
   if (Object.values(versions).some(item => item === undefined || item === '')) {
@@ -90,12 +91,12 @@ async function failWithCleanup(resources, error) {
   }
 }
 
-async function startInstalledStack({ gcHome, progress, resources, root, fixture }) {
+async function startInstalledStack({ gcHome, progress, resources, root, fixture, sshLaunch = false }) {
   const versions = await readVersions()
   const dshHome = join(root, 'dsh-home')
   const profileManifest = join(dshHome, 'profiles/web/package.json')
   let step = 0
-  const total = 8
+  const total = sshLaunch ? 9 : 8
   const tick = message => progress(`[${++step}/${total}] ${message}`)
 
   await writeFile(join(root, 'pnpm'), `#!/bin/sh\nexec "${join(pluginDir, 'node_modules/.bin/pnpm')}" "$@"\n`)
@@ -164,10 +165,19 @@ async function startInstalledStack({ gcHome, progress, resources, root, fixture 
     throw new Error(`stock DSH version output did not contain exact ${versions.dshVersion}`)
   }
 
-  tick('starting exact stock dsh web on loopback')
-  const dsh = spawnOwnedCommand('dsh', ['web', '--host', '127.0.0.1', '--port', '0', '--no-open'], {
+  tick(sshLaunch
+    ? 'starting exact stock dsh web under an SSH launch environment'
+    : 'starting exact stock dsh web on loopback')
+  const dsh = spawnOwnedCommand('dsh', [
+    'web', '--host', '127.0.0.1', '--port', '0',
+    ...(sshLaunch ? [] : ['--no-open']),
+  ], {
     cwd: root,
-    env,
+    env: sshLaunch ? {
+      ...env,
+      SSH_CONNECTION: '192.0.2.10 54000 192.0.2.20 22',
+      SSH_TTY: '/dev/pts/dsh-pack-test',
+    } : env,
   })
   resources.defer('stock DSH process', async () => {
     progress('[cleanup] stopping the runner-owned stock DSH process group')
@@ -199,7 +209,21 @@ async function startInstalledStack({ gcHome, progress, resources, root, fixture 
     )
   })
   tick(`stock dsh ready at ${url}`)
-  const connections = await fetch(`${url}/api/gas-city/v1/connections`, { signal: AbortSignal.timeout(10_000) })
+  let browserUrl = url
+  if (sshLaunch) {
+    const target = new URL(url)
+    const forward = await startLoopbackForward({
+      targetHost: target.hostname,
+      targetPort: Number(target.port),
+    })
+    resources.defer('SSH-style loopback port forward', async () => {
+      progress('[cleanup] stopping the runner-owned SSH-style loopback port forward')
+      await forward.close()
+    })
+    browserUrl = forward.url
+    tick(`SSH client exposed stock dsh at ${browserUrl}`)
+  }
+  const connections = await fetch(`${browserUrl}/api/gas-city/v1/connections`, { signal: AbortSignal.timeout(10_000) })
   if (!connections.ok) throw new Error(`pack gateway readiness returned ${connections.status}`)
   const inventory = await connections.json()
   if (!Array.isArray(inventory.connections)) throw new Error('pack gateway returned an invalid connection inventory')
@@ -207,7 +231,9 @@ async function startInstalledStack({ gcHome, progress, resources, root, fixture 
   tick('installed stock stack is ready for browser verification')
 
   return {
-    url,
+    url: browserUrl,
+    dshUrl: url,
+    dshOutput: () => dsh.output,
     env,
     fixture,
     inventory,
@@ -220,7 +246,7 @@ async function startInstalledStack({ gcHome, progress, resources, root, fixture 
   }
 }
 
-export async function startOwnedStack(progress = () => {}) {
+async function startOwnedFixtureStack(progress, sshLaunch) {
   const resources = new CleanupStack()
   try {
     const root = await mkdtemp(join(tmpdir(), 'deepseek-harness-ui-e2e-'))
@@ -232,10 +258,18 @@ export async function startOwnedStack(progress = () => {}) {
     await mkdir(gcHome, { recursive: true })
     await writeFile(join(gcHome, 'supervisor.toml'), `[supervisor]\nbind = "127.0.0.1"\nport = ${fixture.port}\n`)
     await writeFile(join(gcHome, 'contexts.toml'), '', { mode: 0o600 })
-    return await startInstalledStack({ gcHome, progress, resources, root, fixture })
+    return await startInstalledStack({ gcHome, progress, resources, root, fixture, sshLaunch })
   } catch (error) {
     return await failWithCleanup(resources, error)
   }
+}
+
+export async function startOwnedStack(progress = () => {}) {
+  return await startOwnedFixtureStack(progress, false)
+}
+
+export async function startOwnedSshStack(progress = () => {}) {
+  return await startOwnedFixtureStack(progress, true)
 }
 
 export async function startOwnedLiveStack({ gcHome, progress = () => {} }) {

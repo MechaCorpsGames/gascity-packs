@@ -2,7 +2,11 @@ import { defineConfig } from '@playwright/test'
 
 export default defineConfig({
   testDir: './tests/e2e',
-  testMatch: ['stock-dsh.contract.spec.mjs', 'stock-dsh.uncertainty.spec.mjs'],
+  testMatch: [
+    'stock-dsh.contract.spec.mjs',
+    'stock-dsh.uncertainty.spec.mjs',
+    'stock-dsh.ssh.spec.mjs',
+  ],
   timeout: 120_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,

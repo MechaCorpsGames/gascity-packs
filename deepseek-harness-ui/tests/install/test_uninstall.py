@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -37,11 +38,15 @@ class UninstallTests(unittest.TestCase):
 
             (pack_dir / "assets" / "versions.env").write_text(
                 "PLUGIN_PACKAGE=@gastownhall/deepseek-harness-ui\n"
-                "DSH_VERSION=0.1.1-rc.2\n"
+                "DSH_BUILD_VERSION=0.1.1-rc.2\n"
                 "PNPM_VERSION=11.7.0\n"
                 "NODE_22_MIN=22.19.0\n"
                 "NODE_NEXT_MIN=24.0.0\n",
                 encoding="utf-8",
+            )
+            shutil.copy2(
+                PACK_DIR / "assets" / "dsh-compatibility.json",
+                pack_dir / "assets" / "dsh-compatibility.json",
             )
             for name in ("node", "dsh", "pnpm"):
                 shutil.copy2(
@@ -49,7 +54,14 @@ class UninstallTests(unittest.TestCase):
                     pack_dir / "doctor" / f"check-{name}.sh",
                 )
 
-            write_executable(bin_dir, "node", "printf 'v24.0.0\\n'")
+            real_node = shutil.which("node")
+            self.assertIsNotNone(real_node)
+            write_executable(
+                bin_dir,
+                "node",
+                "if [ \"${1:-}\" = --version ]; then printf 'v24.0.0\\n'; exit 0; fi\n"
+                f"exec {shlex.quote(real_node)} \"$@\"",
+            )
             write_executable(bin_dir, "pnpm", "printf '11.7.0\\n'")
             write_executable(
                 bin_dir,

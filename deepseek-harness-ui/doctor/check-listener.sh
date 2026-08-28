@@ -8,32 +8,51 @@ const { spawn } = require('node:child_process')
 const child = spawn(
   'dsh',
   ['web', '--host', '127.0.0.1', '--port', '0', '--no-open'],
-  { stdio: ['ignore', 'pipe', 'pipe'] },
+  {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
+  },
 )
 
 let output = ''
 let settled = false
+let completed = false
 let probing = false
+let finalResult
+let force
+let reapDeadline
 const deadline = setTimeout(
   () => finish(false, 'DSH loopback boot timed out before the pack route became ready'),
   15000,
 )
 
+function signalOwned(signal) {
+  try {
+    process.kill(process.platform === 'win32' ? child.pid : -child.pid, signal)
+    return true
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false
+    return child.kill(signal)
+  }
+}
+
+function complete() {
+  if (completed || finalResult === undefined) return
+  completed = true
+  clearTimeout(force)
+  clearTimeout(reapDeadline)
+  console.log(finalResult.message)
+  process.exit(finalResult.ok ? 0 : 2)
+}
+
 function finish(ok, message) {
   if (settled) return
   settled = true
+  finalResult = { ok, message }
   clearTimeout(deadline)
-  const force = setTimeout(() => child.kill('SIGKILL'), 6000)
-  child.once('close', () => {
-    clearTimeout(force)
-    console.log(message)
-    process.exit(ok ? 0 : 2)
-  })
-  if (!child.kill('SIGTERM')) {
-    clearTimeout(force)
-    console.log(message)
-    process.exit(ok ? 0 : 2)
-  }
+  signalOwned('SIGTERM')
+  force = setTimeout(() => signalOwned('SIGKILL'), 2500)
+  reapDeadline = setTimeout(complete, 4000)
 }
 
 function inspect(chunk) {
@@ -87,5 +106,6 @@ child.on('close', (code) => {
   if (!settled) {
     finish(false, `dsh web exited before the pack route probe (status ${code})`)
   }
+  complete()
 })
 NODE

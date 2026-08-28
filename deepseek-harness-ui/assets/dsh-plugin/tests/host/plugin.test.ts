@@ -562,6 +562,366 @@ grant_command = "mint-write-grant"
     })
   })
 
+  it('refreshes an authority bearer after an SSE admission 401 before relaying the stream', async () => {
+    const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
+    tempDirs.push(gcHome)
+    await writeFile(join(gcHome, 'contexts.toml'), `
+[[context]]
+name = "remote"
+url = "https://example.test"
+city = "alpha"
+credential_command = "mint-bearer"
+`, { mode: 0o600 })
+    const streamRequests: Array<{ authorization: string | null; lastEventId: string | null; url: string }> = []
+    let admissionBodyCancelled = false
+    const fetchSupervisor = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/health')) return new Response('{}')
+      if (url.endsWith('/v0/cities')) return new Response('{"items":[{"name":"alpha","running":true}]}')
+      if (url.endsWith('/stream?format=structured&include_thinking=false&after_cursor=cursor-7')) {
+        const headers = new Headers(init?.headers)
+        const authorization = headers.get('authorization')
+        streamRequests.push({ authorization, lastEventId: headers.get('last-event-id'), url })
+        if (authorization === 'Bearer stale') {
+          return new Response(new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"status":401}'))
+            },
+            cancel() {
+              admissionBodyCancelled = true
+            },
+          }), { status: 401 })
+        }
+        return new Response('event: heartbeat\ndata: {}\n\n', {
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }
+      throw new Error(`unexpected upstream URL ${url}`)
+    }) as typeof fetch
+    const credential = vi.fn()
+      .mockResolvedValueOnce({ token: 'stale', expirationTimestamp: '2099-01-01T00:00:00Z' })
+      .mockResolvedValueOnce({ token: 'fresh', expirationTimestamp: '2099-01-01T00:00:00Z' })
+    const helpers = { credential, grant: vi.fn(), provider: vi.fn() }
+    const { baseUrl } = await mount(undefined, { gcHome, fetch: fetchSupervisor, helpers } as never)
+    const inventory = await fetch(`${baseUrl}/api/gas-city/v1/connections`).then(
+      response => response.json() as Promise<{ connections: Array<{ id: string; label: string }> }>,
+    )
+    const connection = inventory.connections.find(item => item.label === 'remote')
+
+    const response = await fetch(
+      `${baseUrl}/api/gas-city/v1/connections/${connection?.id}/city/alpha/session/session-1/stream?format=structured&include_thinking=false&after_cursor=cursor-7`,
+      { headers: { 'Last-Event-ID': 'frame-6' } },
+    )
+
+    expect(response.status).toBe(200)
+    await expect(response.text()).resolves.toBe('event: heartbeat\ndata: {}\n\n')
+    expect(streamRequests).toEqual([
+      {
+        authorization: 'Bearer stale',
+        lastEventId: 'frame-6',
+        url: 'https://example.test/v0/city/alpha/session/session-1/stream?format=structured&include_thinking=false&after_cursor=cursor-7',
+      },
+      {
+        authorization: 'Bearer fresh',
+        lastEventId: 'frame-6',
+        url: 'https://example.test/v0/city/alpha/session/session-1/stream?format=structured&include_thinking=false&after_cursor=cursor-7',
+      },
+    ])
+    expect(admissionBodyCancelled).toBe(true)
+    expect(credential).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not replay a non-idempotent mutation after a bearer 401', async () => {
+    const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
+    tempDirs.push(gcHome)
+    await writeFile(join(gcHome, 'contexts.toml'), `
+[[context]]
+name = "remote"
+url = "https://example.test"
+city = "alpha"
+credential_command = "mint-bearer"
+grant_command = "mint-write-grant"
+`, { mode: 0o600 })
+    let mutationCalls = 0
+    const fetchSupervisor = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/health')) return new Response('{}')
+      if (url.endsWith('/v0/cities')) return new Response('{"items":[{"name":"alpha","running":true}]}')
+      if (url.endsWith('/submit')) {
+        mutationCalls += 1
+        return new Response('{"status":401}', {
+          status: 401,
+          headers: { 'Content-Type': 'application/problem+json' },
+        })
+      }
+      throw new Error(`unexpected upstream URL ${url}`)
+    }) as typeof fetch
+    const credential = vi.fn(async () => ({
+      token: 'opaque-bearer',
+      expirationTimestamp: '2099-01-01T00:00:00Z',
+    }))
+    const writeGrant = `${Buffer.from('{}').toString('base64url')}.${Buffer.alloc(64).toString('base64url')}`
+    const grant = vi.fn(async () => writeGrant)
+    const { baseUrl } = await mount(undefined, {
+      gcHome,
+      fetch: fetchSupervisor,
+      helpers: { credential, grant, provider: vi.fn() },
+    } as never)
+    const inventory = await fetch(`${baseUrl}/api/gas-city/v1/connections`).then(
+      response => response.json() as Promise<{ connections: Array<{ id: string; label: string }> }>,
+    )
+    const connection = inventory.connections.find(item => item.label === 'remote')
+
+    const response = await fetch(
+      `${baseUrl}/api/gas-city/v1/connections/${connection?.id}/city/alpha/session/session-1/submit`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'Continue' }),
+      },
+    )
+
+    expect(response.status).toBe(401)
+    expect(mutationCalls).toBe(1)
+    expect(grant).toHaveBeenCalledTimes(1)
+    expect(credential).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves a direct read-grant challenge without forcing bearer refresh', async () => {
+    const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
+    tempDirs.push(gcHome)
+    await writeFile(join(gcHome, 'contexts.toml'), `
+[[context]]
+name = "remote"
+url = "https://example.test"
+city = "alpha"
+credential_command = "mint-bearer"
+`, { mode: 0o600 })
+    let rigsCalls = 0
+    const problem = {
+      status: 401,
+      title: 'Unauthorized',
+      detail: 'missing X-GC-City-Read grant',
+    }
+    const fetchSupervisor = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/health')) return new Response('{}')
+      if (url.endsWith('/v0/cities')) return new Response('{"items":[{"name":"alpha","running":true}]}')
+      if (url.endsWith('/rigs')) {
+        rigsCalls += 1
+        return Response.json(problem, {
+          status: 401,
+          headers: { 'Content-Type': 'application/problem+json' },
+        })
+      }
+      throw new Error(`unexpected upstream URL ${url}`)
+    }) as typeof fetch
+    const credential = vi.fn()
+      .mockResolvedValueOnce({ token: 'opaque-bearer', expirationTimestamp: '2099-01-01T00:00:00Z' })
+      .mockRejectedValue(new Error('forced refresh must not run'))
+    const { baseUrl } = await mount(undefined, {
+      gcHome,
+      fetch: fetchSupervisor,
+      helpers: { credential, grant: vi.fn(), provider: vi.fn() },
+    } as never)
+    const inventory = await fetch(`${baseUrl}/api/gas-city/v1/connections`).then(
+      response => response.json() as Promise<{ connections: Array<{ id: string; label: string }> }>,
+    )
+    const connection = inventory.connections.find(item => item.label === 'remote')
+
+    const response = await fetch(
+      `${baseUrl}/api/gas-city/v1/connections/${connection?.id}/city/alpha/rigs`,
+    )
+
+    expect(response.status).toBe(401)
+    await expect(response.json()).resolves.toEqual(problem)
+    expect(rigsCalls).toBe(1)
+    expect(credential).toHaveBeenCalledTimes(1)
+  })
+
+  it('bounds direct read-grant inspection across an endless zero-length slow-drip body', async () => {
+    const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
+    tempDirs.push(gcHome)
+    await writeFile(join(gcHome, 'contexts.toml'), `
+[[context]]
+name = "remote"
+url = "https://example.test"
+city = "alpha"
+credential_command = "mint-bearer"
+`, { mode: 0o600 })
+    let rigsCalls = 0
+    const fetchSupervisor = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/health')) return new Response('{}')
+      if (url.endsWith('/v0/cities')) return new Response('{"items":[{"name":"alpha","running":true}]}')
+      if (url.endsWith('/rigs')) {
+        rigsCalls += 1
+        if (rigsCalls === 1) {
+          let timer: ReturnType<typeof setInterval> | undefined
+          return new Response(new ReadableStream({
+            start(controller) {
+              timer = setInterval(() => controller.enqueue(new Uint8Array()), 5)
+            },
+            cancel() {
+              if (timer !== undefined) clearInterval(timer)
+            },
+          }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/problem+json' },
+          })
+        }
+        return Response.json({ items: [] })
+      }
+      throw new Error(`unexpected upstream URL ${url}`)
+    }) as typeof fetch
+    const credential = vi.fn()
+      .mockResolvedValueOnce({ token: 'stale', expirationTimestamp: '2099-01-01T00:00:00Z' })
+      .mockResolvedValueOnce({ token: 'fresh', expirationTimestamp: '2099-01-01T00:00:00Z' })
+    const { baseUrl } = await mount(undefined, {
+      gcHome,
+      fetch: fetchSupervisor,
+      helpers: { credential, grant: vi.fn(), provider: vi.fn() },
+    } as never)
+    const inventory = await fetch(`${baseUrl}/api/gas-city/v1/connections`).then(
+      response => response.json() as Promise<{ connections: Array<{ id: string; label: string }> }>,
+    )
+    const connection = inventory.connections.find(item => item.label === 'remote')
+    const startedAt = Date.now()
+
+    const response = await fetch(
+      `${baseUrl}/api/gas-city/v1/connections/${connection?.id}/city/alpha/rigs`,
+    )
+
+    expect(response.status).toBe(200)
+    expect(Date.now() - startedAt).toBeLessThan(1_500)
+    expect(rigsCalls).toBe(2)
+    expect(credential).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries a safe SSE admission only once when the refreshed bearer is also rejected', async () => {
+    const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
+    tempDirs.push(gcHome)
+    await writeFile(join(gcHome, 'contexts.toml'), `
+[[context]]
+name = "remote"
+url = "https://example.test"
+city = "alpha"
+credential_command = "mint-bearer"
+`, { mode: 0o600 })
+    let streamCalls = 0
+    const fetchSupervisor = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.endsWith('/health')) return new Response('{}')
+      if (url.endsWith('/v0/cities')) return new Response('{"items":[{"name":"alpha","running":true}]}')
+      if (url.includes('/stream')) {
+        streamCalls += 1
+        return new Response('{"status":401}', { status: 401 })
+      }
+      throw new Error(`unexpected upstream URL ${url}`)
+    }) as typeof fetch
+    const credential = vi.fn()
+      .mockResolvedValueOnce({ token: 'stale', expirationTimestamp: '2099-01-01T00:00:00Z' })
+      .mockResolvedValueOnce({ token: 'fresh', expirationTimestamp: '2099-01-01T00:00:00Z' })
+    const { baseUrl } = await mount(undefined, {
+      gcHome,
+      fetch: fetchSupervisor,
+      helpers: { credential, grant: vi.fn(), provider: vi.fn() },
+    } as never)
+    const inventory = await fetch(`${baseUrl}/api/gas-city/v1/connections`).then(
+      response => response.json() as Promise<{ connections: Array<{ id: string; label: string }> }>,
+    )
+    const connection = inventory.connections.find(item => item.label === 'remote')
+
+    const response = await fetch(
+      `${baseUrl}/api/gas-city/v1/connections/${connection?.id}/city/alpha/session/session-1/stream?format=structured`,
+    )
+
+    expect(response.status).toBe(401)
+    expect(streamCalls).toBe(2)
+    expect(credential).toHaveBeenCalledTimes(2)
+  })
+
+  it('coalesces concurrent provider refreshes and retries each safe request at most once', async () => {
+    const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
+    tempDirs.push(gcHome)
+    await writeFile(join(gcHome, 'contexts.toml'), `
+[[context]]
+name = "remote"
+url = "https://example.test"
+city = "alpha"
+credential_audience = "gc.example.test"
+credential_required_scopes = ["city:read"]
+`, { mode: 0o600 })
+    const upstreamAuthorizations: Array<{ path: string; authorization: string | null }> = []
+    const fetchSupervisor = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/health')) return new Response('{}')
+      if (url.endsWith('/v0/cities')) return new Response('{"items":[{"name":"alpha","running":true}]}')
+      const authorization = new Headers(init?.headers).get('authorization')
+      upstreamAuthorizations.push({ path: new URL(url).pathname, authorization })
+      if (authorization === 'Bearer stale') return new Response('', { status: 401 })
+      return new Response('event: heartbeat\ndata: {}\n\n', {
+        headers: { 'Content-Type': 'text/event-stream' },
+      })
+    }) as typeof fetch
+    let resolveRefresh: ((value: {
+      accessToken: string
+      authorizationScheme: 'Bearer'
+      expiresAt: string
+      audience: string
+      scopes: string[]
+    }) => void) | undefined
+    const refresh = new Promise<{
+      accessToken: string
+      authorizationScheme: 'Bearer'
+      expiresAt: string
+      audience: string
+      scopes: string[]
+    }>(resolve => { resolveRefresh = resolve })
+    const provider = vi.fn()
+      .mockResolvedValueOnce({
+        accessToken: 'stale',
+        authorizationScheme: 'Bearer',
+        expiresAt: '2099-01-01T00:00:00Z',
+        audience: 'gc.example.test',
+        scopes: ['city:read'],
+      })
+      .mockImplementationOnce(async () => refresh)
+    const { baseUrl } = await mount(undefined, {
+      gcHome,
+      fetch: fetchSupervisor,
+      helpers: { credential: vi.fn(), grant: vi.fn(), provider },
+    } as never)
+    const inventory = await fetch(`${baseUrl}/api/gas-city/v1/connections`).then(
+      response => response.json() as Promise<{ connections: Array<{ id: string; label: string }> }>,
+    )
+    const connection = inventory.connections.find(item => item.label === 'remote')
+
+    const requests = Promise.all([
+      fetch(`${baseUrl}/api/gas-city/v1/connections/${connection?.id}/city/alpha/session/session-1/stream?format=structured`),
+      fetch(`${baseUrl}/api/gas-city/v1/connections/${connection?.id}/city/alpha/session/session-2/stream?format=structured`),
+    ])
+    await vi.waitFor(() => expect(provider).toHaveBeenCalledTimes(2))
+    resolveRefresh?.({
+      accessToken: 'fresh',
+      authorizationScheme: 'Bearer',
+      expiresAt: '2099-01-01T00:00:00Z',
+      audience: 'gc.example.test',
+      scopes: ['city:read'],
+    })
+    const responses = await requests
+
+    expect(responses.map(response => response.status)).toEqual([200, 200])
+    expect(provider).toHaveBeenCalledTimes(2)
+    expect(provider.mock.calls.map(([request]) => request.force_refresh)).toEqual([false, true])
+    expect(upstreamAuthorizations).toEqual([
+      { path: '/v0/city/alpha/session/session-1/stream', authorization: 'Bearer stale' },
+      { path: '/v0/city/alpha/session/session-2/stream', authorization: 'Bearer stale' },
+      { path: '/v0/city/alpha/session/session-1/stream', authorization: 'Bearer fresh' },
+      { path: '/v0/city/alpha/session/session-2/stream', authorization: 'Bearer fresh' },
+    ])
+  })
+
   it('refuses Supervisor redirects before credentials can cross an endpoint boundary', async () => {
     const gcHome = await mkdtemp(join(tmpdir(), 'dsh-gc-home-'))
     tempDirs.push(gcHome)

@@ -14,7 +14,7 @@ elif [ "$#" -ne 0 ]; then
 fi
 
 echo "pack version: $PACK_VERSION"
-for check in node dsh pnpm artifact profile; do
+for check in node dsh artifact profile; do
   "$pack_dir/doctor/check-$check.sh"
 done
 if [ "$live" = true ]; then

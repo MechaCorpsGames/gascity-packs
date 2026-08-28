@@ -1,5 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { execFile } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
@@ -21,11 +23,51 @@ import {
   isBrowserHttpConsoleNoise,
   isExpectedClosedSessionNotFound,
 } from './support/browser-diagnostics.mjs'
+import { startLoopbackForward } from './support/loopback-forward.mjs'
 
 const execFileAsync = promisify(execFile)
 const supportDir = resolve(dirname(fileURLToPath(import.meta.url)), 'support')
+const pluginDir = resolve(supportDir, '../../..')
+const packDir = resolve(pluginDir, '../..')
 
 describe('owned E2E infrastructure', () => {
+  it('certifies exactly the DSH runtime exercised by every stock-browser release gate', async () => {
+    const compatibility = JSON.parse(await readFile(resolve(packDir, 'assets/dsh-compatibility.json'), 'utf8'))
+    const versions = await readFile(resolve(packDir, 'assets/versions.env'), 'utf8')
+    const buildVersion = /^DSH_BUILD_VERSION=(.+)$/m.exec(versions)?.[1]
+    const packageManifest = JSON.parse(await readFile(resolve(pluginDir, 'package.json'), 'utf8'))
+
+    expect(compatibility.certified.map(release => release.version)).toEqual([buildVersion])
+    expect(packageManifest.devDependencies['@deepseek-ai/dsh']).toBe(buildVersion)
+  })
+
+  it('forwards a distinct browser-local port to a loopback DSH listener without rewriting Host', async () => {
+    const target = createServer((request, response) => {
+      response.setHeader('Content-Type', 'application/json')
+      response.end(JSON.stringify({ host: request.headers.host }))
+    })
+    await new Promise((resolveListen, reject) => {
+      target.once('error', reject)
+      target.listen(0, '127.0.0.1', resolveListen)
+    })
+    const targetAddress = target.address()
+    assert(targetAddress !== null && typeof targetAddress === 'object')
+    const forward = await startLoopbackForward({
+      targetHost: '127.0.0.1',
+      targetPort: targetAddress.port,
+    })
+    try {
+      expect(new URL(forward.url).port).not.toBe(String(targetAddress.port))
+      const response = await fetch(forward.url)
+      await expect(response.json()).resolves.toEqual({
+        host: `127.0.0.1:${new URL(forward.url).port}`,
+      })
+    } finally {
+      await forward.close()
+      await new Promise((resolveClose, reject) => target.close(error => error === undefined ? resolveClose() : reject(error)))
+    }
+  })
+
   it('does not keep the caller alive for a completed command timeout', async () => {
     const script = [
       `import { runOwnedCommand } from ${JSON.stringify(resolve(supportDir, 'owned-process.mjs'))}`,

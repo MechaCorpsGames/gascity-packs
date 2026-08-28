@@ -1,6 +1,6 @@
 # DeepSeek Harness UI for Gas City
 
-> Status: production-ready release candidate for the documented v1 boundary, with a pinned, prebuilt DSH plugin artifact and a passing isolated two-provider live certificate.
+> Status: release candidate for the documented v1 boundary. Deterministic, stock-browser, SSH, and soak gates pass; a fresh two-provider certificate for the final artifact remains required before production release because bounded reruns encountered external provider startup stalls.
 
 `deepseek-harness-ui` adds a Gas City workspace to the stock DeepSeek Harness (`dsh web`) interface. From that workspace, a user can discover cities, rigs, configured agents, and sessions; start or attach to a session; stream its structured transcript; answer pending interactions; submit prompts; and control its lifecycle.
 
@@ -66,29 +66,47 @@ V1 deliberately does not include:
 - transcript mirroring or conversion to provider-specific JSONL;
 - raw provider session creation—the create surface is limited to configured GC agents;
 - attachment upload or local-file proxying (safe transcript metadata is displayed);
-- support for a direct read-grant-hardened Supervisor, because the current GC context contract has no read-grant client source;
+- direct read-grant minting without an authority/minter integration, because the current GC context contract has no read-grant client source;
 - a connection editor, city/rig/agent administration, or replacement of DSH's own screens.
 
-The default supported deployment is a loopback-bound `dsh web`. Stock DSH currently provides neither TLS nor authentication for its web server, so exposing this gateway on `0.0.0.0` is outside the supported v1 trust boundary.
+Both local and SSH-forwarded remote use are supported with a loopback-bound `dsh web`. Stock DSH currently provides neither TLS nor authentication for its web server, so exposing this gateway on `0.0.0.0` is outside the supported v1 trust boundary.
+
+An authority-fronted Supervisor is supported through the transport bearer configuration already present in GC contexts. The authority authenticates the DSH host and supplies request-bound read grants upstream. A DSH credential or static token alone cannot create Gas City's single-use `X-GC-City-Read` grants; a direct hardened Supervisor therefore needs a concrete host-only minter/helper contract before the pack can support it.
+
+## Remote use over SSH
+
+SSH-forwarded remote use is supported without publishing DSH or the Supervisor on a network interface. Forward a local port to the remote DSH loopback listener:
+
+```sh
+ssh -L 43080:127.0.0.1:3080 user@remote-host
+```
+
+Then, on the remote host, launch the pack normally:
+
+```sh
+gc <binding> web --port 3080
+```
+
+DSH detects the SSH environment, prints the remote loopback URL, and leaves browser handoff to the SSH client or editor, as documented by the [stock DSH Web bundle](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/web-app/README.md). Open `http://127.0.0.1:43080` in the local browser. VS Code Remote SSH's [**Forward a Port**](https://code.visualstudio.com/docs/remote/ssh#_forwarding-a-port-creating-ssh-tunnel) action is equivalent and may choose a different available local port. The complete browser/host/Supervisor flow stays on one forwarded DSH origin, so Supervisor credentials never enter the browser bundle.
 
 ## Delivery
 
 The schema-v2 pack ships a prebuilt, checksum-pinned DSH plugin artifact plus explicit install, uninstall, web, status, and doctor commands. It reuses `slack-full`'s pack delivery conventions, not its connector architecture. There is no `[[service]]` block: the DSH host process itself supplies the pack-owned gateway.
 
-The audited runtime pins are in [`assets/versions.env`](assets/versions.env). Installation fails when the local Node/DSH/pnpm versions, artifact checksum, profile composition, or loopback pack route do not match. `status --check` separately validates GC contexts, reports unavailable pack connections, and probes the explicitly selected direct Supervisor target (or the loopback default) against the minimized route/schema contract in [`assets/supervisor-contract.json`](assets/supervisor-contract.json), including the expanded `/config` inventory required for cold pools.
+The exact artifact build toolchain is pinned in [`assets/versions.env`](assets/versions.env), while runtime DSH support is maintained independently in [`assets/dsh-compatibility.json`](assets/dsh-compatibility.json). Each pack release certifies the exact DSH runtime exercised by its local and SSH-forwarded stock-browser gates. A newer untested DSH release may still install and run with an explicit provisional warning; profile composition and the host route are checked, but its browser loader and UI-slot compatibility remain unverified until a pack release certifies that DSH version. An older-than-minimum or known-incompatible release fails with a specific diagnostic. Installation still fails when Node or usable plugin-management tooling is missing, the artifact checksum is wrong, profile composition fails, or the loopback pack route does not load. Read-only `status` does not require pnpm. `status --check` separately validates GC contexts, reports unavailable pack connections, and probes the explicitly selected direct Supervisor target (or the loopback default) against the minimized route/schema contract in [`assets/supervisor-contract.json`](assets/supervisor-contract.json), including the expanded `/config` inventory required for cold pools.
 
 ## Verification
 
 The implementation was developed through red-green TDD and currently passes:
 
-- 138 plugin unit, contract, host-boundary, feed-recovery, E2E-infrastructure, and React workspace tests;
-- 28 black-box pack/install/uninstall tests;
+- 146 plugin unit, contract, host-boundary, feed-recovery, E2E-infrastructure, and React workspace tests;
+- 40 black-box pack/install/uninstall tests;
 - TypeScript no-emit checking and production host/client builds;
 - ShellCheck, `gc lint`, and the checksum doctor;
-- checked-in stock `dsh web` browser contracts in headless Chrome, including real pack install/uninstall, a random-port Supervisor fixture, topology pagination, cold-pool create-on-first-send, structured SSE EOF/resume/reset recovery, reasoning rebootstrap, all interaction shapes and submission intents, rename, permission mode, lifecycle control, ambiguous-mutation recovery, and reconnect soak;
+- checked-in stock `dsh web` browser contracts in headless Chrome, including real pack install/uninstall, local and SSH-forwarded origins on different ports, a random-port Supervisor fixture, topology pagination, cold-pool create-on-first-send, structured SSE EOF/resume/reset recovery, reasoning rebootstrap, all interaction shapes and submission intents, rename, permission mode, lifecycle control, ambiguous-mutation recovery, and reconnect soak;
 - a deterministic rebuild that byte-compares the produced `.tgz` with the checksum-pinned artifact.
 
-Live multi-provider certification is deliberately separate from the deterministic fixture gate. `pnpm test:e2e:live:isolated` creates a disposable city with normal `gc init` and allows that command to start its isolated Supervisor; it then requires `/health` and that exact city to report `running: true` before stock DSH is launched. The gate fails as **UNPROVEN** unless two configured agents backed by distinct real provider identities complete authoritative nonce and tool-use evidence through the browser. On the audited baseline, the certificate passed with real Claude and Codex sessions, `session.structured.v1` transcripts, newly completed tool call/results rendered in stock DSH, permanent session deletion, and zero remaining owned resources.
+Live multi-provider certification is deliberately separate from the deterministic fixture gate. `pnpm test:e2e:live:isolated` creates a disposable city with normal `gc init` and allows that command to start its isolated Supervisor; it then requires `/health` and that exact city to report `running: true` before stock DSH is launched. The gate fails as **UNPROVEN** unless two configured agents backed by distinct real provider identities complete authoritative nonce and tool-use evidence through the browser. An earlier audited artifact passed this certificate with real Claude and Codex sessions, `session.structured.v1` transcripts, newly completed tool call/results, and permanent session deletion. After the final auth hardening, bounded recertification attempts stalled alternately in the external Claude and Codex CLIs after the DSH UI had created the corresponding GC session; those attempts are correctly recorded as **UNPROVEN**, not pack passes. The final fixture now uninstalls the isolated Supervisor before force-stopping the city, uses an exact run-owned tmux fallback, and verifies that no fixture process or cache root remains on pass, failure, or interruption.
 
 The isolated release fixture currently sets `GC_BEADS=file`. This is a narrowly documented test-environment exception: the audited machine's default managed-Dolt initialization is blocked by its installed `bd`/Dolt compatibility. It does not bypass city creation or startup, and it is not evidence that the default storage path works on this machine.
 
@@ -105,4 +123,4 @@ This specification was audited against:
 - DeepSeek Harness `dsh-v0.1.1-rc.2`, commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`;
 - `gascity-packs` commit `aab8030d397c211be6a4d460e9ce8de39e867a09` for schema-v2 delivery conventions.
 
-These are research baselines, not a promise of broad semver compatibility. The pack requires exact DSH pinning and Supervisor capability probes.
+These are the artifact-build and first certified runtime baselines, not a claim that every future preview is automatically compatible. Newer DSH versions are usable provisionally instead of being artificially blocked, but only the runtime named in the compatibility manifest has the release's stock-browser evidence.

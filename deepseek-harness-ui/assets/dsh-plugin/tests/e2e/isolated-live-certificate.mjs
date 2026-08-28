@@ -59,6 +59,28 @@ async function waitForJson(url, predicate, timeoutMs, label) {
   throw new Error(`${label} did not become ready: ${lastError?.message ?? 'no response'}`)
 }
 
+async function pathExists(path) {
+  try {
+    await access(path)
+    return true
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+async function ownedTmuxServerExists(name) {
+  try {
+    await runOwnedCommand('tmux', ['-L', name, 'list-sessions'], {
+      label: `owned tmux server ${name} probe`,
+      timeoutMs: 5_000,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
 function includeSupervisorEnv(raw, name) {
   return [...new Set(`${raw ?? ''} ${name}`.split(/[\s,;]+/).filter(Boolean))].sort().join(',')
 }
@@ -165,6 +187,33 @@ try {
   }
   const supervisorUrl = `http://127.0.0.1:${port}`
   diagnosticContext = { cityDir, cityName, env, supervisorUrl }
+  // CleanupStack is LIFO: uninstall the Supervisor first so it cannot restart
+  // an always-on pool while the direct force-stop is reaping city sessions.
+  resources.defer('disposable city processes', async () => {
+    let stopError
+    if (await pathExists(cityDir)) {
+      try {
+        await runOwnedCommand(gcBin, ['stop', '--force', '--timeout', '30s', cityDir], {
+          cwd: root,
+          env,
+          label: 'disposable city force-stop',
+          timeoutMs: 60_000,
+        })
+      } catch (error) {
+        stopError = error
+      }
+    }
+    if (await ownedTmuxServerExists(cityName)) {
+      await runOwnedCommand('tmux', ['-L', cityName, 'kill-server'], {
+        label: `owned tmux server ${cityName} cleanup`,
+        timeoutMs: 10_000,
+      })
+    }
+    if (await ownedTmuxServerExists(cityName)) {
+      throw new Error(`owned tmux server remained after cleanup: ${cityName}`)
+    }
+    if (stopError !== undefined) throw stopError
+  })
   resources.defer('isolated Supervisor service', async () => {
     await runOwnedCommand(gcBin, ['supervisor', 'uninstall'], {
       cwd: root,
@@ -191,15 +240,6 @@ try {
     stdout: process.stdout,
     stderr: process.stderr,
   })
-  resources.defer('disposable city', async () => {
-    await runOwnedCommand(gcBin, ['stop', cityDir], {
-      cwd: root,
-      env,
-      label: 'disposable city stop',
-      timeoutMs: 120_000,
-    })
-  })
-
   process.stdout.write('[3/6] proving gc init started the Supervisor and city\n')
   await waitForJson(
     `${supervisorUrl}/health`,

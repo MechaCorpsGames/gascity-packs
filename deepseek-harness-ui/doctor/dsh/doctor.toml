@@ -1,2 +1,2 @@
-description = "dsh matches the exact audited release"
+description = "dsh meets the compatibility manifest and certification policy"
 run = "../check-dsh.sh"

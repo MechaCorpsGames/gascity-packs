@@ -10,11 +10,11 @@ function isLoopback(hostname) {
   return hostname.split('.').length === 4 && hostname.startsWith('127.')
 }
 
-function options() {
+function options(includeBearer = true) {
   return {
     headers: {
       accept: 'application/json',
-      ...(bearer === undefined ? {} : { authorization: `Bearer ${bearer}` }),
+      ...(bearer === undefined || !includeBearer ? {} : { authorization: `Bearer ${bearer}` }),
     },
     redirect: 'error',
     signal: AbortSignal.timeout(5000),
@@ -42,18 +42,28 @@ try {
     process.exit(1)
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(city)) throw new Error('invalid city')
-  const response = await fetch(`${base}/v0/city/${encodeURIComponent(city)}/rigs`, options())
+  const cityReadUrl = `${base}/v0/city/${encodeURIComponent(city)}/rigs`
+  const unauthenticated = bearer === undefined ? undefined : await fetch(cityReadUrl, options(false))
+  const unauthenticatedAuthRejected = unauthenticated?.status === 401 || unauthenticated?.status === 403
+  await unauthenticated?.body?.cancel()
+  const response = await fetch(cityReadUrl, options())
   const body = await response.text()
   if (response.status === 401) {
     let problem
     try { problem = JSON.parse(body) } catch {}
     if (problem?.detail === 'missing X-GC-City-Read grant') {
-      console.log('Supervisor direct read-grant hardening is unsupported in v1; GC contexts provide no read-grant client source')
+      console.log('Supervisor direct read-grant hardening requires an authority/minter integration; authority-fronted bearer mode remains supported')
       process.exit(2)
     }
   }
   if (!response.ok) throw new Error('city read probe failed')
-  console.log(`Supervisor city reads do not require an unsupported direct read grant (direct target ${base})`)
+  if (bearer === undefined) {
+    console.log(`Supervisor city reads succeed without a direct read-grant challenge (direct target ${base})`)
+  } else if (unauthenticatedAuthRejected) {
+    console.log(`Supervisor bearer-authenticated city read succeeded and front-door behavior observed (direct target ${base})`)
+  } else {
+    console.log(`Supervisor city read succeeded while presenting a bearer, but the target did not require it; authority fronting was not proven (direct target ${base})`)
+  }
 } catch {
   console.log('Supervisor direct read-grant diagnostic could not complete')
   process.exit(2)

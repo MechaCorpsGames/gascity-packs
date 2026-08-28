@@ -4,9 +4,11 @@ import os
 import http.server
 import json
 import pathlib
+import signal
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 
@@ -50,17 +52,64 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "node v22.19.0 is supported\n")
 
-    def test_dsh_doctor_requires_the_exact_audited_release(self) -> None:
+    def test_dsh_doctor_accepts_a_certified_release(self) -> None:
+        result = run_doctor("dsh", {"dsh": "printf '0.1.1-rc.2\\n'"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("certified", result.stdout)
+
+    def test_dsh_doctor_allows_a_newer_release_without_claiming_browser_certification(self) -> None:
+        result = run_doctor("dsh", {"dsh": "printf '0.1.2-rc.1\\n'"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not yet certified", result.stdout)
+        self.assertIn("browser compatibility is unverified", result.stdout)
+        self.assertNotIn("browser capability gates", result.stdout)
+
+    def test_dsh_doctor_rejects_a_release_older_than_the_extension_contract(self) -> None:
         result = run_doctor("dsh", {"dsh": "printf '0.1.1-rc.1\\n'"})
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("want 0.1.1-rc.2", result.stdout)
+        self.assertIn("older than minimum", result.stdout)
 
-    def test_pnpm_doctor_requires_the_tool_used_by_dsh_plugin_management(self) -> None:
-        result = run_doctor("pnpm", {"pnpm": "printf '11.7.0\\n'"})
+    def test_dsh_doctor_rejects_a_release_recorded_as_known_incompatible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            pack_dir = pathlib.Path(raw_dir)
+            (pack_dir / "assets").mkdir()
+            (pack_dir / "assets" / "dsh-compatibility.json").write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "minimum_version": "0.1.1-rc.2",
+                        "certified": [],
+                        "known_incompatible": [
+                            {"version": "0.1.2-rc.1", "reason": "client loader contract changed"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = run_doctor(
+                "dsh",
+                {"dsh": "printf 'dsh 0.1.2-rc.1\\n'"},
+                pack_dir=pack_dir,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("known incompatible", result.stdout)
+        self.assertIn("client loader contract changed", result.stdout)
+
+    def test_pnpm_doctor_accepts_a_different_runtime_tool_version(self) -> None:
+        result = run_doctor("pnpm", {"pnpm": "printf '12.1.0\\n'"})
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "pnpm 11.7.0 matches the audited toolchain\n")
+        self.assertEqual(result.stdout, "pnpm 12.1.0 is available for DSH plugin management\n")
+
+    def test_pnpm_doctor_rejects_an_invalid_version_response(self) -> None:
+        result = run_doctor("pnpm", {"pnpm": "printf 'not-a-version\\n'"})
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("did not report a semantic version", result.stdout)
 
     def test_artifact_doctor_rejects_a_tarball_that_does_not_match_its_pin(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -254,6 +303,57 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("Remote: credential helper failed", result.stdout)
 
+    def test_listener_doctor_kills_the_owned_process_group_with_a_bounded_reap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = pathlib.Path(raw_dir)
+            descendant_pid_path = root / "descendant.pid"
+            fake_dsh = (
+                "exec python3 - <<'PY'\n"
+                "import http.server, os, signal, socketserver, subprocess, sys\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])\n"
+                "open(os.environ['DSH_DESCENDANT_PID'], 'w').write(str(child.pid))\n"
+                "class Handler(http.server.BaseHTTPRequestHandler):\n"
+                "    def do_GET(self):\n"
+                "        self.send_response(200)\n"
+                "        self.send_header('Content-Type', 'application/json')\n"
+                "        self.end_headers()\n"
+                "        self.wfile.write(b'{\\\"connections\\\":[]}')\n"
+                "    def log_message(self, *_args):\n"
+                "        pass\n"
+                "with socketserver.TCPServer(('127.0.0.1', 0), Handler) as server:\n"
+                "    print(f'http://127.0.0.1:{server.server_address[1]}', flush=True)\n"
+                "    server.serve_forever()\n"
+                "PY"
+            )
+            descendant_pid = None
+            descendant_gone = False
+            try:
+                result = run_doctor(
+                    "listener",
+                    {"dsh": fake_dsh},
+                    extra_env={"DSH_DESCENDANT_PID": str(descendant_pid_path)},
+                )
+                descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+                for _ in range(20):
+                    try:
+                        os.kill(descendant_pid, 0)
+                    except ProcessLookupError:
+                        descendant_gone = True
+                        break
+                    time.sleep(0.05)
+            finally:
+                if descendant_pid is not None and not descendant_gone:
+                    try:
+                        os.kill(descendant_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("loopback boot and pack route probe succeeded", result.stdout)
+        self.assertTrue(descendant_gone, "listener doctor leaked its hostile descendant")
+
     def test_gc_contexts_doctor_uses_gc_validation_without_invoking_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             gc_home = pathlib.Path(raw_dir)
@@ -442,7 +542,124 @@ class DoctorTests(unittest.TestCase):
             server.server_close()
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("direct read-grant hardening is unsupported in v1", result.stdout)
+        self.assertIn("direct read-grant hardening requires an authority/minter integration", result.stdout)
+        self.assertIn("authority-fronted bearer mode remains supported", result.stdout)
+
+    def test_read_grant_doctor_observes_when_a_bearer_changes_rejection_to_success(self) -> None:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.headers.get("Authorization") != "Bearer edge-token":
+                    body = b'{"status":401,"title":"Unauthorized"}'
+                    self.send_response(401)
+                elif self.path == "/v0/cities":
+                    body = b'{"items":[{"name":"alpha","running":true}]}'
+                    self.send_response(200)
+                elif self.path == "/v0/city/alpha/rigs":
+                    body = b'{"items":[]}'
+                    self.send_response(200)
+                else:
+                    body = b"{}"
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = run_doctor(
+                "read-grant",
+                {},
+                extra_env={
+                    "GC_SUPERVISOR_URL": f"http://127.0.0.1:{server.server_port}",
+                    "GC_SUPERVISOR_BEARER": "edge-token",
+                    "GC_SUPERVISOR_CITY": "alpha",
+                },
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("bearer-authenticated city read succeeded", result.stdout)
+        self.assertIn("front-door behavior observed", result.stdout)
+
+    def test_read_grant_doctor_does_not_claim_authority_when_the_target_ignores_the_bearer(self) -> None:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = b'{"items":[]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = run_doctor(
+                "read-grant",
+                {},
+                extra_env={
+                    "GC_SUPERVISOR_URL": f"http://127.0.0.1:{server.server_port}",
+                    "GC_SUPERVISOR_BEARER": "ignored-token",
+                    "GC_SUPERVISOR_CITY": "alpha",
+                },
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("target did not require it", result.stdout)
+        self.assertIn("authority fronting was not proven", result.stdout)
+
+    def test_read_grant_doctor_does_not_attribute_a_transient_failure_to_bearer_auth(self) -> None:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.headers.get("Authorization") == "Bearer edge-token":
+                    body = b'{"items":[]}'
+                    self.send_response(200)
+                else:
+                    body = b'{"status":500,"title":"Unavailable"}'
+                    self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = run_doctor(
+                "read-grant",
+                {},
+                extra_env={
+                    "GC_SUPERVISOR_URL": f"http://127.0.0.1:{server.server_port}",
+                    "GC_SUPERVISOR_BEARER": "edge-token",
+                    "GC_SUPERVISOR_CITY": "alpha",
+                },
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("authority fronting was not proven", result.stdout)
+        self.assertNotIn("front-door behavior observed", result.stdout)
 
 
 if __name__ == "__main__":

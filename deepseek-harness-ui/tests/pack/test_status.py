@@ -44,13 +44,17 @@ class StatusTests(unittest.TestCase):
                 "PLUGIN_PACKAGE=@gastownhall/deepseek-harness-ui\n"
                 "PLUGIN_ARTIFACT=plugin.tgz\n"
                 f"PLUGIN_SHA256={digest}\n"
-                "DSH_VERSION=0.1.1-rc.2\n"
+                "DSH_BUILD_VERSION=0.1.1-rc.2\n"
                 "PNPM_VERSION=11.7.0\n"
                 "NODE_22_MIN=22.19.0\n"
                 "NODE_NEXT_MIN=24.0.0\n",
                 encoding="utf-8",
             )
-            for name in ("node", "dsh", "pnpm", "artifact", "profile"):
+            shutil.copy2(
+                PACK_DIR / "assets" / "dsh-compatibility.json",
+                pack_dir / "assets" / "dsh-compatibility.json",
+            )
+            for name in ("node", "dsh", "artifact", "profile"):
                 shutil.copy2(
                     PACK_DIR / "doctor" / f"check-{name}.sh",
                     pack_dir / "doctor" / f"check-{name}.sh",
@@ -91,7 +95,7 @@ class StatusTests(unittest.TestCase):
                 "if [ \"${1:-}\" = --version ]; then printf 'v24.0.0\\n'; exit 0; fi\n"
                 f"exec {shlex.quote(real_node)} \"$@\"",
             )
-            write_executable(bin_dir, "pnpm", "printf '11.7.0\\n'")
+            write_executable(bin_dir, "pnpm", "exit 97")
             write_executable(
                 bin_dir,
                 "dsh",
@@ -211,18 +215,22 @@ class StatusTests(unittest.TestCase):
                     "PLUGIN_PACKAGE=@gastownhall/deepseek-harness-ui\n"
                     "PLUGIN_ARTIFACT=plugin.tgz\n"
                     f"PLUGIN_SHA256={digest}\n"
-                    "DSH_VERSION=0.1.1-rc.2\n"
+                    "DSH_BUILD_VERSION=0.1.1-rc.2\n"
                     "PNPM_VERSION=11.7.0\n"
                     "NODE_22_MIN=22.19.0\n"
                     "NODE_NEXT_MIN=24.0.0\n",
                     encoding="utf-8",
                 )
                 shutil.copy2(
+                    PACK_DIR / "assets" / "dsh-compatibility.json",
+                    pack_dir / "assets" / "dsh-compatibility.json",
+                )
+                shutil.copy2(
                     PACK_DIR / "assets" / "supervisor-contract.json",
                     pack_dir / "assets" / "supervisor-contract.json",
                 )
                 for name in (
-                    "node", "dsh", "pnpm", "artifact", "profile",
+                    "node", "dsh", "artifact", "profile",
                     "gc-contexts", "listener", "supervisor", "read-grant",
                 ):
                     shutil.copy2(
@@ -259,7 +267,7 @@ class StatusTests(unittest.TestCase):
                     "if [ \"${1:-}\" = --version ]; then printf 'v24.0.0\\n'; exit 0; fi\n"
                     f"exec {shlex.quote(real_node)} \"$@\"",
                 )
-                write_executable(bin_dir, "pnpm", "printf '11.7.0\\n'")
+                write_executable(bin_dir, "pnpm", "exit 97")
                 write_executable(
                     bin_dir,
                     "dsh-web-fixture",
@@ -319,7 +327,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("loopback boot and pack route probe succeeded", result.stdout)
         self.assertIn("required OpenAPI capabilities are present", result.stdout)
-        self.assertIn("do not require an unsupported direct read grant", result.stdout)
+        self.assertIn("succeed without a direct read-grant challenge", result.stdout)
 
 
 if __name__ == "__main__":

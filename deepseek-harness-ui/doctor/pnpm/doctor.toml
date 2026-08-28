@@ -1,2 +1,2 @@
-description = "pnpm matches the DSH plugin-management toolchain"
+description = "pnpm is available for DSH plugin management; its build pin is informational at runtime"
 run = "../check-pnpm.sh"

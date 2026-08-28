@@ -295,9 +295,67 @@ function validateGrantToken(token: string): boolean {
   }
 }
 
+async function isDirectReadGrantChallenge(response: Response): Promise<boolean> {
+  if (!response.headers.get('content-type')?.toLowerCase().startsWith('application/problem+json')) {
+    return false
+  }
+  const declaredLength = response.headers.get('content-length')
+  if (declaredLength !== null && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > 16_384)) {
+    return false
+  }
+  let clone: Response
+  try {
+    clone = response.clone()
+  } catch {
+    return false
+  }
+  const reader = clone.body?.getReader()
+  if (reader === undefined) return false
+  const chunks: Uint8Array[] = []
+  let length = 0
+  let chunkCount = 0
+  const deadline = Date.now() + 500
+  try {
+    while (true) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0 || chunkCount >= 256) return false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const result = await Promise.race([
+        reader.read().then(value => ({ kind: 'read' as const, value })),
+        new Promise<{ kind: 'timeout' }>(resolve => {
+          timer = setTimeout(() => resolve({ kind: 'timeout' }), remaining)
+        }),
+      ])
+      if (timer !== undefined) clearTimeout(timer)
+      if (result.kind === 'timeout') return false
+      if (result.value.done) break
+      chunkCount += 1
+      length += result.value.value.byteLength
+      if (length > 16_384) return false
+      chunks.push(result.value.value)
+    }
+    const bytes = new Uint8Array(length)
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    const value: unknown = JSON.parse(new TextDecoder().decode(bytes))
+    return value !== null
+      && typeof value === 'object'
+      && !Array.isArray(value)
+      && (value as { detail?: unknown }).detail === 'missing X-GC-City-Read grant'
+  } catch {
+    return false
+  } finally {
+    void reader.cancel().catch(() => undefined)
+  }
+}
+
 class ProductionBoundary implements HostBoundary {
   private groups: ConnectionGroup[] | undefined
   private readonly bearerCache = new Map<string, { token: string; expiresAt: number }>()
+  private readonly bearerLoads = new Map<string, Promise<{ token: string; expiresAt: number }>>()
   private readonly dispatchers = new Map<string, Agent>()
 
   constructor(
@@ -325,48 +383,67 @@ class ProductionBoundary implements HostBoundary {
     return agent
   }
 
-  private async bearer(profile: AccessProfile, forceRefresh = false): Promise<string | undefined> {
+  private async bearer(
+    profile: AccessProfile,
+    forceRefresh = false,
+    rejectedToken?: string,
+  ): Promise<string | undefined> {
     if (profile.credentialCommand === undefined && profile.credentialAudience === undefined) return undefined
     const city = profile.city ?? profile.name
     const key = `${profileFingerprint(profile)}\0${city}`
     const cached = this.bearerCache.get(key)
     if (!forceRefresh && cached !== undefined && Date.now() + 30_000 < cached.expiresAt) return cached.token
-    if (profile.credentialCommand !== undefined) {
-      const result = await this.helpers.credential(profile.credentialCommand, {
-        version: 'gascity.dev/client-auth/v1',
-        spec: { server_url: profile.endpoint, city, interactive: false },
-      })
-      const expiresAt = Date.parse(result.expirationTimestamp)
-      if (result.token.trim() === '' || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-        throw new Error('credential command returned an invalid credential')
+    if (forceRefresh && rejectedToken !== undefined && cached !== undefined
+      && cached.token !== rejectedToken && Date.now() + 30_000 < cached.expiresAt) {
+      return cached.token
+    }
+    const existing = this.bearerLoads.get(key)
+    if (existing !== undefined) return (await existing).token
+    const load = (async (): Promise<{ token: string; expiresAt: number }> => {
+      if (profile.credentialCommand !== undefined) {
+        const result = await this.helpers.credential(profile.credentialCommand, {
+          version: 'gascity.dev/client-auth/v1',
+          spec: { server_url: profile.endpoint, city, interactive: false },
+        })
+        const expiresAt = Date.parse(result.expirationTimestamp)
+        if (result.token.trim() === '' || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+          throw new Error('credential command returned an invalid credential')
+        }
+        return { token: result.token, expiresAt }
       }
-      this.bearerCache.set(key, { token: result.token, expiresAt })
-      return result.token
+      const credential = await this.helpers.provider({
+        audience: profile.credentialAudience as string,
+        required_scopes: [...profile.credentialRequiredScopes],
+        org: profile.credentialOrg ?? '',
+        force_refresh: forceRefresh,
+      })
+      const expiresAt = Date.parse(credential.expiresAt)
+      if (credential.authorizationScheme !== 'Bearer' || credential.accessToken.trim() === ''
+        || !Number.isFinite(expiresAt) || expiresAt <= Date.now()
+        || credential.audience !== profile.credentialAudience
+        || profile.credentialRequiredScopes.some(scope => !credential.scopes.includes(scope))) {
+        throw new Error('credential provider returned an invalid credential')
+      }
+      return { token: credential.accessToken, expiresAt }
+    })()
+    this.bearerLoads.set(key, load)
+    try {
+      const credential = await load
+      this.bearerCache.set(key, credential)
+      return credential.token
+    } finally {
+      if (this.bearerLoads.get(key) === load) this.bearerLoads.delete(key)
     }
-    const credential = await this.helpers.provider({
-      audience: profile.credentialAudience as string,
-      required_scopes: [...profile.credentialRequiredScopes],
-      org: profile.credentialOrg ?? '',
-      force_refresh: forceRefresh,
-    })
-    const expiresAt = Date.parse(credential.expiresAt)
-    if (credential.authorizationScheme !== 'Bearer' || credential.accessToken.trim() === ''
-      || !Number.isFinite(expiresAt) || expiresAt <= Date.now()
-      || credential.audience !== profile.credentialAudience
-      || profile.credentialRequiredScopes.some(scope => !credential.scopes.includes(scope))) {
-      throw new Error('credential provider returned an invalid credential')
-    }
-    this.bearerCache.set(key, { token: credential.accessToken, expiresAt })
-    return credential.accessToken
   }
 
   private async authorizedHeaders(
     profile: AccessProfile,
     request: GatewayRequest,
     forceRefresh = false,
-  ): Promise<Headers> {
+    rejectedToken?: string,
+  ): Promise<{ headers: Headers; bearer?: string }> {
     const headers = new Headers(request.headers)
-    const bearer = await this.bearer(profile, forceRefresh)
+    const bearer = await this.bearer(profile, forceRefresh, rejectedToken)
     if (bearer !== undefined) headers.set('Authorization', `Bearer ${bearer}`)
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       headers.set('X-GC-Request', 'true')
@@ -392,33 +469,43 @@ class ProductionBoundary implements HostBoundary {
         headers.set('X-GC-City-Write', grant)
       }
     }
-    return headers
+    return { headers, ...(bearer === undefined ? {} : { bearer }) }
   }
 
   private async perform(profile: AccessProfile, request: GatewayRequest): Promise<Response> {
     const query = request.query === '' ? '' : `?${request.query}`
-    const call = async (forceRefresh: boolean): Promise<Response> => {
+    const call = async (
+      forceRefresh: boolean,
+      rejectedToken?: string,
+    ): Promise<{ response: Response; bearer?: string }> => {
       const dispatcher = await this.dispatcher(profile)
+      const authorized = await this.authorizedHeaders(profile, request, forceRefresh, rejectedToken)
       const init: RequestInit & { dispatcher?: Dispatcher } = {
         method: request.method,
         redirect: 'error',
-        headers: await this.authorizedHeaders(profile, request, forceRefresh),
+        headers: authorized.headers,
         ...(request.body === undefined ? {} : { body: request.body }),
         ...(dispatcher === undefined ? {} : { dispatcher }),
       }
       try {
-        return await this.fetchFn(`${profile.endpoint}${request.path}${query}`, init as RequestInit)
+        return {
+          response: await this.fetchFn(`${profile.endpoint}${request.path}${query}`, init as RequestInit),
+          ...(authorized.bearer === undefined ? {} : { bearer: authorized.bearer }),
+        }
       } catch (cause) {
         throw new GatewayDispatchError(cause)
       }
     }
-    let response = await call(false)
-    const isSSE = request.headers.accept === 'text/event-stream'
-    if (response.status === 401 && !isSSE
-      && (profile.credentialCommand !== undefined || profile.credentialAudience !== undefined)) {
-      response = await call(true)
+    let attempt = await call(false)
+    const safeToReplay = request.method === 'GET' || request.method === 'HEAD'
+    if (attempt.response.status === 401
+      && safeToReplay
+      && (profile.credentialCommand !== undefined || profile.credentialAudience !== undefined)
+      && !(await isDirectReadGrantChallenge(attempt.response))) {
+      await attempt.response.body?.cancel()
+      attempt = await call(true, attempt.bearer)
     }
-    return response
+    return attempt.response
   }
 
   private async connectionGroups(): Promise<ConnectionGroup[]> {

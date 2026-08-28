@@ -1,2 +1,2 @@
-description = "detect unsupported direct X-GC-City-Read grant hardening"
+description = "diagnose direct X-GC-City-Read hardening and observe whether bearer authentication changes city-read access"
 run = "../check-read-grant.sh"

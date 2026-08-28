@@ -8,6 +8,7 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 PACKAGE_JSON = REPO_ROOT / "deepseek-harness-ui" / "assets" / "dsh-plugin" / "package.json"
+PLAYWRIGHT_CONFIG = REPO_ROOT / "deepseek-harness-ui" / "assets" / "dsh-plugin" / "playwright.config.mjs"
 ISOLATED_CERTIFICATE = (
     REPO_ROOT
     / "deepseek-harness-ui"
@@ -44,6 +45,11 @@ class BrowserContractCiTests(unittest.TestCase):
             "playwright test --config playwright.soak.config.mjs",
         )
 
+    def test_stock_dsh_contract_includes_the_ssh_forwarded_browser_surface(self) -> None:
+        config = PLAYWRIGHT_CONFIG.read_text(encoding="utf-8")
+
+        self.assertIn("stock-dsh.ssh.spec.mjs", config)
+
     def test_plugin_exposes_an_isolated_live_certificate_command(self) -> None:
         package = json.loads(PACKAGE_JSON.read_text(encoding="utf-8"))
 
@@ -65,12 +71,19 @@ class BrowserContractCiTests(unittest.TestCase):
         self.assertIn("GC_BEADS: 'file'", script)
         self.assertIn("GC_SUPERVISOR_ENV", script)
         self.assertIn("runOwnedCommand(gcBin, ['supervisor', 'uninstall']", script)
+        self.assertIn("runOwnedCommand(gcBin, ['stop', '--force', '--timeout', '30s', cityDir]", script)
+        self.assertIn("runOwnedCommand('tmux', ['-L', cityName, 'kill-server']", script)
+        self.assertIn("owned tmux server remained after cleanup", script)
         self.assertIn("city => city.name === cityName && city.running === true", script)
         self.assertIn("runOwnedCommand(gcBin, ['import', 'add'", script)
         self.assertIn("runOwnedCommand(gcBin, ['reload', cityDir]", script)
         self.assertIn("live-agent-matrix", script)
         self.assertNotIn("void resources.close()", script)
         self.assertIn("new AbortController()", script)
+
+        process_cleanup_position = script.index("resources.defer('disposable city processes'")
+        supervisor_cleanup_position = script.index("resources.defer('isolated Supervisor service'")
+        self.assertLess(process_cleanup_position, supervisor_cleanup_position)
 
         init_position = script.index("runOwnedCommand(gcBin, ['init'")
         health_position = script.index("`${supervisorUrl}/health`")
