@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 
+import { waitForCreatedSession } from './support/live-evidence.mjs'
 import { startOwnedStack } from './support/owned-stack.mjs'
 import { openGasCityWorkspace } from './support/stock-dsh-ui.mjs'
 
@@ -101,6 +102,10 @@ test('stock DSH prevents accidental duplicate mutations after an unknown outcome
   const acceptedCreateComposer = page.getByRole('textbox', { name: 'Message demo/cold-reviewer' })
   await acceptedCreateComposer.fill('Accepted but result lost')
   await page.getByRole('button', { name: 'Start session' }).click()
+  await expect(waitForCreatedSession(page, {
+    agent: 'demo/cold-reviewer',
+    timeoutMs: 2_000,
+  })).rejects.toThrow('Create outcome unknown')
   await expect(page.getByRole('alert').filter({ hasText: 'Create outcome unknown' })).toContainText(
     'Session inventory refreshed; inspect sessions before retrying.',
   )

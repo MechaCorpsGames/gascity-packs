@@ -162,6 +162,50 @@ describe("city operation watcher", () => {
     expect(closeCount).toBe(1);
   });
 
+  it("keeps a terminal result absorbing when a later city event is already buffered", async () => {
+    let emit!: (frame: CityEventFrame) => void;
+    let closeCount = 0;
+    const watcher = createCityOperationWatcher(
+      {
+        async openCityEventStream(request) {
+          emit = request.onEvent;
+          return {
+            close() {
+              closeCount += 1;
+            },
+          };
+        },
+      },
+      {
+        requestId: "request-1",
+        operation: "session.create",
+        eventCursor: "100",
+      },
+    );
+    await watcher.start();
+
+    emit({
+      id: "101",
+      eventType: "request.result.session.create",
+      payload: {
+        request_id: "request-1",
+        session: { id: "session-1" },
+      },
+    });
+    emit({
+      id: "102",
+      eventType: "session.activity",
+      payload: { session_id: "session-1", activity: "idle" },
+    });
+
+    expect(closeCount).toBe(1);
+    expect(watcher.getSnapshot()).toMatchObject({
+      phase: "succeeded",
+      cursor: "101",
+      terminal: { id: "101" },
+    });
+  });
+
   it("replays a malformed matching terminal once then reports unknown outcome", async () => {
     const requests: Parameters<CityOperationPort["openCityEventStream"]>[0][] =
       [];

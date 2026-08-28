@@ -53,6 +53,20 @@ export function newCompletedToolCallIds(before, after) {
     .filter(id => !previousUses.has(id) && newResults.has(id))
 }
 
+export async function waitForCreatedSession(page, { agent, timeoutMs }) {
+  const sessionWorkspace = page.locator('main.gc-session')
+  const createFailure = page
+    .locator('main.gc-draft')
+    .getByRole('alert')
+    .filter({ hasText: /^(Create outcome unknown|Session failed to start|Session result incompatible)/ })
+
+  await sessionWorkspace.or(createFailure).first().waitFor({ state: 'visible', timeout: timeoutMs })
+  if (await sessionWorkspace.isVisible()) return sessionWorkspace
+
+  const detail = await createFailure.first().innerText()
+  throw new Error(`${agent} session creation failed in stock DSH: ${detail}`)
+}
+
 export async function closeRunOwnedSessions(sessionIds, api) {
   const errors = []
   const remainingSessionIds = []

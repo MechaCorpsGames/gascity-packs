@@ -8,6 +8,7 @@ import {
   closeRunOwnedSessions,
   newCompletedToolCallIds,
   sessionEvidence,
+  waitForCreatedSession,
 } from './support/live-evidence.mjs'
 import {
   isBrowserHttpConsoleNoise,
@@ -313,9 +314,9 @@ try {
     await page.getByRole('button', { name: agent, exact: true }).click()
     await page.getByRole('textbox', { name: `Message ${agent}` }).fill(`Reply briefly with this exact nonce: ${nonce}`)
     await page.getByRole('button', { name: 'Start session' }).click()
-    const sessionWorkspace = page.locator('main.gc-session')
+    let sessionWorkspace
     try {
-      await sessionWorkspace.waitFor({ state: 'visible', timeout: 330_000 })
+      sessionWorkspace = await waitForCreatedSession(page, { agent, timeoutMs: 330_000 })
     } catch (error) {
       await captureBrowserFailure(error)
       throw new Error(`${error instanceof Error ? error.message : String(error)}\nVisible UI: ${browserFailureState.visible_text}`)

@@ -88,6 +88,12 @@ test('stock DSH renders and controls the provider-neutral Supervisor workspace',
   await expect(page.locator('main.gc-session')).toHaveAttribute('data-session-id', 'session-created-browser')
   await expect(page.getByText('Created session attached to its own Supervisor stream.')).toBeVisible()
 
+  await page.getByRole('button', { name: 'demo/cold-reviewer' }).click()
+  await page.getByRole('textbox', { name: 'Message demo/cold-reviewer' }).fill('Create again after buffered events')
+  await page.getByRole('button', { name: 'Start session' }).click()
+  await expect(page.locator('main.gc-session')).toHaveAttribute('data-session-id', 'session-created-browser')
+  await expect(page.getByText('Created session attached to its own Supervisor stream.')).toBeVisible()
+
   expect(stack.fixture.requests.filter(request => request.path.endsWith('/submit')).map(request => request.body)).toEqual([
     { message: 'Run the release check' },
     { message: 'Queue this after the turn', intent: 'follow_up' },
@@ -104,9 +110,10 @@ test('stock DSH renders and controls the provider-neutral Supervisor workspace',
   expect(stack.fixture.requests.find(request => request.path.endsWith('/permission-mode'))?.body).toEqual({
     permission_mode: 'auto-edit',
   })
-  expect(stack.fixture.requests.find(request => request.path === '/v0/city/demo/sessions' && request.method === 'POST')?.body).toEqual({
-    kind: 'agent', name: 'demo/cold-reviewer', message: 'Create exactly once', async: true,
-  })
+  expect(stack.fixture.requests.filter(request => request.path === '/v0/city/demo/sessions' && request.method === 'POST').map(request => request.body)).toEqual([
+    { kind: 'agent', name: 'demo/cold-reviewer', message: 'Create exactly once', async: true },
+    { kind: 'agent', name: 'demo/cold-reviewer', message: 'Create again after buffered events', async: true },
+  ])
   expect(browserRequests.some(url => url.startsWith(stack.fixture.url))).toBe(false)
   expect(browserErrors).toEqual([])
 })

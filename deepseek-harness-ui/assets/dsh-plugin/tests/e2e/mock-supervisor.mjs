@@ -263,6 +263,8 @@ export async function startMockSupervisor({ port = 0 } = {}) {
       capture.body = await readJson(request)
       const created = { ...structuredClone(active), id: 'session-created-browser', title: 'Created from stock DSH', template: capture.body.name }
       sessions.set(created.id, created)
+      sessionStreamAttempts.delete(created.id)
+      finalizedSessions.delete(created.id)
       if (consumeMutationFailure('create')) {
         response.destroy()
         return
@@ -283,23 +285,31 @@ export async function startMockSupervisor({ port = 0 } = {}) {
       } else if (failedMutations.delete('create-result')) {
         failedResultCursors.add(eventCursor)
       } else {
-        cityResults.push({
-          seq: String(Number(eventCursor) + 1), type: 'request.result.session.create',
-          payload: { request_id: requestId, session: created },
-        })
+        cityResults.push([
+          {
+            seq: String(Number(eventCursor) + 1), type: 'request.result.session.create',
+            payload: { request_id: requestId, session: created },
+          },
+          {
+            seq: String(Number(eventCursor) + 2), type: 'session.updated',
+            payload: { session_id: created.id },
+          },
+        ])
       }
       return json(response, 202, { status: 'accepted', request_id: requestId, event_cursor: eventCursor })
     }
     if (request.method === 'GET' && path === '/v0/city/demo/events/stream') {
-      if (failedResultCursors.has(url.searchParams.get('after_seq'))) {
+      const cursor = request.headers['last-event-id'] ?? url.searchParams.get('after_seq')
+      if (failedResultCursors.has(cursor)) {
         return json(response, 410, { title: 'Gone', status: 410, detail: 'fixture result cursor expired' })
       }
       response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
       if (cityResults.length > 0) {
-        const event = cityResults.shift()
-        response.end(`event: event\nid: ${event.seq}\ndata: ${JSON.stringify({
+        const next = cityResults.shift()
+        const events = Array.isArray(next) ? next : [next]
+        response.end(events.map(event => `event: event\nid: ${event.seq}\ndata: ${JSON.stringify({
           seq: Number(event.seq), type: event.type, actor: 'supervisor', ts: '2026-08-26T00:00:00Z', payload: event.payload,
-        })}\n\n`)
+        })}\n\n`).join(''))
       } else response.end()
       return
     }

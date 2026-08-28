@@ -1,4 +1,6 @@
 scope = "city"
 provider = "codex"
+# This gate certifies provider identity and transport, not reasoning depth.
+option_defaults = { effort = "low" }
 max_active_sessions = 1
 description = "Disposable Codex agent for the DSH live release certificate"

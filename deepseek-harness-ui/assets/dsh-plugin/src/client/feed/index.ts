@@ -1175,7 +1175,15 @@ export function createCityOperationWatcher(
     const openedConnection = await port.openCityEventStream({
       ...resume,
       onEvent(frame) {
-        if (generation !== connectionGeneration) return;
+        if (
+          generation !== connectionGeneration ||
+          snapshot.phase === "succeeded" ||
+          snapshot.phase === "failed" ||
+          snapshot.phase === "outcome_unknown" ||
+          snapshot.phase === "dismissed"
+        ) {
+          return;
+        }
         sawFrame = true;
         silentAttempts = 0;
         retryAttempt = 0;
@@ -1215,6 +1223,7 @@ export function createCityOperationWatcher(
           dataCommitted = true;
           cancelWatchdog?.();
           cancelWatchdog = null;
+          connectionGeneration += 1;
           connection?.close();
           connection = null;
           return;
@@ -1257,6 +1266,7 @@ export function createCityOperationWatcher(
           dataCommitted = true;
           cancelWatchdog?.();
           cancelWatchdog = null;
+          connectionGeneration += 1;
           connection?.close();
           connection = null;
           return;

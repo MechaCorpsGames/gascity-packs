@@ -96,6 +96,15 @@ for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) {
 }
 const resources = new CleanupStack()
 const cityName = process.env.GC_LIVE_CITY ?? `dsh-live-${randomUUID().slice(0, 8)}`
+if (!/^dsh-live-[A-Za-z0-9_-]+$/.test(cityName)) {
+  process.stderr.write('UNPROVEN: GC_LIVE_CITY must be a narrowly named dsh-live-* fixture city\n')
+  process.exit(2)
+}
+const requestedRootName = process.env.GC_LIVE_ROOT_NAME
+if (requestedRootName !== undefined && !/^dsh-gc-live-[A-Za-z0-9_-]+$/.test(requestedRootName)) {
+  process.stderr.write('UNPROVEN: GC_LIVE_ROOT_NAME must be a basename matching dsh-gc-live-*\n')
+  process.exit(2)
+}
 const matrix = JSON.stringify({
   'live.release-claude': 'claude',
   'live.release-codex': 'codex',
@@ -160,7 +169,13 @@ try {
   await access(gcBin, constants.X_OK)
   const temporaryBase = process.platform === 'darwin' ? join(homedir(), 'Library', 'Caches') : tmpdir()
   await mkdir(temporaryBase, { recursive: true })
-  const root = await mkdtemp(join(temporaryBase, 'dsh-gc-live-'))
+  const root = requestedRootName === undefined
+    ? await mkdtemp(join(temporaryBase, 'dsh-gc-live-'))
+    : join(temporaryBase, requestedRootName)
+  if (requestedRootName !== undefined) {
+    if (await pathExists(root)) throw new Error(`isolated live root already exists: ${root}`)
+    await mkdir(root, { mode: 0o700 })
+  }
   resources.defer('isolated live root', () => rm(root, { recursive: true, force: true }))
   const gcHome = join(root, 'gc-home')
   const runtimeDir = join(root, 'runtime')
