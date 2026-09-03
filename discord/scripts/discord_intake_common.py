@@ -3091,7 +3091,14 @@ def _attachment_url_is_allowed(url: str) -> bool:
         return False
     if parts.scheme != "https":
         return False
-    return True
+    try:
+        host = parts.hostname
+    except ValueError:
+        return False
+    # hostname is already lowercased and stripped of userinfo and port by
+    # urlsplit, so "cdn.discordapp.com.evil.example" and "user@cdn.discordapp
+    # .com" are both compared as the host that would actually be dialled.
+    return bool(host) and host in INBOUND_ATTACHMENT_ALLOWED_HOSTS
 
 
 def inbound_attachment_summaries(message: dict[str, Any]) -> list[dict[str, Any]]:
