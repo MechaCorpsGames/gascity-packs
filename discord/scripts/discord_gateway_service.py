@@ -2326,6 +2326,9 @@ class GatewayWorker:
         self.recovery_thread: threading.Thread | None = None
         self._current_ws_lock = threading.Lock()
         self._current_ws: GatewayWebSocket | None = None
+        # What Discord was last TOLD, so the loop can tell a change from a
+        # no-op and does not send an op 3 every heartbeat.
+        self.applied_presence = "online"
         consumer_count = GATEWAY_NAMED_WORKER_THREADS if self.app_name else GATEWAY_WORKER_THREADS
         for index in range(consumer_count):
             worker_name = f"discord-gateway-worker-{index + 1}"
@@ -2461,20 +2464,46 @@ class GatewayWorker:
         return self.gateway_connect_url(url)
 
     def identify(self, ws: GatewayWebSocket, token: str) -> None:
-        ws.send_json(
-            {
-                "op": 2,
-                "d": {
-                    "token": token,
-                    "intents": GATEWAY_INTENTS,
-                    "properties": {
-                        "os": "linux",
-                        "browser": "gas-city-discord",
-                        "device": "gas-city-discord",
-                    },
-                },
-            }
-        )
+        payload: dict[str, Any] = {
+            "token": token,
+            "intents": GATEWAY_INTENTS,
+            "properties": {
+                "os": "linux",
+                "browser": "gas-city-discord",
+                "device": "gas-city-discord",
+            },
+        }
+        # Presence has to ride along on IDENTIFY, not only be pushed after it.
+        # A fresh IDENTIFY resets the session's presence to the default, so a
+        # gateway that only ever sent op 3 would pop back to online on every
+        # reconnect and stay there until something noticed. That is the same
+        # bug this feature exists to fix, in a slower and harder to see form.
+        status = common.effective_gateway_presence(self.app_name)
+        if status != "online":
+            payload["presence"] = presence_payload(status)
+        ws.send_json({"op": 2, "d": payload})
+        self.applied_presence = status
+
+    def send_presence(self, ws: GatewayWebSocket, status: str) -> None:
+        ws.send_json({"op": 3, "d": presence_payload(status)})
+        self.applied_presence = status
+        self.runtime_state.patch(presence=status, presence_applied_at=common.utcnow())
+
+    def apply_presence_if_changed(self, ws: GatewayWebSocket) -> None:
+        """Push presence when the desired status has moved, including expiry.
+
+        Called from the same loop that sends heartbeats, so a lapsed assertion
+        returns the bot to online on its own rather than at the next reconnect.
+        """
+        status = common.effective_gateway_presence(self.app_name)
+        if status == self.applied_presence:
+            return
+        try:
+            self.send_presence(ws, status)
+        except Exception as exc:  # noqa: BLE001
+            # Presence is cosmetic next to delivering messages. Never let it
+            # take down a connection that is otherwise working.
+            self.runtime_state.patch(last_presence_error=str(exc))
 
     def resume(self, ws: GatewayWebSocket, token: str, session_id: str, seq: int) -> None:
         ws.send_json(
@@ -2817,6 +2846,13 @@ class GatewayWorker:
                             awaiting_heartbeat_ack = True
                             next_heartbeat_at = now + heartbeat_interval
                             self.runtime_state.patch(last_heartbeat_at=common.utcnow())
+                            # Ride the heartbeat rather than add a timer. It is
+                            # the one tick guaranteed to keep running on an idle
+                            # connection, which is exactly the case presence has
+                            # to work in. Worst-case latency is one heartbeat
+                            # interval, about 41s, against a signal that reports
+                            # a stall measured in quarter-hours.
+                            self.apply_presence_if_changed(ws)
                         if not self.app_name and now >= next_prune_at:
                             self.prune_runtime_data()
                             next_prune_at = now + PRUNE_INTERVAL_SECONDS
@@ -2845,6 +2881,7 @@ class GatewayWorker:
                                     last_ready_epoch=int(time.time()),
                                     last_error="",
                                 )
+                                self.apply_presence_if_changed(ws)
                                 continue
                             if event_type == "RESUMED":
                                 bot_user_id = self.current_bot_user_id(config, None, last_known_bot_user_id)
@@ -2859,6 +2896,11 @@ class GatewayWorker:
                                     last_resumed_epoch=int(time.time()),
                                     last_error="",
                                 )
+                                # A RESUME restores the old session's presence,
+                                # so this is a no-op unless the desired status
+                                # moved while we were disconnected. That window
+                                # is exactly when a stall is likely to start.
+                                self.apply_presence_if_changed(ws)
                                 continue
                             if event_type == "MESSAGE_CREATE" and isinstance(data, dict):
                                 bot_user_id = self.current_bot_user_id(config, ready_payload, last_known_bot_user_id)
@@ -2923,6 +2965,22 @@ def build_gateway_workers(config: dict[str, Any]) -> list[GatewayWorker]:
             )
         )
     return workers
+
+
+def presence_payload(status: str) -> dict[str, Any]:
+    """The `d` of an op 3, and the `presence` of an op 2.
+
+    `since` is only meaningful for "idle" (Discord reads it as "afk since"),
+    and 0 is the documented value for "not idle". `afk` stays False: it changes
+    where Discord routes the user's own notifications and means nothing for a
+    bot, so setting it would be cargo.
+    """
+    return {
+        "since": 0,
+        "activities": [],
+        "status": status,
+        "afk": False,
+    }
 
 
 class GatewayHandler(BaseHTTPRequestHandler):

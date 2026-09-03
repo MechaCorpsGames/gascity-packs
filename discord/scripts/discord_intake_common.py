@@ -205,6 +205,107 @@ def gateway_status_path(app_name: str = "") -> str:
     return os.path.join(data_dir(), "gateway-status.json")
 
 
+# --- Gateway presence -------------------------------------------------------
+#
+# Discord shows the bot ONLINE for as long as the gateway connection is up, and
+# the gateway is a long-lived service that outlives the session it speaks for.
+# So the bot reads online while nobody can answer, which is the bug this exists
+# to fix (bead ga-okqd0). Connor asked for a status change SPECIFICALLY so that
+# no message has to be sent: presence costs a reader nothing, no notification,
+# no unread, no line in their list, while a broadcast interrupts everyone.
+#
+# The desired presence is a FILE rather than a request to the running service,
+# for three reasons. It survives a gateway restart. An assertion made while the
+# gateway happens to be down is applied on its next connect instead of being
+# lost. And there is exactly one source of truth to reason about when presence
+# and reality disagree.
+
+GATEWAY_PRESENCE_STATUSES = ("online", "idle", "dnd", "invisible")
+# How long an assertion is believed if nobody refreshes it. See
+# effective_gateway_presence: when it lapses the bot goes back to online, on
+# purpose.
+GATEWAY_PRESENCE_DEFAULT_TTL_SECONDS = 1800
+
+
+def gateway_presence_path(app_name: str = "") -> str:
+    normalized_app_name = validate_app_name(app_name)
+    if normalized_app_name:
+        return os.path.join(data_dir(), f"gateway-presence-{normalized_app_name}.json")
+    return os.path.join(data_dir(), "gateway-presence.json")
+
+
+def save_gateway_presence(
+    status: str,
+    ttl_seconds: int = GATEWAY_PRESENCE_DEFAULT_TTL_SECONDS,
+    app_name: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    """Assert a presence for this app, good for ttl_seconds.
+
+    Raises on an unknown status rather than passing it to Discord, which
+    answers an invalid status by ignoring the whole op 3 and leaving the bot
+    exactly as it was, i.e. by failing silently.
+    """
+    normalized = str(status or "").strip().lower()
+    if normalized not in GATEWAY_PRESENCE_STATUSES:
+        raise ValueError(
+            f"presence status must be one of {', '.join(GATEWAY_PRESENCE_STATUSES)}, got {status!r}"
+        )
+    ttl = int(ttl_seconds)
+    if ttl <= 0:
+        raise ValueError("presence ttl must be a positive number of seconds")
+    body = {
+        "status": normalized,
+        "reason": str(reason or "").strip(),
+        "set_at": utcnow(),
+        "set_at_epoch": int(time.time()),
+        "expires_at_epoch": int(time.time()) + ttl,
+        "ttl_seconds": ttl,
+    }
+    ensure_layout()
+    atomic_write_json(gateway_presence_path(app_name), body)
+    return body
+
+
+def load_gateway_presence(app_name: str = "") -> dict[str, Any]:
+    ensure_layout()
+    payload = read_json(gateway_presence_path(app_name), {}, allow_invalid=True)
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def clear_gateway_presence(app_name: str = "") -> None:
+    """Drop the assertion, which returns the bot to online at the next tick."""
+    with contextlib.suppress(OSError):
+        os.unlink(gateway_presence_path(app_name))
+
+
+def effective_gateway_presence(app_name: str = "", now_epoch: int | None = None) -> str:
+    """The status the gateway should currently be showing.
+
+    AN EXPIRED ASSERTION MEANS ONLINE, AND THAT DIRECTION IS DELIBERATE. A bot
+    that reads online while it cannot answer is the bug; a bot stuck reading
+    idle while someone IS working is worse, because it tells four people not to
+    bother asking and nothing ever corrects it. So the failure mode is chosen:
+    if the thing asserting idle stops running, the assertion rots away and the
+    bot comes back. The caller is expected to re-assert while the condition it
+    is reporting still holds.
+    """
+    payload = load_gateway_presence(app_name)
+    status = str(payload.get("status", "")).strip().lower()
+    if status not in GATEWAY_PRESENCE_STATUSES:
+        return "online"
+    try:
+        expires_at = int(payload.get("expires_at_epoch", 0) or 0)
+    except (TypeError, ValueError):
+        return "online"
+    current = int(time.time()) if now_epoch is None else int(now_epoch)
+    if expires_at <= current:
+        return "online"
+    return status
+
+
 def ensure_layout() -> None:
     for path in (
         data_dir(),

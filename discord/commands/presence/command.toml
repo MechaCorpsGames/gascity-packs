@@ -1,0 +1,2 @@
+description = "Set, clear or read the Discord bot's presence without messaging anyone"
+run = '../presence.sh'

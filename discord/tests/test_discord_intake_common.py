@@ -3568,3 +3568,111 @@ class InboundAttachmentTests(unittest.TestCase):
         self.assertEqual(entry["local_path"], "[redacted]")
         self.assertEqual(entry["content_type"], "image/png")
         self.assertEqual(entry["status"], "saved")
+
+
+class GatewayPresenceTests(unittest.TestCase):
+    """The bot can read something other than online (bead ga-okqd0).
+
+    Connor's ask, 2026-09-03: "I would like you to set your online status to
+    offline when you can't accept messages so that you don't need to message me
+    about it." The point is that no message is sent, so nothing here sends one.
+    """
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self._env = mock.patch.dict(
+            os.environ,
+            {"GC_CITY_PATH": self.tempdir.name, **{name: "" for name in SEAT_ENV_OVERRIDES}},
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        common.ensure_layout()
+
+    def test_no_assertion_reads_as_online(self) -> None:
+        self.assertEqual(common.effective_gateway_presence(), "online")
+
+    def test_an_assertion_is_what_the_gateway_should_show(self) -> None:
+        common.save_gateway_presence("idle", ttl_seconds=600)
+
+        self.assertEqual(common.effective_gateway_presence(), "idle")
+
+    def test_an_expired_assertion_reads_as_online_again(self) -> None:
+        """The safety property: a watcher that dies cannot strand the bot idle.
+
+        A bot online while it cannot answer is the bug. A bot stuck idle while
+        someone IS working is worse, because it tells people not to ask and
+        nothing corrects it. So the assertion rots on purpose.
+        """
+        common.save_gateway_presence("idle", ttl_seconds=600)
+        payload = common.load_gateway_presence()
+
+        expired_at = int(payload["expires_at_epoch"]) + 1
+
+        self.assertEqual(common.effective_gateway_presence(now_epoch=expired_at), "online")
+
+    def test_the_boundary_second_is_already_expired(self) -> None:
+        common.save_gateway_presence("idle", ttl_seconds=600)
+        expires_at = int(common.load_gateway_presence()["expires_at_epoch"])
+
+        self.assertEqual(common.effective_gateway_presence(now_epoch=expires_at - 1), "idle")
+        self.assertEqual(common.effective_gateway_presence(now_epoch=expires_at), "online")
+
+    def test_clearing_returns_to_online(self) -> None:
+        common.save_gateway_presence("dnd", ttl_seconds=600)
+        common.clear_gateway_presence()
+
+        self.assertEqual(common.effective_gateway_presence(), "online")
+        self.assertEqual(common.load_gateway_presence(), {})
+
+    def test_clearing_nothing_is_not_an_error(self) -> None:
+        common.clear_gateway_presence()
+        common.clear_gateway_presence()
+
+        self.assertEqual(common.effective_gateway_presence(), "online")
+
+    def test_an_unknown_status_is_refused_rather_than_sent(self) -> None:
+        """Discord answers an invalid status by ignoring the whole op 3.
+
+        That is a silent no-op on the wire, so it has to be caught here or the
+        bot simply stays as it was with nothing to read in any log.
+        """
+        with self.assertRaises(ValueError):
+            common.save_gateway_presence("asleep")
+        self.assertEqual(common.effective_gateway_presence(), "online")
+
+    def test_a_non_positive_ttl_is_refused(self) -> None:
+        """Not a subTest: a subTest failure reports the outer test as PASSED.
+
+        Checked against the unfixed tree, where this exact assertion raised
+        AttributeError and the test still printed PASSED with two SUBFAILED
+        lines above it. A test that cannot go red is not a test.
+        """
+        with self.assertRaises(ValueError):
+            common.save_gateway_presence("idle", ttl_seconds=0)
+        with self.assertRaises(ValueError):
+            common.save_gateway_presence("idle", ttl_seconds=-1)
+
+    def test_a_corrupt_assertion_reads_as_online(self) -> None:
+        with open(common.gateway_presence_path(), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+
+        self.assertEqual(common.effective_gateway_presence(), "online")
+
+    def test_an_assertion_without_an_expiry_reads_as_online(self) -> None:
+        """A hand-written or half-written file must not pin the bot forever."""
+        common.atomic_write_json(common.gateway_presence_path(), {"status": "idle"})
+
+        self.assertEqual(common.effective_gateway_presence(), "online")
+
+    def test_presence_is_per_app(self) -> None:
+        common.save_gateway_presence("idle", ttl_seconds=600, app_name="ollie")
+
+        self.assertEqual(common.effective_gateway_presence(app_name="ollie"), "idle")
+        self.assertEqual(common.effective_gateway_presence(), "online")
+        self.assertNotEqual(common.gateway_presence_path("ollie"), common.gateway_presence_path())
+
+    def test_the_reason_is_recorded_for_a_human_reading_it_back(self) -> None:
+        common.save_gateway_presence("idle", ttl_seconds=600, reason="session stalled 20 min")
+
+        self.assertEqual(common.load_gateway_presence()["reason"], "session stalled 20 min")
