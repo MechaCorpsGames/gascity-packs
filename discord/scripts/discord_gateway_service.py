@@ -779,6 +779,7 @@ def build_human_envelope(
         f"discord_message_id: {message_id}",
         f"from_display: {display_name_from_message(message)}",
         f"from_user_id: {str((message.get('author') or {}).get('id', '')).strip()}",
+        *common.inbound_reply_envelope_lines(message),
         f"delivery: {delivery}",
         f"mentioned_aliases_json: {json.dumps(mentioned_aliases)}",
         f"untrusted_body_json: {json.dumps(body)}",
@@ -818,6 +819,7 @@ def build_room_launch_envelope(
         f"discord_message_id: {str(message.get('id', '')).strip()}",
         f"from_display: {display_name_from_message(message)}",
         f"from_user_id: {str((message.get('author') or {}).get('id', '')).strip()}",
+        *common.inbound_reply_envelope_lines(message),
         "delivery: targeted",
         f"mentioned_handles_json: {json.dumps(mentioned_handles)}",
         f"launch_id: {str(launch.get('launch_id', '')).strip()}",
@@ -871,6 +873,7 @@ def build_room_launch_thread_envelope(
         f"discord_message_id: {str(message.get('id', '')).strip()}",
         f"from_display: {display_name_from_message(message)}",
         f"from_user_id: {str((message.get('author') or {}).get('id', '')).strip()}",
+        *common.inbound_reply_envelope_lines(message),
         "delivery: targeted",
         f"routing_mode: {routing_mode}",
         f"reply_to_discord_message_id: {reply_to_id}",
@@ -1256,6 +1259,7 @@ def save_rejected_ingress_receipt(
             "from_user_id": str((message.get("author") or {}).get("id", "")).strip(),
             "from_display": display_name_from_message(message),
             "body_preview": ingress_preview(message, bot_user_id),
+            **common.inbound_reply_context(message),
             "status": status,
             "reason": reason,
             "message_debug": dict(message_debug or {}),
@@ -1298,6 +1302,8 @@ def reject_ingress_before_processing(
                 "from_user_id": str((message.get("author") or {}).get("id", "")).strip(),
                 "from_display": display_name_from_message(message),
                 "body_preview": ingress_preview(message, bot_user_id),
+                **common.inbound_reply_context(message),
+            **common.inbound_reply_context(message),
                 "status": "failed_claim_conflict",
                 "reason": str(receipt.get("reason", "")).strip() or "ingress_claim_unreadable",
                 "message_debug": dict(message_debug or {}),
@@ -1439,6 +1445,7 @@ def process_room_launch_message(
             "from_user_id": str((message.get("author") or {}).get("id", "")).strip(),
             "from_display": display_name_from_message(message),
             "body_preview": ingress_preview(message, bot_user_id),
+            **common.inbound_reply_context(message),
         }
     )
     try:

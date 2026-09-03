@@ -2868,6 +2868,60 @@ def normalize_to_extmsg_message(
     }
 
 
+REPLY_EXCERPT_MAX = 240
+
+
+def inbound_reply_context(message: dict[str, Any]) -> dict[str, str]:
+    """Extract the parent message a human replied to, if any.
+
+    Discord sets ``message_reference`` when a person uses native Reply, and
+    usually inlines the parent as ``referenced_message``. Both are absent on an
+    ordinary message, so every field here is optional and an empty dict means
+    "not a reply" rather than "lookup failed".
+
+    Note this is INBOUND context: which of our messages the human answered. It
+    is unrelated to the envelope's ``publish_reply_to_discord_message_id`` and
+    ``reply_to_discord_message_id``, which are outbound and say which message
+    the agent should reply to. The similar names are exactly why this was
+    missing for so long.
+    """
+    ref = message.get("message_reference") or {}
+    if not isinstance(ref, dict):
+        return {}
+    parent_id = str(ref.get("message_id", "") or "").strip()
+    if not parent_id:
+        return {}
+    out = {"reply_to_message_id": parent_id}
+    parent = message.get("referenced_message") or {}
+    if isinstance(parent, dict):
+        author = parent.get("author") or {}
+        if isinstance(author, dict):
+            name = str(author.get("global_name", "") or author.get("username", "") or "").strip()
+            if name:
+                out["reply_to_from_display"] = name
+        excerpt = str(parent.get("content", "") or "").strip()
+        if excerpt:
+            out["reply_to_excerpt"] = excerpt[:REPLY_EXCERPT_MAX]
+    return out
+
+
+def inbound_reply_envelope_lines(message: dict[str, Any]) -> list[str]:
+    """Envelope lines carrying inbound reply context, or [] when not a reply.
+
+    The excerpt is JSON-encoded because it is untrusted human text: a raw
+    newline in it would terminate the line and corrupt the envelope.
+    """
+    ctx = inbound_reply_context(message)
+    if not ctx:
+        return []
+    lines = [f"reply_to_message_id: {ctx['reply_to_message_id']}"]
+    if ctx.get("reply_to_from_display"):
+        lines.append(f"reply_to_from_display: {ctx['reply_to_from_display']}")
+    if ctx.get("reply_to_excerpt"):
+        lines.append(f"reply_to_excerpt_json: {json.dumps(ctx['reply_to_excerpt'])}")
+    return lines
+
+
 def _fuzzy_match_handle(
     text: str,
     participants: list[dict[str, str]],
@@ -3136,6 +3190,7 @@ def _build_thread_launch_envelope(
         f"discord_message_id: {message_id}",
         f"from_display: {str(author.get('global_name', '') or author.get('username', '')).strip()}",
         f"from_user_id: {str(author.get('id', '')).strip()}",
+        *inbound_reply_envelope_lines(discord_message),
         "delivery: targeted",
         f"target_handle: {handle}",
         f"untrusted_body_json: {json.dumps(content)}",

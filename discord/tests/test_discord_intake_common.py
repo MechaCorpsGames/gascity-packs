@@ -3071,3 +3071,70 @@ class DiscordIntakeCommonTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InboundReplyContextTests(unittest.TestCase):
+    """A human's native Discord reply must carry WHICH message they answered.
+
+    Regression cover for the parent reference being dropped between the gateway
+    and the session (gastownhall/gascity-packs#391). Reported by a human who
+    answered a three-option brief with "Let's go with C" and could not be
+    understood, because the envelope named no parent.
+    """
+
+    def test_an_ordinary_message_is_not_a_reply(self):
+        self.assertEqual(common.inbound_reply_context({"id": "1", "content": "hi"}), {})
+        self.assertEqual(common.inbound_reply_envelope_lines({"id": "1"}), [])
+
+    def test_a_native_reply_carries_the_parent_id(self):
+        ctx = common.inbound_reply_context(
+            {"message_reference": {"type": 0, "message_id": "42"}}
+        )
+        self.assertEqual(ctx["reply_to_message_id"], "42")
+
+    def test_the_parent_author_and_excerpt_come_through_when_inlined(self):
+        ctx = common.inbound_reply_context(
+            {
+                "message_reference": {"message_id": "42"},
+                "referenced_message": {
+                    "content": "A / B / C",
+                    "author": {"global_name": "mayor", "username": "gasbot"},
+                },
+            }
+        )
+        self.assertEqual(ctx["reply_to_from_display"], "mayor")
+        self.assertEqual(ctx["reply_to_excerpt"], "A / B / C")
+
+    def test_a_multiline_parent_cannot_corrupt_the_envelope(self):
+        """The excerpt is JSON-encoded: a raw newline would end the line early."""
+        lines = common.inbound_reply_envelope_lines(
+            {
+                "message_reference": {"message_id": "42"},
+                "referenced_message": {
+                    "content": "A. first\nB. second\nC. third",
+                    "author": {"username": "gasbot"},
+                },
+            }
+        )
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertNotIn("\n", line)
+
+    def test_the_excerpt_is_capped(self):
+        ctx = common.inbound_reply_context(
+            {
+                "message_reference": {"message_id": "42"},
+                "referenced_message": {"content": "x" * 999, "author": {"username": "u"}},
+            }
+        )
+        self.assertEqual(len(ctx["reply_to_excerpt"]), common.REPLY_EXCERPT_MAX)
+
+    def test_malformed_shapes_do_not_raise(self):
+        for bad in (
+            {"message_reference": None},
+            {"message_reference": []},
+            {"message_reference": {"message_id": ""}},
+            {"message_reference": {"message_id": "9"}, "referenced_message": None},
+            {"message_reference": {"message_id": "9"}, "referenced_message": {"author": "nope"}},
+        ):
+            common.inbound_reply_context(bad)
