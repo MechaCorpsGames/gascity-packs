@@ -3223,3 +3223,42 @@ class AttachmentTests(unittest.TestCase):
             common.post_channel_message("123", "body")
         self.assertIsNone(seen["files"])
         self.assertNotIn("attachments", seen["payload"])
+
+
+class UnresolvedReplyTests(unittest.TestCase):
+    """A reply whose parent is lost must be LOUD, never silent.
+
+    Asked by a reviewer: "could you detect that a reply was attempted, but
+    unknown which message it actually links to, then notify the user?" Before
+    this, a lost parent returned {} — identical to an ordinary message — so the
+    agent would answer confidently against the wrong question.
+    """
+
+    def test_a_plain_message_stays_silent(self):
+        self.assertEqual(common.inbound_reply_context({"type": 0, "id": "1"}), {})
+        self.assertEqual(common.inbound_reply_envelope_lines({"type": 0}), [])
+
+    def test_a_reply_with_a_lost_reference_is_flagged(self):
+        ctx = common.inbound_reply_context({"type": common.DISCORD_MESSAGE_TYPE_REPLY, "id": "1"})
+        self.assertEqual(ctx, {"reply_to_status": "UNRESOLVED"})
+
+    def test_an_empty_reference_is_flagged(self):
+        ctx = common.inbound_reply_context({"type": 19, "message_reference": {}})
+        self.assertEqual(ctx, {"reply_to_status": "UNRESOLVED"})
+
+    def test_a_reference_without_the_reply_type_is_still_flagged(self):
+        """Belt and braces: either signal alone is enough to raise the flag."""
+        ctx = common.inbound_reply_context({"message_reference": {"message_id": ""}})
+        self.assertEqual(ctx, {"reply_to_status": "UNRESOLVED"})
+
+    def test_the_flag_tells_the_agent_what_to_do(self):
+        lines = common.inbound_reply_envelope_lines({"type": 19, "id": "1"})
+        self.assertIn("reply_to_status: UNRESOLVED", lines)
+        self.assertTrue(any("ask which message they meant" in line for line in lines))
+
+    def test_an_intact_reply_is_unaffected(self):
+        lines = common.inbound_reply_envelope_lines(
+            {"type": 19, "message_reference": {"message_id": "42"}}
+        )
+        self.assertIn("reply_to_message_id: 42", lines)
+        self.assertFalse(any("UNRESOLVED" in line for line in lines))

@@ -2942,6 +2942,7 @@ def normalize_to_extmsg_message(
     }
 
 
+DISCORD_MESSAGE_TYPE_REPLY = 19
 REPLY_EXCERPT_MAX = 240
 
 
@@ -2961,9 +2962,17 @@ def inbound_reply_context(message: dict[str, Any]) -> dict[str, str]:
     """
     ref = message.get("message_reference") or {}
     if not isinstance(ref, dict):
-        return {}
+        ref = {}
     parent_id = str(ref.get("message_id", "") or "").strip()
     if not parent_id:
+        # Discord stamps a native reply as type 19 (REPLY) even when the
+        # reference itself is missing or empty. Without this branch a reply
+        # whose parent was lost is indistinguishable from an ordinary message,
+        # and the agent silently answers the wrong question. Reported as a
+        # question by a reviewer: "could you detect that a reply was attempted,
+        # but unknown which message it links to?" Yes — this is how.
+        if int(message.get("type", 0) or 0) == DISCORD_MESSAGE_TYPE_REPLY or ref:
+            return {"reply_to_status": "UNRESOLVED"}
         return {}
     out = {"reply_to_message_id": parent_id}
     parent = message.get("referenced_message") or {}
@@ -2988,6 +2997,14 @@ def inbound_reply_envelope_lines(message: dict[str, Any]) -> list[str]:
     ctx = inbound_reply_context(message)
     if not ctx:
         return []
+    if ctx.get("reply_to_status") == "UNRESOLVED":
+        # Loud on purpose. A silently dropped parent is worse than a visible
+        # one, because the agent cannot know to ask which message was meant.
+        return [
+            "reply_to_status: UNRESOLVED",
+            "reply_to_note: the human replied to a message but the parent "
+            "reference did not survive; ask which message they meant",
+        ]
     lines = [f"reply_to_message_id: {ctx['reply_to_message_id']}"]
     if ctx.get("reply_to_from_display"):
         lines.append(f"reply_to_from_display: {ctx['reply_to_from_display']}")
