@@ -3313,7 +3313,7 @@ class InboundAttachmentTests(unittest.TestCase):
 
     def test_summarizing_never_fetches(self) -> None:
         """The summary is what makes an attachment DETECTABLE; it must be free."""
-        with mock.patch.object(common.urllib.request, "urlopen") as urlopen:
+        with mock.patch.object(common, "attachment_urlopen") as urlopen:
             summaries = common.inbound_attachment_summaries({"attachments": [self._cdn()]})
         urlopen.assert_not_called()
         self.assertEqual(summaries[0]["filename"], "shot.png")
@@ -3338,35 +3338,35 @@ class InboundAttachmentTests(unittest.TestCase):
     def test_an_arbitrary_host_is_never_fetched(self) -> None:
         """The url comes off an inbound payload, so it is attacker-controlled."""
         message = {"attachments": [{**self._cdn(), "url": "https://evil.example/x.png"}]}
-        with mock.patch.object(common.urllib.request, "urlopen") as urlopen:
+        with mock.patch.object(common, "attachment_urlopen") as urlopen:
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         urlopen.assert_not_called()
         self.assertEqual(out[0]["status"], "skipped_untrusted_host")
 
     def test_a_localhost_url_is_never_fetched(self) -> None:
         message = {"attachments": [{**self._cdn(), "url": "https://127.0.0.1:9200/_all"}]}
-        with mock.patch.object(common.urllib.request, "urlopen") as urlopen:
+        with mock.patch.object(common, "attachment_urlopen") as urlopen:
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         urlopen.assert_not_called()
         self.assertEqual(out[0]["status"], "skipped_untrusted_host")
 
     def test_plain_http_on_a_cdn_host_is_refused(self) -> None:
         message = {"attachments": [{**self._cdn(), "url": "http://cdn.discordapp.com/a/b/c.png"}]}
-        with mock.patch.object(common.urllib.request, "urlopen") as urlopen:
+        with mock.patch.object(common, "attachment_urlopen") as urlopen:
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         urlopen.assert_not_called()
         self.assertEqual(out[0]["status"], "skipped_untrusted_host")
 
     def test_a_host_that_merely_ends_in_the_cdn_name_is_refused(self) -> None:
         message = {"attachments": [{**self._cdn(), "url": "https://cdn.discordapp.com.evil.example/x"}]}
-        with mock.patch.object(common.urllib.request, "urlopen") as urlopen:
+        with mock.patch.object(common, "attachment_urlopen") as urlopen:
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         urlopen.assert_not_called()
         self.assertEqual(out[0]["status"], "skipped_untrusted_host")
 
     def test_the_media_proxy_host_is_allowed(self) -> None:
         message = {"attachments": [{**self._cdn(), "url": "https://media.discordapp.net/a/b/c.png"}]}
-        with mock.patch.object(common.urllib.request, "urlopen", return_value=self._response(b"png!")):
+        with mock.patch.object(common, "attachment_urlopen", return_value=self._response(b"png!")):
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         self.assertEqual(out[0]["status"], "saved")
 
@@ -3374,7 +3374,7 @@ class InboundAttachmentTests(unittest.TestCase):
 
     def test_the_bytes_are_written_and_the_receipt_names_the_file(self) -> None:
         message = {"attachments": [self._cdn()]}
-        with mock.patch.object(common.urllib.request, "urlopen", return_value=self._response(b"PNG-BYTES")):
+        with mock.patch.object(common, "attachment_urlopen", return_value=self._response(b"PNG-BYTES")):
             out = common.download_inbound_attachments("in-77", common.inbound_attachment_summaries(message))
         self.assertEqual(out[0]["status"], "saved")
         path = out[0]["local_path"]
@@ -3386,7 +3386,7 @@ class InboundAttachmentTests(unittest.TestCase):
     def test_a_traversing_filename_cannot_escape_the_attachment_directory(self) -> None:
         """The filename is attacker-controlled: it must not choose the path."""
         message = {"attachments": [self._cdn(name="../../../../etc/cron.d/pwned")]}
-        with mock.patch.object(common.urllib.request, "urlopen", return_value=self._response(b"x")):
+        with mock.patch.object(common, "attachment_urlopen", return_value=self._response(b"x")):
             out = common.download_inbound_attachments("in-77", common.inbound_attachment_summaries(message))
         self.assertEqual(out[0]["status"], "saved")
         expected_dir = os.path.realpath(common.chat_ingress_attachment_dir("in-77"))
@@ -3394,7 +3394,7 @@ class InboundAttachmentTests(unittest.TestCase):
 
     def test_an_absolute_filename_cannot_choose_the_path(self) -> None:
         message = {"attachments": [self._cdn(name="/etc/passwd")]}
-        with mock.patch.object(common.urllib.request, "urlopen", return_value=self._response(b"x")):
+        with mock.patch.object(common, "attachment_urlopen", return_value=self._response(b"x")):
             out = common.download_inbound_attachments("in-77", common.inbound_attachment_summaries(message))
         expected_dir = os.path.realpath(common.chat_ingress_attachment_dir("in-77"))
         self.assertEqual(os.path.dirname(os.path.realpath(out[0]["local_path"])), expected_dir)
@@ -3402,8 +3402,8 @@ class InboundAttachmentTests(unittest.TestCase):
     def test_two_attachments_sharing_a_filename_do_not_overwrite_each_other(self) -> None:
         message = {"attachments": [self._cdn(index=0), self._cdn(index=1)]}
         with mock.patch.object(
-            common.urllib.request,
-            "urlopen",
+            common,
+            "attachment_urlopen",
             side_effect=[self._response(b"first"), self._response(b"second")],
         ):
             out = common.download_inbound_attachments("in-77", common.inbound_attachment_summaries(message))
@@ -3414,10 +3414,92 @@ class InboundAttachmentTests(unittest.TestCase):
 
     # --- the guards ---------------------------------------------------------
 
+    def test_a_redirect_off_the_allowlist_is_refused(self) -> None:
+        """The allow-list was one 302 wide (mc-k6jn2).
+
+        urlopen follows redirects, and _attachment_url_is_allowed only ever saw
+        the url that came off the inbound payload. Verified before the fix with
+        a local server that 302'd to its own /internal: the body came back and
+        geturl() reported 127.0.0.1.
+        """
+        handler = common._AttachmentRedirectHandler()
+        request = urllib.request.Request("https://cdn.discordapp.com/attachments/1/2/a.png")
+
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            handler.redirect_request(
+                request,
+                io.BytesIO(b""),
+                302,
+                "Found",
+                {},
+                "http://127.0.0.1:8080/internal",
+            )
+
+        self.assertIn("allow-list", str(caught.exception))
+
+    def test_a_redirect_that_stays_on_the_cdn_is_still_followed(self) -> None:
+        """Coverage control for the test above.
+
+        Refusing every redirect would also make that test pass, and would break
+        a CDN that legitimately redirects. This pins that the fix discriminates
+        rather than just says no.
+        """
+        handler = common._AttachmentRedirectHandler()
+        request = urllib.request.Request("https://cdn.discordapp.com/attachments/1/2/a.png")
+
+        redirected = handler.redirect_request(
+            request,
+            io.BytesIO(b""),
+            302,
+            "Found",
+            {},
+            "https://media.discordapp.net/attachments/1/2/a.png",
+        )
+
+        self.assertIsNotNone(redirected)
+        self.assertEqual(redirected.full_url, "https://media.discordapp.net/attachments/1/2/a.png")
+
+    def test_the_handler_is_actually_installed_on_the_opener(self) -> None:
+        """A control that exists and is never wired in protects nothing."""
+        opened: dict[str, Any] = {}
+
+        class _Opener:
+            def __init__(self, *handlers):
+                opened["handlers"] = handlers
+
+            def open(self, request, timeout=None):
+                opened["timeout"] = timeout
+                return "response"
+
+        with mock.patch.object(common.urllib.request, "build_opener", _Opener):
+            result = common.attachment_urlopen(
+                urllib.request.Request("https://cdn.discordapp.com/a.png"), timeout=7
+            )
+
+        self.assertEqual(result, "response")
+        self.assertEqual(opened["timeout"], 7)
+        self.assertIn(common._AttachmentRedirectHandler, opened["handlers"])
+
+    def test_a_refused_redirect_is_recorded_rather_than_silently_dropped(self) -> None:
+        """The message must still deliver, with the failure visible."""
+        message = {"attachments": [self._cdn()]}
+        refusal = urllib.error.HTTPError(
+            "http://127.0.0.1/internal", 302, "refusing a redirect off the Discord CDN allow-list", {}, None
+        )
+
+        with mock.patch.object(common, "attachment_urlopen", side_effect=refusal):
+            out = common.download_inbound_attachments("in-redirect", common.inbound_attachment_summaries(message))
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["status"], "failed")
+        self.assertIn("redirect", out[0]["error"])
+        self.assertNotIn("local_path", out[0])
+
+
     def test_no_authorization_header_reaches_the_cdn(self) -> None:
         """A CDN url needs no auth; sending the bot token would leak it."""
         message = {"attachments": [self._cdn()]}
-        with mock.patch.object(common.urllib.request, "urlopen", return_value=self._response(b"x")) as urlopen:
+        with mock.patch.object(common, "attachment_urlopen", return_value=self._response(b"x")) as urlopen:
             common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         request = urlopen.call_args.args[0]
         self.assertIsNone(request.get_header("Authorization"))
@@ -3425,7 +3507,7 @@ class InboundAttachmentTests(unittest.TestCase):
     def test_the_fetch_is_given_a_timeout(self) -> None:
         """A slow CDN must not hold a gateway worker forever."""
         message = {"attachments": [self._cdn()]}
-        with mock.patch.object(common.urllib.request, "urlopen", return_value=self._response(b"x")) as urlopen:
+        with mock.patch.object(common, "attachment_urlopen", return_value=self._response(b"x")) as urlopen:
             common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         self.assertEqual(
             urlopen.call_args.kwargs.get("timeout"),
@@ -3434,7 +3516,7 @@ class InboundAttachmentTests(unittest.TestCase):
 
     def test_a_declared_oversize_file_is_not_fetched_at_all(self) -> None:
         message = {"attachments": [self._cdn(size=common.INBOUND_ATTACHMENT_MAX_BYTES + 1)]}
-        with mock.patch.object(common.urllib.request, "urlopen") as urlopen:
+        with mock.patch.object(common, "attachment_urlopen") as urlopen:
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         urlopen.assert_not_called()
         self.assertEqual(out[0]["status"], "skipped_too_large")
@@ -3443,7 +3525,7 @@ class InboundAttachmentTests(unittest.TestCase):
         """Content-Length and ``size`` are claims made by the far end."""
         oversized = b"x" * (common.INBOUND_ATTACHMENT_MAX_BYTES + 1024)
         message = {"attachments": [self._cdn(size=4)]}
-        with mock.patch.object(common.urllib.request, "urlopen", return_value=self._response(oversized)):
+        with mock.patch.object(common, "attachment_urlopen", return_value=self._response(oversized)):
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         self.assertEqual(out[0]["status"], "failed")
         self.assertNotIn("local_path", out[0])
@@ -3457,7 +3539,7 @@ class InboundAttachmentTests(unittest.TestCase):
         count = (common.INBOUND_ATTACHMENT_MAX_TOTAL_BYTES // chunk) + 2
         message = {"attachments": [self._cdn(name=f"f{i}.bin", size=chunk, index=i) for i in range(count)]}
         with mock.patch.object(
-            common.urllib.request, "urlopen", side_effect=lambda *a, **k: self._response(b"y" * chunk)
+            common, "attachment_urlopen", side_effect=lambda *a, **k: self._response(b"y" * chunk)
         ):
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         saved = [item for item in out if item["status"] == "saved"]
@@ -3468,7 +3550,7 @@ class InboundAttachmentTests(unittest.TestCase):
 
     def test_an_empty_body_is_not_recorded_as_a_saved_file(self) -> None:
         message = {"attachments": [self._cdn()]}
-        with mock.patch.object(common.urllib.request, "urlopen", return_value=self._response(b"")):
+        with mock.patch.object(common, "attachment_urlopen", return_value=self._response(b"")):
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         self.assertEqual(out[0]["status"], "failed")
 
@@ -3476,7 +3558,7 @@ class InboundAttachmentTests(unittest.TestCase):
         """Julius asked to be able to tell a transmission error from a drop."""
         message = {"attachments": [self._cdn()]}
         with mock.patch.object(
-            common.urllib.request, "urlopen", side_effect=urllib.error.URLError("cdn down")
+            common, "attachment_urlopen", side_effect=urllib.error.URLError("cdn down")
         ):
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))
         self.assertEqual(out[0]["status"], "failed")
@@ -3485,8 +3567,8 @@ class InboundAttachmentTests(unittest.TestCase):
     def test_one_failure_does_not_stop_the_next_attachment(self) -> None:
         message = {"attachments": [self._cdn(name="a.png", index=0), self._cdn(name="b.png", index=1)]}
         with mock.patch.object(
-            common.urllib.request,
-            "urlopen",
+            common,
+            "attachment_urlopen",
             side_effect=[urllib.error.URLError("boom"), self._response(b"ok")],
         ):
             out = common.download_inbound_attachments("in-1", common.inbound_attachment_summaries(message))

@@ -3532,7 +3532,7 @@ class InboundAttachmentRoutingTests(unittest.TestCase):
         ), mock.patch.object(
             common, "deliver_session_message", return_value={"status": "accepted"}
         ) as deliver, mock.patch.object(
-            common.urllib.request, "urlopen", **urlopen_result
+            common, "attachment_urlopen", **urlopen_result
         ):
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
         return outcome, deliver
@@ -3642,7 +3642,7 @@ class InboundAttachmentRoutingTests(unittest.TestCase):
         }
 
         with mock.patch.object(
-            common.urllib.request, "urlopen", side_effect=AssertionError("must not fetch")
+            common, "attachment_urlopen", side_effect=AssertionError("must not fetch")
         ):
             outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
 
