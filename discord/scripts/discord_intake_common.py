@@ -3237,13 +3237,54 @@ def inbound_attachment_summaries(message: dict[str, Any]) -> list[dict[str, Any]
     return out
 
 
+class _AttachmentRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-check the allow-list on every hop, not just the first.
+
+    urlopen follows redirects, so checking only the url that came off the
+    inbound payload leaves the allow-list one 302 wide. A redirect from an
+    allow-listed host to http://127.0.0.1/ was followed and its body returned,
+    verified against a local server before this handler existed.
+
+    That needs a redirect FROM Discord's own CDN, so it is defence in depth
+    rather than something a message sender can reach today. It is closed anyway
+    because the allow-list is the whole of the protection here, and a control
+    that holds only for the first hop is not the control anyone reading
+    _attachment_url_is_allowed would assume they have.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _attachment_url_is_allowed(newurl):
+            raise urllib.error.HTTPError(
+                newurl,
+                code,
+                "refusing a redirect off the Discord CDN allow-list",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def attachment_urlopen(request: urllib.request.Request, timeout: float):
+    """The one way attachment bytes are fetched.
+
+    A dedicated opener rather than urllib.request.urlopen, because the redirect
+    handler has to be attached to something and installing it globally would
+    put a Discord-CDN allow-list in front of discord_api_request's calls to
+    discord.com. Kept as a named module-level function so tests have a seam
+    that is this fetch and not every fetch in the module.
+    """
+    opener = urllib.request.build_opener(_AttachmentRedirectHandler)
+    return opener.open(request, timeout=timeout)
+
+
 def _fetch_attachment_bytes(url: str, limit: int) -> bytes:
     """Fetch up to ``limit`` bytes, raising if the body runs past it.
 
     Reads in chunks rather than trusting Content-Length, which is a claim made
     by the far end. Sends no Authorization header: a Discord CDN url needs no
     auth, and attaching the bot token would hand the credential to whatever
-    host answered.
+    host answered. Redirects are followed only while they stay on the
+    allow-list, see _AttachmentRedirectHandler.
     """
     request = urllib.request.Request(
         url,
@@ -3252,7 +3293,7 @@ def _fetch_attachment_bytes(url: str, limit: int) -> bytes:
     )
     chunks: list[bytes] = []
     total = 0
-    with urllib.request.urlopen(request, timeout=INBOUND_ATTACHMENT_TIMEOUT_SECONDS) as response:
+    with attachment_urlopen(request, timeout=INBOUND_ATTACHMENT_TIMEOUT_SECONDS) as response:
         while True:
             chunk = response.read(65536)
             if not chunk:
