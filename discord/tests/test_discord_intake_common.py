@@ -3138,3 +3138,88 @@ class InboundReplyContextTests(unittest.TestCase):
             {"message_reference": {"message_id": "9"}, "referenced_message": {"author": "nope"}},
         ):
             common.inbound_reply_context(bad)
+
+
+class AttachmentTests(unittest.TestCase):
+    """Sending a file into a Discord message.
+
+    Requested by a human who did not want ephemeral clarification images
+    committed to the repo just to be linked: "sometimes we may be exchanging
+    images just to clarify a visual miscommunication ... that do not belong in
+    the repo."
+    """
+
+    def _tmpfile(self, name, content):
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, name)
+        with open(path, "wb") as handle:
+            handle.write(content)
+        return path
+
+    def test_multipart_carries_payload_json_and_the_file(self):
+        body, content_type = common._encode_multipart(
+            {"content": "hi"}, [("files[0]", "shot.png", b"\x89PNG\x00\xff")]
+        )
+        boundary = content_type.split("boundary=")[1]
+        text = body.decode("latin-1")
+        self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
+        self.assertIn('name="payload_json"', text)
+        self.assertIn('name="files[0]"; filename="shot.png"', text)
+        self.assertTrue(text.endswith(f"--{boundary}--\r\n"))
+
+    def test_binary_content_survives_encoding(self):
+        raw = bytes(range(256))
+        body, _ = common._encode_multipart(None, [("files[0]", "b.bin", raw)])
+        self.assertIn(raw, body)
+
+    def test_the_boundary_is_random_per_call(self):
+        """A fixed boundary could appear inside an uploaded file and split it."""
+        first = common._encode_multipart(None, [("files[0]", "a", b"x")])[1]
+        second = common._encode_multipart(None, [("files[0]", "a", b"x")])[1]
+        self.assertNotEqual(first, second)
+
+    def test_a_filename_cannot_inject_a_header(self):
+        body, _ = common._encode_multipart(None, [("files[0]", 'a"b\r\nX-Injected: y', b"z")])
+        text = body.decode("latin-1")
+        self.assertNotIn("\r\nX-Injected", text)
+        self.assertEqual(text.count("X-Injected"), 1)
+
+    def test_read_attachments_returns_basename_and_bytes(self):
+        path = self._tmpfile("a.png", b"x" * 10)
+        self.assertEqual(common.read_attachments([path]), [("a.png", b"x" * 10)])
+
+    def test_read_attachments_rejects_missing_empty_and_oversized(self):
+        missing = os.path.join(tempfile.mkdtemp(), "nope.png")
+        empty = self._tmpfile("e.png", b"")
+        with self.assertRaises(ValueError):
+            common.read_attachments([missing])
+        with self.assertRaises(ValueError):
+            common.read_attachments([empty])
+        with self.assertRaises(ValueError):
+            common.read_attachments([self._tmpfile("a.png", b"x")] * (common.ATTACHMENT_MAX_COUNT + 1))
+
+    def test_post_channel_message_declares_each_attachment(self):
+        seen = {}
+
+        def fake(method, path, payload=None, files=None, **kwargs):
+            seen["payload"] = payload
+            seen["files"] = files
+            return {"id": "1"}
+
+        with mock.patch.object(common, "discord_api_request", fake):
+            common.post_channel_message("123", "body", attachments=[("a.png", b"x")])
+        self.assertEqual(seen["payload"]["attachments"], [{"id": 0, "filename": "a.png"}])
+        self.assertEqual(seen["files"], [("files[0]", "a.png", b"x")])
+
+    def test_a_message_without_attachments_still_sends_plain_json(self):
+        seen = {}
+
+        def fake(method, path, payload=None, files=None, **kwargs):
+            seen["files"] = files
+            seen["payload"] = payload
+            return {"id": "1"}
+
+        with mock.patch.object(common, "discord_api_request", fake):
+            common.post_channel_message("123", "body")
+        self.assertIsNone(seen["files"])
+        self.assertNotIn("attachments", seen["payload"])

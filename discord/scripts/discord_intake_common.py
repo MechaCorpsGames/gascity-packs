@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
+import uuid
 import pathlib
 import re
 import socket
@@ -2228,11 +2229,75 @@ def verify_discord_signature(public_key_hex: str, timestamp: str, payload: bytes
     return bool(result and result.returncode == 0)
 
 
+ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024
+ATTACHMENT_MAX_COUNT = 10
+
+
+def _encode_multipart(
+    payload: Any,
+    files: list[tuple[str, str, bytes]],
+) -> tuple[bytes, str]:
+    """Encode payload_json plus files[N] parts as multipart/form-data.
+
+    files entries are (field_name, filename, content). The boundary is random
+    per call; a fixed one could appear inside an uploaded file and split it.
+    """
+    boundary = "----gascity" + uuid.uuid4().hex
+    out: list[bytes] = []
+    sep = f"--{boundary}\r\n".encode("utf-8")
+    if payload is not None:
+        out.append(sep)
+        out.append(b'Content-Disposition: form-data; name="payload_json"\r\n')
+        out.append(b"Content-Type: application/json\r\n\r\n")
+        out.append(json.dumps(payload).encode("utf-8"))
+        out.append(b"\r\n")
+    for field, filename, content in files:
+        safe = str(filename).replace("\\", "_").replace('"', "_").replace("\r", "").replace("\n", "")
+        out.append(sep)
+        out.append(
+            f'Content-Disposition: form-data; name="{field}"; filename="{safe}"\r\n'.encode("utf-8")
+        )
+        out.append(b"Content-Type: application/octet-stream\r\n\r\n")
+        out.append(content)
+        out.append(b"\r\n")
+    out.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(out), f"multipart/form-data; boundary={boundary}"
+
+
+def read_attachments(paths: list[str]) -> list[tuple[str, bytes]]:
+    """Read attachment files, refusing the cases Discord would reject anyway.
+
+    Returns (basename, content). Raises ValueError with a reason a human can
+    act on rather than letting the API return an opaque 400.
+    """
+    if len(paths) > ATTACHMENT_MAX_COUNT:
+        raise ValueError(f"at most {ATTACHMENT_MAX_COUNT} attachments per message, got {len(paths)}")
+    out: list[tuple[str, bytes]] = []
+    for raw in paths:
+        path = os.path.expanduser(str(raw).strip())
+        if not path:
+            continue
+        if not os.path.isfile(path):
+            raise ValueError(f"attachment not found: {path}")
+        size = os.path.getsize(path)
+        if size == 0:
+            raise ValueError(f"attachment is empty: {path}")
+        if size > ATTACHMENT_MAX_BYTES:
+            raise ValueError(
+                f"attachment {os.path.basename(path)} is {size} bytes, over the "
+                f"{ATTACHMENT_MAX_BYTES}-byte limit for a standard Discord upload"
+            )
+        with open(path, "rb") as handle:
+            out.append((os.path.basename(path), handle.read()))
+    return out
+
+
 def discord_api_request(
     method: str,
     path: str,
     payload: Any = None,
     bot_token: str | None = None,
+    files: list[tuple[str, str, bytes]] | None = None,
 ) -> Any:
     if path.startswith("http://") or path.startswith("https://"):
         url = path
@@ -2246,7 +2311,13 @@ def discord_api_request(
     token = load_bot_token() if bot_token is None else bot_token
     if token:
         headers["Authorization"] = f"Bot {token}"
-    if payload is not None:
+    if files:
+        # Discord takes attachments as multipart/form-data: the JSON goes in a
+        # payload_json part and each file in a files[N] part. Built by hand
+        # because the pack has no third-party HTTP dependency.
+        body, content_type = _encode_multipart(payload, files)
+        headers["Content-Type"] = content_type
+    elif payload is not None:
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
@@ -5516,6 +5587,7 @@ def publish_binding_message(
     source_context: dict[str, str] | None = None,
     source_session_name: str = "",
     source_session_id: str = "",
+    attachments: list[tuple[str, bytes]] | None = None,
 ) -> dict[str, Any]:
     app_name = validate_app_name(binding.get("app", ""))
     bot_token: str | None = None
@@ -5561,19 +5633,21 @@ def publish_binding_message(
     )
     if not conversation_id:
         raise ValueError("binding is missing a destination conversation_id")
+    # Pass bot_token only for a named app, and attachments only when there are
+    # some, so the plain call signature stays exactly as it was for every
+    # existing caller and test. Several tests assert the whole call, e.g.
+    # post_channel_message.assert_called_once_with("333", "hello humans",
+    # reply_to_message_id=""), so an unconditional kwarg here is a breakage.
+    post_kwargs: dict[str, Any] = {"reply_to_message_id": reply_target}
     if app_name:
-        response = post_channel_message(
-            conversation_id,
-            body,
-            reply_to_message_id=reply_target,
-            bot_token=bot_token,
-        )
-    else:
-        response = post_channel_message(
-            conversation_id,
-            body,
-            reply_to_message_id=reply_target,
-        )
+        post_kwargs["bot_token"] = bot_token
+    if attachments:
+        post_kwargs["attachments"] = attachments
+    response = post_channel_message(
+        conversation_id,
+        body,
+        **post_kwargs,
+    )
     remote_message_id = str((response or {}).get("id", "")).strip()
     if not remote_message_id:
         raise DiscordAPIError("discord publish returned no message id")
@@ -5787,6 +5861,7 @@ def post_channel_message(
     channel_id: str,
     body: str,
     reply_to_message_id: str = "",
+    attachments: list[tuple[str, bytes]] | None = None,
     *,
     bot_token: str | None = None,
 ) -> Any:
@@ -5794,6 +5869,16 @@ def post_channel_message(
         "content": body,
         "allowed_mentions": {"parse": ["users"]},
     }
+    files: list[tuple[str, str, bytes]] | None = None
+    if attachments:
+        payload["attachments"] = [
+            {"id": index, "filename": filename}
+            for index, (filename, _) in enumerate(attachments)
+        ]
+        files = [
+            (f"files[{index}]", filename, content)
+            for index, (filename, content) in enumerate(attachments)
+        ]
     reply_to_message_id = str(reply_to_message_id).strip()
     if reply_to_message_id:
         payload["message_reference"] = {
@@ -5802,9 +5887,18 @@ def post_channel_message(
             "fail_if_not_exists": False,
         }
     path = f"/channels/{urllib.parse.quote(str(channel_id))}/messages"
-    if bot_token is None:
-        return discord_api_request("POST", path, payload=payload)
-    return discord_api_request("POST", path, payload=payload, bot_token=bot_token)
+    # Pass a kwarg only when it carries something, the same rule the callers
+    # above follow. Upstream's test doubles mirror the old signature exactly:
+    # test_discord_multibot_cli_contract.py's fake_discord_api_request takes
+    # (method, path, payload, bot_token) and nothing else, so an unconditional
+    # files= raises TypeError there. This code is headed upstream, so the fix
+    # belongs here rather than in their fake.
+    request_kwargs: dict[str, Any] = {"payload": payload}
+    if files:
+        request_kwargs["files"] = files
+    if bot_token is not None:
+        request_kwargs["bot_token"] = bot_token
+    return discord_api_request("POST", path, **request_kwargs)
 
 
 def discord_jump_url(guild_id: str, conversation_id: str) -> str:
