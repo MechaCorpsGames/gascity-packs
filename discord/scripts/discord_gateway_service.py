@@ -349,7 +349,7 @@ def recover_message_for_routing(
         debug["content_source"] = "rest_fallback"
     else:
         debug["content_source"] = "gateway_empty_rest_empty"
-    for key in ("mentions", "message_reference", "member"):
+    for key in ("mentions", "message_reference", "member", "attachments"):
         current = recovered.get(key)
         if current in (None, "", [], {}):
             fetched_value = fetched.get(key)
@@ -763,6 +763,7 @@ def build_human_envelope(
     mentioned_aliases: list[str],
     delivery: str,
     ingress_id: str,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> str:
     conversation_value, conversation_key = conversation_fields(message, channel_info)
     binding_id = str(binding.get("id", "")).strip()
@@ -779,6 +780,8 @@ def build_human_envelope(
         f"discord_message_id: {message_id}",
         f"from_display: {display_name_from_message(message)}",
         f"from_user_id: {str((message.get('author') or {}).get('id', '')).strip()}",
+        *common.inbound_reply_envelope_lines(message),
+        *common.inbound_attachment_envelope_lines(attachments or []),
         f"delivery: {delivery}",
         f"mentioned_aliases_json: {json.dumps(mentioned_aliases)}",
         f"untrusted_body_json: {json.dumps(body)}",
@@ -804,6 +807,7 @@ def build_room_launch_envelope(
     body: str,
     mentioned_handles: list[str],
     ingress_id: str,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> str:
     guild_id = str(message.get("guild_id", "")).strip()
     channel_id = str(message.get("channel_id", "")).strip()
@@ -818,6 +822,8 @@ def build_room_launch_envelope(
         f"discord_message_id: {str(message.get('id', '')).strip()}",
         f"from_display: {display_name_from_message(message)}",
         f"from_user_id: {str((message.get('author') or {}).get('id', '')).strip()}",
+        *common.inbound_reply_envelope_lines(message),
+        *common.inbound_attachment_envelope_lines(attachments or []),
         "delivery: targeted",
         f"mentioned_handles_json: {json.dumps(mentioned_handles)}",
         f"launch_id: {str(launch.get('launch_id', '')).strip()}",
@@ -853,6 +859,7 @@ def build_room_launch_thread_envelope(
     ingress_id: str,
     routing_mode: str,
     reply_to_id: str,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> str:
     guild_id = str(message.get("guild_id", "")).strip()
     channel_id = str(message.get("channel_id", "")).strip()
@@ -871,6 +878,8 @@ def build_room_launch_thread_envelope(
         f"discord_message_id: {str(message.get('id', '')).strip()}",
         f"from_display: {display_name_from_message(message)}",
         f"from_user_id: {str((message.get('author') or {}).get('id', '')).strip()}",
+        *common.inbound_reply_envelope_lines(message),
+        *common.inbound_attachment_envelope_lines(attachments or []),
         "delivery: targeted",
         f"routing_mode: {routing_mode}",
         f"reply_to_discord_message_id: {reply_to_id}",
@@ -1256,6 +1265,8 @@ def save_rejected_ingress_receipt(
             "from_user_id": str((message.get("author") or {}).get("id", "")).strip(),
             "from_display": display_name_from_message(message),
             "body_preview": ingress_preview(message, bot_user_id),
+            **common.inbound_reply_context(message),
+            "attachments": common.inbound_attachment_summaries(message),
             "status": status,
             "reason": reason,
             "message_debug": dict(message_debug or {}),
@@ -1298,6 +1309,8 @@ def reject_ingress_before_processing(
                 "from_user_id": str((message.get("author") or {}).get("id", "")).strip(),
                 "from_display": display_name_from_message(message),
                 "body_preview": ingress_preview(message, bot_user_id),
+                **common.inbound_reply_context(message),
+                "attachments": common.inbound_attachment_summaries(message),
                 "status": "failed_claim_conflict",
                 "reason": str(receipt.get("reason", "")).strip() or "ingress_claim_unreadable",
                 "message_debug": dict(message_debug or {}),
@@ -1320,7 +1333,8 @@ def process_room_launch_message(
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     body = strip_bot_mentions(str(message.get("content", "")), bot_user_id)
-    if not body:
+    attachments = common.inbound_attachment_summaries(message)
+    if not body and not attachments:
         receipt = persist_ingress_receipt(
             {
                 **base_receipt,
@@ -1439,6 +1453,7 @@ def process_room_launch_message(
             "from_user_id": str((message.get("author") or {}).get("id", "")).strip(),
             "from_display": display_name_from_message(message),
             "body_preview": ingress_preview(message, bot_user_id),
+            **common.inbound_reply_context(message),
         }
     )
     try:
@@ -1457,6 +1472,17 @@ def process_room_launch_message(
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
 
     target_selector = participant_delivery_selector(launch)
+    # Fetched here, after the message is known to have somewhere to go and
+    # before the envelope is built. Earlier would download for every message in
+    # an ambient room the bot only watches; later would mean building an
+    # envelope that names files not yet on disk, and
+    # test_the_envelope_hands_the_session_a_path_it_can_read pins that.
+    #
+    # Upstream moved the pending receipt to AFTER the envelope (it now carries
+    # delivery_protocol_version and per-target idempotency keys), so the
+    # download lands before that single persist and the pre-download persist
+    # plus re-persist this commit originally needed is gone.
+    attachments = common.download_inbound_attachments(ingress_id, attachments)
     envelope = build_room_launch_envelope(
         launcher=launcher,
         launch=launch,
@@ -1464,6 +1490,7 @@ def process_room_launch_message(
         body=body,
         mentioned_handles=mentioned_handles,
         ingress_id=ingress_id,
+        attachments=attachments,
     )
     idempotency_key = f"ingress:{ingress_id}:target:{target_selector}"
     receipt = persist_ingress_receipt(
@@ -1477,6 +1504,7 @@ def process_room_launch_message(
             "launch_id": launch_id,
             "mentioned_handles": mentioned_handles,
             "qualified_handle": qualified_handle,
+            "attachments": attachments,
             "targets": [
                 {
                     "session_name": target_selector,
@@ -1510,7 +1538,8 @@ def process_room_launch_thread_message(
     if isinstance(refreshed_launch, dict):
         launch = refreshed_launch
     body = strip_bot_mentions(str(message.get("content", "")), bot_user_id)
-    if not body:
+    attachments = common.inbound_attachment_summaries(message)
+    if not body and not attachments:
         receipt = persist_ingress_receipt(
             {
                 **base_receipt,
@@ -1604,6 +1633,17 @@ def process_room_launch_thread_message(
         return {"status": "failed_lookup", "ingress_id": ingress_id, "receipt": receipt}
     target_selector = participant_delivery_selector(target_participant)
 
+    # Fetched here, after the message is known to have somewhere to go and
+    # before the envelope is built. Earlier would download for every message in
+    # an ambient room the bot only watches; later would mean building an
+    # envelope that names files not yet on disk, and
+    # test_the_envelope_hands_the_session_a_path_it_can_read pins that.
+    #
+    # Upstream moved the pending receipt to AFTER the envelope (it now carries
+    # delivery_protocol_version and per-target idempotency keys), so the
+    # download lands before that single persist and the pre-download persist
+    # plus re-persist this commit originally needed is gone.
+    attachments = common.download_inbound_attachments(ingress_id, attachments)
     envelope = build_room_launch_thread_envelope(
         launcher=launcher,
         launch=launch,
@@ -1614,6 +1654,7 @@ def process_room_launch_thread_message(
         ingress_id=ingress_id,
         routing_mode=routing_mode,
         reply_to_id=reply_to_id,
+        attachments=attachments,
     )
     idempotency_key = f"ingress:{ingress_id}:target:{target_selector}"
     receipt = persist_ingress_receipt(
@@ -1628,6 +1669,7 @@ def process_room_launch_thread_message(
             "routing_mode": routing_mode,
             "mentioned_handles": mentioned_handles,
             "qualified_handle": target_handle,
+            "attachments": attachments,
             "targets": [
                 {
                     "session_name": target_selector,
@@ -1667,6 +1709,10 @@ def process_inbound_message(
     recovery_token = common.load_bot_token(normalized_app_name) if normalized_app_name else None
     message, message_debug = recover_message_for_routing(message, bot_token=recovery_token)
     author = message.get("author") or {}
+    # Read before anything can discard the message. A screenshot sent with no
+    # caption has empty content, so without this the message is thrown away as
+    # empty and no receipt ever records that a file was attached.
+    attachments = common.inbound_attachment_summaries(message)
 
     config = common.load_config()
     mentioned_configured_bots = configured_bot_mentions(message, config) if guild_id else set()
@@ -1756,6 +1802,7 @@ def process_inbound_message(
             "from_display": display_name_from_message(message),
             "body_preview": preview,
             "message_debug": dict(message_debug or {}),
+            "attachments": attachments,
             "status": "processing",
             "delivery_protocol_version": INGRESS_DELIVERY_PROTOCOL_VERSION,
             "targets": [],
@@ -1778,6 +1825,7 @@ def process_inbound_message(
                     "from_display": display_name_from_message(message),
                     "body_preview": preview,
                     "message_debug": dict(message_debug or {}),
+                    "attachments": attachments,
                     "status": "failed_claim_conflict",
                     "reason": str(base_receipt.get("reason", "")).strip() or "ingress_claim_unreadable",
                     "targets": [],
@@ -1830,6 +1878,7 @@ def process_inbound_message(
                         "from_display": display_name_from_message(message),
                         "body_preview": preview,
                         "message_debug": dict(message_debug or {}),
+                        "attachments": attachments,
                         "status": "processing",
                         "reason": retry_reason,
                         "targets": [],
@@ -1942,7 +1991,7 @@ def process_inbound_message(
             return {"status": "rejected_unbound", "ingress_id": ingress_id, "receipt": receipt}
 
         body = preloaded_body if preloaded_body is not None else strip_bot_mentions(str(message.get("content", "")), bot_user_id)
-        if not body:
+        if not body and not attachments:
             receipt = persist_ingress_receipt(
                 {
                     **base_receipt,
@@ -2001,6 +2050,17 @@ def process_inbound_message(
             )
             return {"status": "skipped_no_targets", "ingress_id": ingress_id, "receipt": receipt}
 
+        # Fetched here, after the message is known to have somewhere to go and
+        # before the envelope is built. Earlier would download for every message in
+        # an ambient room the bot only watches; later would mean building an
+        # envelope that names files not yet on disk, and
+        # test_the_envelope_hands_the_session_a_path_it_can_read pins that.
+        #
+        # Upstream moved the pending receipt to AFTER the envelope (it now carries
+        # delivery_protocol_version and per-target idempotency keys), so the
+        # download lands before that single persist and the pre-download persist
+        # plus re-persist this commit originally needed is gone.
+        attachments = common.download_inbound_attachments(ingress_id, attachments)
         envelope = build_human_envelope(
             binding=binding,
             message=message,
@@ -2009,6 +2069,7 @@ def process_inbound_message(
             mentioned_aliases=mentioned_aliases,
             delivery=delivery,
             ingress_id=ingress_id,
+            attachments=attachments,
         )
         receipt = persist_ingress_receipt(
             {
@@ -2018,6 +2079,7 @@ def process_inbound_message(
                 "delivery_protocol_version": INGRESS_DELIVERY_PROTOCOL_VERSION,
                 "mentioned_aliases": mentioned_aliases,
                 "delivery": delivery,
+                "attachments": attachments,
                 "targets": [
                     {
                         "session_name": target,

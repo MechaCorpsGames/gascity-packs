@@ -1,0 +1,2 @@
+description = 'Edit a Discord message this bot already sent'
+run = '../edit.sh'

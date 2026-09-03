@@ -68,6 +68,13 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--body", default="", help="Inline message body")
     parser.add_argument("--body-file", default="", help="Read the message body from a file")
+    parser.add_argument(
+        "--attach",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Attach a file to the message. Repeatable, up to 10 files, 8MB each.",
+    )
     args = parser.parse_args(argv)
 
     body = _load_body(args)
@@ -96,6 +103,11 @@ def main(argv: list[str]) -> int:
         raise SystemExit(str(exc)) from exc
 
     try:
+        attachments = common.read_attachments(list(args.attach or []))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    try:
         payload = common.publish_binding_message(
             binding,
             body,
@@ -105,6 +117,7 @@ def main(argv: list[str]) -> int:
             source_context=source_context or None,
             source_session_name=str(source_identity.get("session_name", "")).strip(),
             source_session_id=str(source_identity.get("session_id", "")).strip(),
+            attachments=attachments or None,
         )
     except (ValueError, common.DiscordAPIError) as exc:
         raise SystemExit(str(exc)) from exc

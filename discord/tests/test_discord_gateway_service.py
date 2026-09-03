@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 import os
@@ -3474,3 +3475,195 @@ class DiscordGatewayServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InboundAttachmentRoutingTests(unittest.TestCase):
+    """A screenshot must reach the session as a local file, on the real path.
+
+    Regression cover for two separate losses, both measured against live
+    receipts in the gascity discord service on 2026-09-03:
+
+    · in-1544877238179209256, a DM from Julius at 01:10:36Z, was recorded
+      ``ignored_empty`` / ``empty_message_content`` with gateway_content_length
+      0. It was a screenshot with no caption. The message was discarded before
+      anything looked at ``attachments``.
+    · every other receipt of his had no ``attachments`` key at all, so even a
+      captioned screenshot arrived as text with the image absent without trace.
+    """
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self._old_environ = os.environ.copy()
+        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        gateway_service.CHANNEL_INFO_CACHE.clear()
+        gateway_service.CHANNEL_INFO_FETCH_LOCKS.clear()
+        gateway_service.STALE_RECLAIM_LOCKS.clear()
+        gateway_service.INGRESS_PROCESS_LOCKS.clear()
+        gateway_service.AMBIENT_ROOM_BINDINGS_CACHE["config_signature"] = None
+        gateway_service.AMBIENT_ROOM_BINDINGS_CACHE["bindings"] = {}
+
+    def tearDown(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._old_environ)
+
+    @staticmethod
+    def _attachment(name: str = "shot.png") -> dict[str, object]:
+        return {
+            "id": "a-1",
+            "filename": name,
+            "content_type": "image/png",
+            "size": 9,
+            "url": f"https://cdn.discordapp.com/attachments/1/2/{name}?ex=6a9a5d70&is=1&hm=2",
+        }
+
+    @staticmethod
+    def _response(body: bytes):
+        handle = mock.MagicMock()
+        handle.read.side_effect = [body, b""]
+        handle.__enter__ = mock.Mock(return_value=handle)
+        handle.__exit__ = mock.Mock(return_value=False)
+        return handle
+
+    def _deliver_dm(self, message: dict[str, object], urlopen_result):
+        common.set_chat_binding(common.load_config(), "dm", "55", ["sky"])
+        with mock.patch.object(
+            common, "session_index_by_name", return_value={"sky": {"session_name": "sky", "state": "active"}}
+        ), mock.patch.object(
+            common, "deliver_session_message", return_value={"status": "accepted"}
+        ) as deliver, mock.patch.object(
+            common.urllib.request, "urlopen", **urlopen_result
+        ):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+        return outcome, deliver
+
+    def test_a_screenshot_with_no_caption_is_no_longer_discarded_as_empty(self) -> None:
+        message = {
+            "id": "901",
+            "channel_id": "55",
+            "content": "",
+            "attachments": [self._attachment()],
+            "author": {"id": "u-1", "username": "julius"},
+        }
+
+        outcome, deliver = self._deliver_dm(message, {"return_value": self._response(b"PNG-BYTES")})
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver.assert_called_once()
+
+    def test_the_envelope_hands_the_session_a_path_it_can_read(self) -> None:
+        message = {
+            "id": "902",
+            "channel_id": "55",
+            "content": "look at this",
+            "attachments": [self._attachment()],
+            "author": {"id": "u-1", "username": "julius"},
+        }
+
+        _, deliver = self._deliver_dm(message, {"return_value": self._response(b"PNG-BYTES")})
+
+        envelope = deliver.call_args.args[1]
+        self.assertIn("attachments_saved_count: 1", envelope)
+        receipt = common.load_chat_ingress("in-902")
+        path = receipt["attachments"][0]["local_path"]
+        self.assertIn(path, envelope)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"PNG-BYTES")
+
+    def test_text_and_an_attachment_both_arrive(self) -> None:
+        message = {
+            "id": "903",
+            "channel_id": "55",
+            "content": "the bid button overlaps the hand",
+            "attachments": [self._attachment()],
+            "author": {"id": "u-1", "username": "julius"},
+        }
+
+        _, deliver = self._deliver_dm(message, {"return_value": self._response(b"PNG-BYTES")})
+
+        envelope = deliver.call_args.args[1]
+        self.assertIn('untrusted_body_json: "the bid button overlaps the hand"', envelope)
+        self.assertIn("attachments_saved_count: 1", envelope)
+
+    def test_a_broken_download_still_delivers_the_text_and_says_so(self) -> None:
+        """"unless there was a genuine transmission error" -- it must be visible."""
+        message = {
+            "id": "904",
+            "channel_id": "55",
+            "content": "see attached",
+            "attachments": [self._attachment()],
+            "author": {"id": "u-1", "username": "julius"},
+        }
+
+        outcome, deliver = self._deliver_dm(
+            message, {"side_effect": urllib.error.URLError("cdn refused")}
+        )
+
+        self.assertEqual(outcome["status"], "delivered")
+        envelope = deliver.call_args.args[1]
+        self.assertIn('untrusted_body_json: "see attached"', envelope)
+        self.assertIn("attachments_failed_count: 1", envelope)
+        self.assertEqual(common.load_chat_ingress("in-904")["attachments"][0]["status"], "failed")
+
+    def test_a_message_with_no_attachment_gains_no_attachment_lines(self) -> None:
+        message = {
+            "id": "905",
+            "channel_id": "55",
+            "content": "just text",
+            "author": {"id": "u-1", "username": "julius"},
+        }
+
+        _, deliver = self._deliver_dm(message, {"side_effect": AssertionError("must not fetch")})
+
+        self.assertNotIn("attachments_", deliver.call_args.args[1])
+
+    def test_a_still_empty_message_is_still_ignored(self) -> None:
+        message = {
+            "id": "906",
+            "channel_id": "55",
+            "content": "",
+            "attachments": [],
+            "author": {"id": "u-1", "username": "julius"},
+        }
+
+        outcome, deliver = self._deliver_dm(message, {"side_effect": AssertionError("must not fetch")})
+
+        self.assertEqual(outcome["status"], "ignored_empty")
+        deliver.assert_not_called()
+
+    def test_an_unroutable_message_still_records_that_a_file_was_attached(self) -> None:
+        """The detection half: a receipt that knows an image existed."""
+        message = {
+            "id": "907",
+            "channel_id": "does-not-exist",
+            "content": "hello",
+            "attachments": [self._attachment()],
+            "author": {"id": "u-1", "username": "julius"},
+        }
+
+        with mock.patch.object(
+            common.urllib.request, "urlopen", side_effect=AssertionError("must not fetch")
+        ):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "rejected_unbound")
+        receipt = common.load_chat_ingress("in-907")
+        self.assertEqual(len(receipt["attachments"]), 1)
+        self.assertEqual(receipt["attachments"][0]["status"], "pending")
+
+    def test_an_attachment_recovered_over_rest_is_not_thrown_away(self) -> None:
+        """A guild message with empty gateway content is re-fetched; the
+        attachments on the re-fetched copy must survive the merge."""
+        message = {
+            "id": "908",
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "",
+            "author": {"id": "u-1", "username": "julius"},
+        }
+        fetched = {"content": "<@999> look", "attachments": [self._attachment()]}
+
+        with mock.patch.object(gateway_service, "fetch_message_via_rest", return_value=fetched):
+            recovered, _ = gateway_service.recover_message_for_routing(message)
+
+        self.assertEqual(len(recovered["attachments"]), 1)

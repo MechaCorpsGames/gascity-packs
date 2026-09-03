@@ -8,8 +8,10 @@ import fcntl
 import hashlib
 import json
 import os
+import uuid
 import pathlib
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -212,6 +214,7 @@ def ensure_layout() -> None:
         pending_modals_dir(),
         chat_publishes_dir(),
         chat_ingress_dir(),
+        chat_ingress_attachments_dir(),
         room_launches_dir(),
         channel_metadata_cache_dir(),
         peer_root_budget_dir(),
@@ -2042,6 +2045,7 @@ def list_chat_ingress() -> list[dict[str, Any]]:
 def prune_chat_ingress() -> None:
     ensure_layout()
     _prune_dir(chat_ingress_dir(), CHAT_INGRESS_RETENTION_SECONDS)
+    prune_chat_ingress_attachments()
 
 
 def prune_chat_publishes() -> None:
@@ -2062,6 +2066,22 @@ def redact_chat_ingress_record(payload: dict[str, Any]) -> dict[str, Any]:
         body["from_user_id"] = "[redacted]"
     if body.get("body_preview"):
         body["body_preview"] = "[redacted]"
+    if isinstance(body.get("attachments"), list):
+        # A filename is human content and the url carries a signed token, so
+        # both go the way of body_preview. What survives is enough to see that
+        # a file arrived and whether it saved, which is the point of the view.
+        body["attachments"] = [
+            {
+                "content_type": item.get("content_type", ""),
+                "size": item.get("size", 0),
+                "status": item.get("status", ""),
+                "filename": "[redacted]" if item.get("filename") else "",
+                "url": "[redacted]" if item.get("url") else "",
+                "local_path": "[redacted]" if item.get("local_path") else "",
+            }
+            for item in body["attachments"]
+            if isinstance(item, dict)
+        ]
     return body
 
 
@@ -2228,11 +2248,78 @@ def verify_discord_signature(public_key_hex: str, timestamp: str, payload: bytes
     return bool(result and result.returncode == 0)
 
 
+# Discord's free-tier ceiling; boosted servers and Nitro allow more. Kept as a
+# pre-flight guard so an oversized file fails with a readable reason here rather
+# than as an opaque rejection from the API. If Discord raises it, raise this.
+ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
+ATTACHMENT_MAX_COUNT = 10
+
+
+def _encode_multipart(
+    payload: Any,
+    files: list[tuple[str, str, bytes]],
+) -> tuple[bytes, str]:
+    """Encode payload_json plus files[N] parts as multipart/form-data.
+
+    files entries are (field_name, filename, content). The boundary is random
+    per call; a fixed one could appear inside an uploaded file and split it.
+    """
+    boundary = "----gascity" + uuid.uuid4().hex
+    out: list[bytes] = []
+    sep = f"--{boundary}\r\n".encode("utf-8")
+    if payload is not None:
+        out.append(sep)
+        out.append(b'Content-Disposition: form-data; name="payload_json"\r\n')
+        out.append(b"Content-Type: application/json\r\n\r\n")
+        out.append(json.dumps(payload).encode("utf-8"))
+        out.append(b"\r\n")
+    for field, filename, content in files:
+        safe = str(filename).replace("\\", "_").replace('"', "_").replace("\r", "").replace("\n", "")
+        out.append(sep)
+        out.append(
+            f'Content-Disposition: form-data; name="{field}"; filename="{safe}"\r\n'.encode("utf-8")
+        )
+        out.append(b"Content-Type: application/octet-stream\r\n\r\n")
+        out.append(content)
+        out.append(b"\r\n")
+    out.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(out), f"multipart/form-data; boundary={boundary}"
+
+
+def read_attachments(paths: list[str]) -> list[tuple[str, bytes]]:
+    """Read attachment files, refusing the cases Discord would reject anyway.
+
+    Returns (basename, content). Raises ValueError with a reason a human can
+    act on rather than letting the API return an opaque 400.
+    """
+    if len(paths) > ATTACHMENT_MAX_COUNT:
+        raise ValueError(f"at most {ATTACHMENT_MAX_COUNT} attachments per message, got {len(paths)}")
+    out: list[tuple[str, bytes]] = []
+    for raw in paths:
+        path = os.path.expanduser(str(raw).strip())
+        if not path:
+            continue
+        if not os.path.isfile(path):
+            raise ValueError(f"attachment not found: {path}")
+        size = os.path.getsize(path)
+        if size == 0:
+            raise ValueError(f"attachment is empty: {path}")
+        if size > ATTACHMENT_MAX_BYTES:
+            raise ValueError(
+                f"attachment {os.path.basename(path)} is {size} bytes, over the "
+                f"{ATTACHMENT_MAX_BYTES}-byte limit for a standard Discord upload"
+            )
+        with open(path, "rb") as handle:
+            out.append((os.path.basename(path), handle.read()))
+    return out
+
+
 def discord_api_request(
     method: str,
     path: str,
     payload: Any = None,
     bot_token: str | None = None,
+    files: list[tuple[str, str, bytes]] | None = None,
 ) -> Any:
     if path.startswith("http://") or path.startswith("https://"):
         url = path
@@ -2246,7 +2333,13 @@ def discord_api_request(
     token = load_bot_token() if bot_token is None else bot_token
     if token:
         headers["Authorization"] = f"Bot {token}"
-    if payload is not None:
+    if files:
+        # Discord takes attachments as multipart/form-data: the JSON goes in a
+        # payload_json part and each file in a files[N] part. Built by hand
+        # because the pack has no third-party HTTP dependency.
+        body, content_type = _encode_multipart(payload, files)
+        headers["Content-Type"] = content_type
+    elif payload is not None:
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
@@ -2868,6 +2961,349 @@ def normalize_to_extmsg_message(
     }
 
 
+DISCORD_MESSAGE_TYPE_REPLY = 19
+REPLY_EXCERPT_MAX = 240
+
+
+def inbound_reply_context(message: dict[str, Any]) -> dict[str, str]:
+    """Extract the parent message a human replied to, if any.
+
+    Discord sets ``message_reference`` when a person uses native Reply, and
+    usually inlines the parent as ``referenced_message``. Both are absent on an
+    ordinary message, so every field here is optional and an empty dict means
+    "not a reply" rather than "lookup failed".
+
+    Note this is INBOUND context: which of our messages the human answered. It
+    is unrelated to the envelope's ``publish_reply_to_discord_message_id`` and
+    ``reply_to_discord_message_id``, which are outbound and say which message
+    the agent should reply to. The similar names are exactly why this was
+    missing for so long.
+    """
+    ref = message.get("message_reference") or {}
+    if not isinstance(ref, dict):
+        ref = {}
+    parent_id = str(ref.get("message_id", "") or "").strip()
+    if not parent_id:
+        # Discord stamps a native reply as type 19 (REPLY) even when the
+        # reference itself is missing or empty. Without this branch a reply
+        # whose parent was lost is indistinguishable from an ordinary message,
+        # and the agent silently answers the wrong question. Reported as a
+        # question by a reviewer: "could you detect that a reply was attempted,
+        # but unknown which message it links to?" Yes — this is how.
+        if int(message.get("type", 0) or 0) == DISCORD_MESSAGE_TYPE_REPLY or ref:
+            return {"reply_to_status": "UNRESOLVED"}
+        return {}
+    out = {"reply_to_message_id": parent_id}
+    parent = message.get("referenced_message") or {}
+    if isinstance(parent, dict):
+        author = parent.get("author") or {}
+        if isinstance(author, dict):
+            name = str(author.get("global_name", "") or author.get("username", "") or "").strip()
+            if name:
+                out["reply_to_from_display"] = name
+        excerpt = str(parent.get("content", "") or "").strip()
+        if excerpt:
+            out["reply_to_excerpt"] = excerpt[:REPLY_EXCERPT_MAX]
+    return out
+
+
+def inbound_reply_envelope_lines(message: dict[str, Any]) -> list[str]:
+    """Envelope lines carrying inbound reply context, or [] when not a reply.
+
+    The excerpt is JSON-encoded because it is untrusted human text: a raw
+    newline in it would terminate the line and corrupt the envelope.
+    """
+    ctx = inbound_reply_context(message)
+    if not ctx:
+        return []
+    if ctx.get("reply_to_status") == "UNRESOLVED":
+        # Loud on purpose. A silently dropped parent is worse than a visible
+        # one, because the agent cannot know to ask which message was meant.
+        return [
+            "reply_to_status: UNRESOLVED",
+            "reply_to_note: the human replied to a message but the parent "
+            "reference did not survive; ask which message they meant",
+        ]
+    lines = [f"reply_to_message_id: {ctx['reply_to_message_id']}"]
+    if ctx.get("reply_to_from_display"):
+        lines.append(f"reply_to_from_display: {ctx['reply_to_from_display']}")
+    if ctx.get("reply_to_excerpt"):
+        lines.append(f"reply_to_excerpt_json: {json.dumps(ctx['reply_to_excerpt'])}")
+    return lines
+
+
+# --- Inbound attachments -----------------------------------------------------
+#
+# Discord CDN urls are signed and EXPIRE (the ex/is/hm query params). Storing
+# only the url on the receipt produces a record that ROTS: a session reading it
+# an hour later gets a dead link, which is a worse failure than no url at all
+# because it looks like it should work. So the bytes are fetched at ingest and
+# written next to the receipt, and the envelope names the LOCAL PATH.
+
+INBOUND_ATTACHMENT_ALLOWED_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
+# Per file. Mirrors the outbound ceiling, which is what Discord itself accepts,
+# so anything a human could have sent fits.
+INBOUND_ATTACHMENT_MAX_BYTES = ATTACHMENT_MAX_BYTES
+INBOUND_ATTACHMENT_MAX_COUNT = ATTACHMENT_MAX_COUNT
+# Across one message. Ten files at the per-file ceiling would be 100MB written
+# on a single inbound message; this bounds the whole message instead.
+INBOUND_ATTACHMENT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
+INBOUND_ATTACHMENT_TIMEOUT_SECONDS = 20
+INBOUND_ATTACHMENT_FILENAME_MAX = 96
+
+
+def chat_ingress_attachments_dir() -> str:
+    return os.path.join(data_dir(), "chat-ingress-attachments")
+
+
+def chat_ingress_attachment_dir(ingress_id: str) -> str:
+    return os.path.join(
+        chat_ingress_attachments_dir(),
+        safe_storage_id(str(ingress_id), "chat-ingress"),
+    )
+
+
+def _safe_attachment_filename(raw: str, index: int) -> str:
+    """A filename that cannot escape the attachment directory.
+
+    The name comes off an inbound payload, so it is attacker-controlled: it is
+    reduced to its basename, stripped of separators and control characters, and
+    replaced entirely if nothing usable survives.
+    """
+    name = str(raw or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if ch.isprintable() and ch not in '/\\:*?"<>|')
+    name = name.strip().strip(".")
+    if not name:
+        name = f"attachment-{index}"
+    return name[:INBOUND_ATTACHMENT_FILENAME_MAX]
+
+
+def _attachment_url_is_allowed(url: str) -> bool:
+    """True only for an https url on a Discord CDN host.
+
+    Deliberately an allow-list. The url arrives inside an inbound payload, so
+    fetching whatever it names would let anyone who can message the bot point
+    it at an arbitrary host, including one on the machine's own network.
+    """
+    try:
+        parts = urllib.parse.urlsplit(str(url or "").strip())
+    except ValueError:
+        return False
+    if parts.scheme != "https":
+        return False
+    try:
+        host = parts.hostname
+    except ValueError:
+        return False
+    # hostname is already lowercased and stripped of userinfo and port by
+    # urlsplit, so "cdn.discordapp.com.evil.example" and "user@cdn.discordapp
+    # .com" are both compared as the host that would actually be dialled.
+    return bool(host) and host in INBOUND_ATTACHMENT_ALLOWED_HOSTS
+
+
+def inbound_attachment_summaries(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Describe a message's attachments without touching the network.
+
+    Separate from the download on purpose: this is what makes an attachment
+    DETECTABLE. It has to run before the empty-body check, because a message
+    that is nothing but a screenshot has no content at all and would otherwise
+    be discarded as empty before anything knew a file was there.
+    """
+    raw = message.get("attachments")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        try:
+            size = int(item.get("size", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        entry: dict[str, Any] = {
+            "index": index,
+            "attachment_id": str(item.get("id", "") or "").strip(),
+            "filename": _safe_attachment_filename(item.get("filename", ""), index),
+            "content_type": str(item.get("content_type", "") or "").strip(),
+            "size": size,
+            "url": str(item.get("url", "") or "").strip(),
+            "status": "pending",
+        }
+        if len(out) >= INBOUND_ATTACHMENT_MAX_COUNT:
+            entry["status"] = "skipped_too_many"
+            entry["error"] = f"more than {INBOUND_ATTACHMENT_MAX_COUNT} attachments on one message"
+        out.append(entry)
+    return out
+
+
+def _fetch_attachment_bytes(url: str, limit: int) -> bytes:
+    """Fetch up to ``limit`` bytes, raising if the body runs past it.
+
+    Reads in chunks rather than trusting Content-Length, which is a claim made
+    by the far end. Sends no Authorization header: a Discord CDN url needs no
+    auth, and attaching the bot token would hand the credential to whatever
+    host answered.
+    """
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "gas-city-discord/0.1", "Accept": "*/*"},
+        method="GET",
+    )
+    chunks: list[bytes] = []
+    total = 0
+    with urllib.request.urlopen(request, timeout=INBOUND_ATTACHMENT_TIMEOUT_SECONDS) as response:
+        while True:
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ValueError(f"attachment body exceeded {limit} bytes")
+            chunks.append(chunk)
+    if total == 0:
+        raise ValueError("attachment body was empty")
+    return b"".join(chunks)
+
+
+def download_inbound_attachments(
+    ingress_id: str,
+    summaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fetch each attachment's bytes to disk and return updated summaries.
+
+    NEVER raises and never drops anything. A file that cannot be fetched comes
+    back with status "failed" and a reason, so the text of the message still
+    delivers and the reader can tell a transmission error from a silent drop.
+    """
+    if not summaries:
+        return []
+    target_dir = chat_ingress_attachment_dir(ingress_id)
+    out: list[dict[str, Any]] = []
+    budget = INBOUND_ATTACHMENT_MAX_TOTAL_BYTES
+    for entry in summaries:
+        item = dict(entry)
+        if item.get("status") != "pending":
+            out.append(item)
+            continue
+        url = str(item.get("url", "") or "")
+        if not _attachment_url_is_allowed(url):
+            item["status"] = "skipped_untrusted_host"
+            item["error"] = "url is not an https Discord CDN url"
+            out.append(item)
+            continue
+        declared = int(item.get("size", 0) or 0)
+        if declared > INBOUND_ATTACHMENT_MAX_BYTES:
+            item["status"] = "skipped_too_large"
+            item["error"] = f"{declared} bytes, over the {INBOUND_ATTACHMENT_MAX_BYTES}-byte per-file limit"
+            out.append(item)
+            continue
+        limit = min(INBOUND_ATTACHMENT_MAX_BYTES, budget)
+        if limit <= 0:
+            item["status"] = "skipped_budget"
+            item["error"] = f"the {INBOUND_ATTACHMENT_MAX_TOTAL_BYTES}-byte budget for one message was already used"
+            out.append(item)
+            continue
+        try:
+            content = _fetch_attachment_bytes(url, limit)
+            os.makedirs(target_dir, exist_ok=True)
+            path = os.path.join(
+                target_dir,
+                f"{int(item.get('index', 0)):02d}-{item['filename']}",
+            )
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=target_dir)
+            try:
+                with os.fdopen(tmp_fd, "wb") as handle:
+                    handle.write(content)
+                os.chmod(tmp_path, 0o640)
+                os.replace(tmp_path, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
+        except Exception as exc:  # noqa: BLE001
+            # Includes the over-budget ValueError from the reader. Whatever went
+            # wrong, the message itself must still reach the session.
+            item["status"] = "failed"
+            item["error"] = str(exc) or exc.__class__.__name__
+            out.append(item)
+            continue
+        budget -= len(content)
+        item["status"] = "saved"
+        item["local_path"] = path
+        item["size"] = len(content)
+        out.append(item)
+    return out
+
+
+def inbound_attachment_envelope_lines(attachments: list[dict[str, Any]]) -> list[str]:
+    """Envelope lines naming the local files, or [] when there are none.
+
+    JSON-encoded on one line for the same reason the reply excerpt is: the
+    filename is untrusted human input and a raw newline in it would terminate
+    the line and corrupt every field after it.
+    """
+    if not attachments:
+        return []
+    saved = [item for item in attachments if item.get("status") == "saved"]
+    unsaved = [item for item in attachments if item.get("status") != "saved"]
+    payload = [
+        {
+            "filename": item.get("filename", ""),
+            "content_type": item.get("content_type", ""),
+            "size": item.get("size", 0),
+            "status": item.get("status", ""),
+            "local_path": item.get("local_path", ""),
+            "error": item.get("error", ""),
+        }
+        for item in attachments
+    ]
+    lines = [
+        f"attachments_count: {len(attachments)}",
+        f"attachments_saved_count: {len(saved)}",
+        f"attachments_json: {json.dumps(payload)}",
+    ]
+    if saved:
+        lines.append(
+            "attachments_note: the files are already on this machine at the "
+            "local_path values above; read them directly, do not ask the "
+            "sender to resend or to paste a link"
+        )
+    if unsaved:
+        # Loud on purpose, in the same spirit as reply_to_status UNRESOLVED. The
+        # sender was told to expect a transmission error to be visible, so a
+        # failure that reads as silence is the one outcome to avoid.
+        lines.append(
+            f"attachments_failed_count: {len(unsaved)}"
+        )
+        lines.append(
+            "attachments_failed_note: at least one attachment did not transfer; "
+            "say so and ask the sender to resend it or paste its link"
+        )
+    return lines
+
+
+def prune_chat_ingress_attachments() -> None:
+    """Drop saved attachment bytes on the same clock as their receipts.
+
+    _prune_dir only globs *.json, so these directories would otherwise never be
+    collected and the bytes would accumulate for the life of the machine.
+    """
+    root = chat_ingress_attachments_dir()
+    if not os.path.isdir(root):
+        return
+    now = time.time()
+    for entry in pathlib.Path(root).iterdir():
+        if not entry.is_dir():
+            continue
+        try:
+            age = now - entry.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if age > CHAT_INGRESS_RETENTION_SECONDS:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(entry, ignore_errors=True)
+
+
 def _fuzzy_match_handle(
     text: str,
     participants: list[dict[str, str]],
@@ -3136,6 +3572,7 @@ def _build_thread_launch_envelope(
         f"discord_message_id: {message_id}",
         f"from_display: {str(author.get('global_name', '') or author.get('username', '')).strip()}",
         f"from_user_id: {str(author.get('id', '')).strip()}",
+        *inbound_reply_envelope_lines(discord_message),
         "delivery: targeted",
         f"target_handle: {handle}",
         f"untrusted_body_json: {json.dumps(content)}",
@@ -5461,6 +5898,7 @@ def publish_binding_message(
     source_context: dict[str, str] | None = None,
     source_session_name: str = "",
     source_session_id: str = "",
+    attachments: list[tuple[str, bytes]] | None = None,
 ) -> dict[str, Any]:
     app_name = validate_app_name(binding.get("app", ""))
     bot_token: str | None = None
@@ -5506,19 +5944,21 @@ def publish_binding_message(
     )
     if not conversation_id:
         raise ValueError("binding is missing a destination conversation_id")
+    # Pass bot_token only for a named app, and attachments only when there are
+    # some, so the plain call signature stays exactly as it was for every
+    # existing caller and test. Several tests assert the whole call, e.g.
+    # post_channel_message.assert_called_once_with("333", "hello humans",
+    # reply_to_message_id=""), so an unconditional kwarg here is a breakage.
+    post_kwargs: dict[str, Any] = {"reply_to_message_id": reply_target}
     if app_name:
-        response = post_channel_message(
-            conversation_id,
-            body,
-            reply_to_message_id=reply_target,
-            bot_token=bot_token,
-        )
-    else:
-        response = post_channel_message(
-            conversation_id,
-            body,
-            reply_to_message_id=reply_target,
-        )
+        post_kwargs["bot_token"] = bot_token
+    if attachments:
+        post_kwargs["attachments"] = attachments
+    response = post_channel_message(
+        conversation_id,
+        body,
+        **post_kwargs,
+    )
     remote_message_id = str((response or {}).get("id", "")).strip()
     if not remote_message_id:
         raise DiscordAPIError("discord publish returned no message id")
@@ -5732,6 +6172,7 @@ def post_channel_message(
     channel_id: str,
     body: str,
     reply_to_message_id: str = "",
+    attachments: list[tuple[str, bytes]] | None = None,
     *,
     bot_token: str | None = None,
 ) -> Any:
@@ -5739,6 +6180,16 @@ def post_channel_message(
         "content": body,
         "allowed_mentions": {"parse": ["users"]},
     }
+    files: list[tuple[str, str, bytes]] | None = None
+    if attachments:
+        payload["attachments"] = [
+            {"id": index, "filename": filename}
+            for index, (filename, _) in enumerate(attachments)
+        ]
+        files = [
+            (f"files[{index}]", filename, content)
+            for index, (filename, content) in enumerate(attachments)
+        ]
     reply_to_message_id = str(reply_to_message_id).strip()
     if reply_to_message_id:
         payload["message_reference"] = {
@@ -5747,9 +6198,18 @@ def post_channel_message(
             "fail_if_not_exists": False,
         }
     path = f"/channels/{urllib.parse.quote(str(channel_id))}/messages"
-    if bot_token is None:
-        return discord_api_request("POST", path, payload=payload)
-    return discord_api_request("POST", path, payload=payload, bot_token=bot_token)
+    # Pass a kwarg only when it carries something, the same rule the callers
+    # above follow. Upstream's test doubles mirror the old signature exactly:
+    # test_discord_multibot_cli_contract.py's fake_discord_api_request takes
+    # (method, path, payload, bot_token) and nothing else, so an unconditional
+    # files= raises TypeError there. This code is headed upstream, so the fix
+    # belongs here rather than in their fake.
+    request_kwargs: dict[str, Any] = {"payload": payload}
+    if files:
+        request_kwargs["files"] = files
+    if bot_token is not None:
+        request_kwargs["bot_token"] = bot_token
+    return discord_api_request("POST", path, **request_kwargs)
 
 
 def discord_jump_url(guild_id: str, conversation_id: str) -> str:
