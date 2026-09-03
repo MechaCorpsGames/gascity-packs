@@ -3667,3 +3667,335 @@ class InboundAttachmentRoutingTests(unittest.TestCase):
             recovered, _ = gateway_service.recover_message_for_routing(message)
 
         self.assertEqual(len(recovered["attachments"]), 1)
+
+
+class GatewayPresenceTests(unittest.TestCase):
+    """The gateway reflects an asserted presence (bead ga-okqd0).
+
+    The bot reads ONLINE for as long as the gateway connection is up, and the
+    gateway outlives the session it speaks for, so it reads online while nobody
+    can answer. These pin the three places that has to be corrected: the
+    IDENTIFY payload, a live op 3, and the tick that lets a lapsed assertion
+    undo itself.
+    """
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self._old_environ = os.environ.copy()
+        self.addCleanup(self._restore_environment)
+        os.environ["GC_CITY_PATH"] = self.tempdir.name
+        common.ensure_layout()
+
+    def _restore_environment(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._old_environ)
+
+    def _worker(self, app_name: str = "") -> gateway_service.GatewayWorker:
+        runtime_state = gateway_service.GatewayRuntimeState(app_name)
+        with mock.patch.object(gateway_service, "GATEWAY_WORKER_THREADS", 0):
+            worker = gateway_service.GatewayWorker(runtime_state, app_name)
+        self.addCleanup(worker.stop)
+        return worker
+
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        def send_json(self, payload: dict) -> None:
+            self.sent.append(payload)
+
+    # --- IDENTIFY ---------------------------------------------------------
+
+    def test_identify_carries_no_presence_when_none_is_asserted(self) -> None:
+        """The default call shape must not change for anyone reading it."""
+        worker = self._worker()
+        ws = self._FakeWS()
+
+        worker.identify(ws, "token-1")
+
+        self.assertEqual(ws.sent[0]["op"], 2)
+        self.assertNotIn("presence", ws.sent[0]["d"])
+
+    def test_identify_carries_the_asserted_presence(self) -> None:
+        """A fresh IDENTIFY resets presence, so it cannot be an op 3 alone.
+
+        Without this, every reconnect would pop the bot back to online and
+        leave it there until something noticed: the same bug, slower.
+        """
+        common.save_gateway_presence("idle", ttl_seconds=600)
+        worker = self._worker()
+        ws = self._FakeWS()
+
+        worker.identify(ws, "token-1")
+
+        self.assertEqual(ws.sent[0]["d"]["presence"]["status"], "idle")
+        self.assertEqual(worker.applied_presence, "idle")
+
+    def test_identify_ignores_an_expired_assertion(self) -> None:
+        common.save_gateway_presence("idle", ttl_seconds=1)
+        stale = int(common.load_gateway_presence()["expires_at_epoch"]) + 5
+        worker = self._worker()
+        ws = self._FakeWS()
+
+        with mock.patch.object(common.time, "time", return_value=stale):
+            worker.identify(ws, "token-1")
+
+        self.assertNotIn("presence", ws.sent[0]["d"])
+
+    # --- op 3 -------------------------------------------------------------
+
+    def test_a_change_sends_op_3(self) -> None:
+        worker = self._worker()
+        ws = self._FakeWS()
+        common.save_gateway_presence("idle", ttl_seconds=600)
+
+        worker.apply_presence_if_changed(ws)
+
+        self.assertEqual(len(ws.sent), 1)
+        self.assertEqual(ws.sent[0]["op"], 3)
+        self.assertEqual(ws.sent[0]["d"]["status"], "idle")
+
+    def test_no_change_sends_nothing(self) -> None:
+        """This runs on every heartbeat, so a no-op has to stay a no-op."""
+        worker = self._worker()
+        ws = self._FakeWS()
+        common.save_gateway_presence("idle", ttl_seconds=600)
+
+        worker.apply_presence_if_changed(ws)
+        worker.apply_presence_if_changed(ws)
+        worker.apply_presence_if_changed(ws)
+
+        self.assertEqual(len(ws.sent), 1)
+
+    def test_a_lapsed_assertion_pushes_the_bot_back_to_online(self) -> None:
+        """The whole reason the tick exists.
+
+        Without it a lapsed assertion would only be noticed at the next
+        reconnect, so a watcher that died at 09:00 could leave the bot reading
+        idle for as long as the connection happened to stay up.
+        """
+        worker = self._worker()
+        ws = self._FakeWS()
+        common.save_gateway_presence("idle", ttl_seconds=600)
+        worker.apply_presence_if_changed(ws)
+        expired = int(common.load_gateway_presence()["expires_at_epoch"]) + 1
+
+        with mock.patch.object(common.time, "time", return_value=expired):
+            worker.apply_presence_if_changed(ws)
+
+        self.assertEqual([item["op"] for item in ws.sent], [3, 3])
+        self.assertEqual(ws.sent[1]["d"]["status"], "online")
+        self.assertEqual(worker.applied_presence, "online")
+
+    def test_clearing_pushes_the_bot_back_to_online(self) -> None:
+        worker = self._worker()
+        ws = self._FakeWS()
+        common.save_gateway_presence("dnd", ttl_seconds=600)
+        worker.apply_presence_if_changed(ws)
+
+        common.clear_gateway_presence()
+        worker.apply_presence_if_changed(ws)
+
+        self.assertEqual(ws.sent[-1]["d"]["status"], "online")
+
+    def test_a_failed_send_does_not_take_down_the_connection(self) -> None:
+        """Presence is cosmetic next to delivering messages."""
+        worker = self._worker()
+        common.save_gateway_presence("idle", ttl_seconds=600)
+
+        class _Broken:
+            def send_json(self, payload: dict) -> None:
+                raise OSError("socket went away")
+
+        worker.apply_presence_if_changed(_Broken())
+
+        self.assertIn("socket went away", str(worker.runtime_state.snapshot().get("last_presence_error", "")))
+
+    def test_presence_is_per_app(self) -> None:
+        common.save_gateway_presence("idle", ttl_seconds=600, app_name="ollie")
+        named = self._worker("ollie")
+        default = self._worker()
+        named_ws = self._FakeWS()
+        default_ws = self._FakeWS()
+
+        named.apply_presence_if_changed(named_ws)
+        default.apply_presence_if_changed(default_ws)
+
+        self.assertEqual(named_ws.sent[0]["d"]["status"], "idle")
+        self.assertEqual(default_ws.sent, [])
+
+    # --- the payload itself ----------------------------------------------
+
+    def test_the_payload_is_the_shape_discord_documents(self) -> None:
+        payload = gateway_service.presence_payload("idle")
+
+        self.assertEqual(
+            payload,
+            {"since": 0, "activities": [], "status": "idle", "afk": False},
+        )
+
+    def test_nothing_in_this_feature_sends_a_message(self) -> None:
+        """Connor asked for a status change SO THAT no message is needed.
+
+        A future edit that "helpfully" announces the status change would undo
+        the entire point, so it is pinned rather than left to good manners.
+        """
+        worker = self._worker()
+        ws = self._FakeWS()
+        common.save_gateway_presence("idle", ttl_seconds=600)
+
+        with mock.patch.object(common, "post_channel_message") as post_channel_message, \
+                mock.patch.object(common, "publish_binding_message") as publish_binding_message:
+            worker.identify(ws, "token-1")
+            worker.apply_presence_if_changed(ws)
+            common.save_gateway_presence("online", ttl_seconds=600)
+            worker.apply_presence_if_changed(ws)
+
+        post_channel_message.assert_not_called()
+        publish_binding_message.assert_not_called()
+
+
+class GatewayPresenceReachesTheWireTests(unittest.TestCase):
+    """The connect loop actually sends it, not just the method that could.
+
+    Every other presence test calls identify() or apply_presence_if_changed()
+    directly, which proves the method and says nothing about whether anything
+    calls it. This one starts run_forever against a mocked websocket and reads
+    what landed on the wire, so deleting the call site in the heartbeat loop
+    reddens something.
+    """
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self._old_environ = os.environ.copy()
+        self.addCleanup(self._restore_environment)
+        os.environ["GC_CITY_PATH"] = self.tempdir.name
+        common.ensure_layout()
+
+    def _restore_environment(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._old_environ)
+
+    def _run_until(self, predicate, timeout: float = 5.0):
+        """Drive a real worker over a fake socket until the wire satisfies us."""
+        config = common.import_app_config(
+            common.load_config(),
+            {"application_id": "111"},
+            bot_token="default-test-token",
+        )
+        with mock.patch.object(gateway_service, "GATEWAY_WORKER_THREADS", 0), mock.patch.object(
+            gateway_service, "GATEWAY_IDENTIFY_STAGGER_SECONDS", 0
+        ):
+            workers = gateway_service.build_gateway_workers(config)
+        worker = workers[0]
+
+        frames = iter(
+            [
+                {"op": 10, "d": {"heartbeat_interval": 1_000}},
+                {"op": 0, "t": "READY", "s": 1, "d": {"user": {"id": "111"}, "session_id": "s-1"}},
+            ]
+        )
+        closed = threading.Event()
+        sent: list[dict] = []
+        sent_lock = threading.Lock()
+        pending_ack = threading.Event()
+
+        def recv_event(timeout: float | None = None):
+            try:
+                return next(frames)
+            except StopIteration:
+                pass
+            # Answer the heartbeat. Without this the loop raises "missed
+            # heartbeat ack" on its SECOND beat and tears the connection down,
+            # so the tick under test only ever runs once. That is how the first
+            # draft of this harness hid the thing it was built to show.
+            if pending_ack.is_set():
+                pending_ack.clear()
+                return {"op": 11}
+            # Nothing more arrives, so the loop falls through to its heartbeat,
+            # which is the tick presence rides on.
+            if closed.wait(timeout if timeout is not None else 0.05):
+                raise gateway_service.WebSocketClosed("websocket closed")
+            raise gateway_service.GatewayFrameTimeout("no frame")
+
+        def send_json(payload: dict) -> None:
+            with sent_lock:
+                sent.append(payload)
+            if payload.get("op") == 1:
+                pending_ack.set()
+
+        websocket = mock.Mock()
+        websocket.recv_event.side_effect = recv_event
+        websocket.send_json.side_effect = send_json
+        websocket.close.side_effect = closed.set
+
+        thread = threading.Thread(target=worker.run_forever, name="presence-wire-test")
+        with mock.patch.object(worker, "gateway_url", return_value="wss://example.invalid"), \
+                mock.patch.object(worker, "prune_runtime_data"), \
+                mock.patch.object(gateway_service, "GatewayWebSocket", return_value=websocket), \
+                mock.patch.object(gateway_service.random, "uniform", return_value=0.0), \
+                mock.patch.object(gateway_service, "RECONNECT_BASE_DELAY_SECONDS", 0.01), \
+                mock.patch.object(gateway_service, "RECONNECT_MAX_DELAY_SECONDS", 0.01):
+            try:
+                thread.start()
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    with sent_lock:
+                        snapshot = list(sent)
+                    hit = predicate(snapshot)
+                    if hit:
+                        return snapshot
+                    time.sleep(0.02)
+                with sent_lock:
+                    return list(sent)
+            finally:
+                worker.request_stop()
+                closed.set()
+                thread.join(timeout=5.0)
+
+    def test_an_assertion_made_before_connecting_rides_the_identify(self) -> None:
+        common.save_gateway_presence("idle", ttl_seconds=600)
+
+        sent = self._run_until(
+            lambda frames: any(frame.get("op") == 2 for frame in frames)
+        )
+
+        identifies = [frame for frame in sent if frame.get("op") == 2]
+        self.assertTrue(identifies, f"no IDENTIFY reached the wire: {sent}")
+        self.assertEqual(identifies[0]["d"].get("presence", {}).get("status"), "idle")
+
+    def test_an_assertion_made_while_connected_reaches_the_wire_as_op_3(self) -> None:
+        """The heartbeat tick, end to end, on ONE connection.
+
+        Nothing is asserted at connect time, so IDENTIFY carries no presence.
+        The assertion is written mid-flight, exactly as the watcher would write
+        it, and the op 3 has to arrive without a reconnect.
+
+        The assertion is made from inside the predicate on purpose. Writing it
+        between two separate runs would start a second worker, which would pick
+        the file up at IDENTIFY and never need an op 3 at all: the first draft
+        of this test did that and passed while proving nothing about the tick.
+        """
+        asserted = threading.Event()
+
+        def wire(frames: list[dict]) -> bool:
+            if not asserted.is_set() and any(frame.get("op") == 1 for frame in frames):
+                common.save_gateway_presence("idle", ttl_seconds=600)
+                asserted.set()
+                return False
+            return any(frame.get("op") == 3 for frame in frames)
+
+        sent = self._run_until(wire)
+
+        self.assertTrue(asserted.is_set(), f"the loop never reached its heartbeat: {sent}")
+        identifies = [frame for frame in sent if frame.get("op") == 2]
+        self.assertNotIn(
+            "presence",
+            identifies[0]["d"],
+            "nothing was asserted at connect time, so IDENTIFY must not carry a presence",
+        )
+        presences = [frame for frame in sent if frame.get("op") == 3]
+        self.assertTrue(presences, f"no op 3 reached the wire: {sent}")
+        self.assertEqual(presences[0]["d"]["status"], "idle")
