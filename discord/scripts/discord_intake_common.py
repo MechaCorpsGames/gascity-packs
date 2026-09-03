@@ -11,6 +11,7 @@ import os
 import uuid
 import pathlib
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -213,6 +214,7 @@ def ensure_layout() -> None:
         pending_modals_dir(),
         chat_publishes_dir(),
         chat_ingress_dir(),
+        chat_ingress_attachments_dir(),
         room_launches_dir(),
         channel_metadata_cache_dir(),
         peer_root_budget_dir(),
@@ -2043,6 +2045,7 @@ def list_chat_ingress() -> list[dict[str, Any]]:
 def prune_chat_ingress() -> None:
     ensure_layout()
     _prune_dir(chat_ingress_dir(), CHAT_INGRESS_RETENTION_SECONDS)
+    prune_chat_ingress_attachments()
 
 
 def prune_chat_publishes() -> None:
@@ -2063,6 +2066,22 @@ def redact_chat_ingress_record(payload: dict[str, Any]) -> dict[str, Any]:
         body["from_user_id"] = "[redacted]"
     if body.get("body_preview"):
         body["body_preview"] = "[redacted]"
+    if isinstance(body.get("attachments"), list):
+        # A filename is human content and the url carries a signed token, so
+        # both go the way of body_preview. What survives is enough to see that
+        # a file arrived and whether it saved, which is the point of the view.
+        body["attachments"] = [
+            {
+                "content_type": item.get("content_type", ""),
+                "size": item.get("size", 0),
+                "status": item.get("status", ""),
+                "filename": "[redacted]" if item.get("filename") else "",
+                "url": "[redacted]" if item.get("url") else "",
+                "local_path": "[redacted]" if item.get("local_path") else "",
+            }
+            for item in body["attachments"]
+            if isinstance(item, dict)
+        ]
     return body
 
 
@@ -3011,6 +3030,271 @@ def inbound_reply_envelope_lines(message: dict[str, Any]) -> list[str]:
     if ctx.get("reply_to_excerpt"):
         lines.append(f"reply_to_excerpt_json: {json.dumps(ctx['reply_to_excerpt'])}")
     return lines
+
+
+# --- Inbound attachments -----------------------------------------------------
+#
+# Discord CDN urls are signed and EXPIRE (the ex/is/hm query params). Storing
+# only the url on the receipt produces a record that ROTS: a session reading it
+# an hour later gets a dead link, which is a worse failure than no url at all
+# because it looks like it should work. So the bytes are fetched at ingest and
+# written next to the receipt, and the envelope names the LOCAL PATH.
+
+INBOUND_ATTACHMENT_ALLOWED_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
+# Per file. Mirrors the outbound ceiling, which is what Discord itself accepts,
+# so anything a human could have sent fits.
+INBOUND_ATTACHMENT_MAX_BYTES = ATTACHMENT_MAX_BYTES
+INBOUND_ATTACHMENT_MAX_COUNT = ATTACHMENT_MAX_COUNT
+# Across one message. Ten files at the per-file ceiling would be 100MB written
+# on a single inbound message; this bounds the whole message instead.
+INBOUND_ATTACHMENT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
+INBOUND_ATTACHMENT_TIMEOUT_SECONDS = 20
+INBOUND_ATTACHMENT_FILENAME_MAX = 96
+
+
+def chat_ingress_attachments_dir() -> str:
+    return os.path.join(data_dir(), "chat-ingress-attachments")
+
+
+def chat_ingress_attachment_dir(ingress_id: str) -> str:
+    return os.path.join(
+        chat_ingress_attachments_dir(),
+        safe_storage_id(str(ingress_id), "chat-ingress"),
+    )
+
+
+def _safe_attachment_filename(raw: str, index: int) -> str:
+    """A filename that cannot escape the attachment directory.
+
+    The name comes off an inbound payload, so it is attacker-controlled: it is
+    reduced to its basename, stripped of separators and control characters, and
+    replaced entirely if nothing usable survives.
+    """
+    name = str(raw or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(ch for ch in name if ch.isprintable() and ch not in '/\\:*?"<>|')
+    name = name.strip().strip(".")
+    if not name:
+        name = f"attachment-{index}"
+    return name[:INBOUND_ATTACHMENT_FILENAME_MAX]
+
+
+def _attachment_url_is_allowed(url: str) -> bool:
+    """True only for an https url on a Discord CDN host.
+
+    Deliberately an allow-list. The url arrives inside an inbound payload, so
+    fetching whatever it names would let anyone who can message the bot point
+    it at an arbitrary host, including one on the machine's own network.
+    """
+    try:
+        parts = urllib.parse.urlsplit(str(url or "").strip())
+    except ValueError:
+        return False
+    if parts.scheme != "https":
+        return False
+    return True
+
+
+def inbound_attachment_summaries(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Describe a message's attachments without touching the network.
+
+    Separate from the download on purpose: this is what makes an attachment
+    DETECTABLE. It has to run before the empty-body check, because a message
+    that is nothing but a screenshot has no content at all and would otherwise
+    be discarded as empty before anything knew a file was there.
+    """
+    raw = message.get("attachments")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        try:
+            size = int(item.get("size", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        entry: dict[str, Any] = {
+            "index": index,
+            "attachment_id": str(item.get("id", "") or "").strip(),
+            "filename": _safe_attachment_filename(item.get("filename", ""), index),
+            "content_type": str(item.get("content_type", "") or "").strip(),
+            "size": size,
+            "url": str(item.get("url", "") or "").strip(),
+            "status": "pending",
+        }
+        if len(out) >= INBOUND_ATTACHMENT_MAX_COUNT:
+            entry["status"] = "skipped_too_many"
+            entry["error"] = f"more than {INBOUND_ATTACHMENT_MAX_COUNT} attachments on one message"
+        out.append(entry)
+    return out
+
+
+def _fetch_attachment_bytes(url: str, limit: int) -> bytes:
+    """Fetch up to ``limit`` bytes, raising if the body runs past it.
+
+    Reads in chunks rather than trusting Content-Length, which is a claim made
+    by the far end. Sends no Authorization header: a Discord CDN url needs no
+    auth, and attaching the bot token would hand the credential to whatever
+    host answered.
+    """
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "gas-city-discord/0.1", "Accept": "*/*"},
+        method="GET",
+    )
+    chunks: list[bytes] = []
+    total = 0
+    with urllib.request.urlopen(request, timeout=INBOUND_ATTACHMENT_TIMEOUT_SECONDS) as response:
+        while True:
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ValueError(f"attachment body exceeded {limit} bytes")
+            chunks.append(chunk)
+    if total == 0:
+        raise ValueError("attachment body was empty")
+    return b"".join(chunks)
+
+
+def download_inbound_attachments(
+    ingress_id: str,
+    summaries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fetch each attachment's bytes to disk and return updated summaries.
+
+    NEVER raises and never drops anything. A file that cannot be fetched comes
+    back with status "failed" and a reason, so the text of the message still
+    delivers and the reader can tell a transmission error from a silent drop.
+    """
+    if not summaries:
+        return []
+    target_dir = chat_ingress_attachment_dir(ingress_id)
+    out: list[dict[str, Any]] = []
+    budget = INBOUND_ATTACHMENT_MAX_TOTAL_BYTES
+    for entry in summaries:
+        item = dict(entry)
+        if item.get("status") != "pending":
+            out.append(item)
+            continue
+        url = str(item.get("url", "") or "")
+        if not _attachment_url_is_allowed(url):
+            item["status"] = "skipped_untrusted_host"
+            item["error"] = "url is not an https Discord CDN url"
+            out.append(item)
+            continue
+        declared = int(item.get("size", 0) or 0)
+        if declared > INBOUND_ATTACHMENT_MAX_BYTES:
+            item["status"] = "skipped_too_large"
+            item["error"] = f"{declared} bytes, over the {INBOUND_ATTACHMENT_MAX_BYTES}-byte per-file limit"
+            out.append(item)
+            continue
+        limit = min(INBOUND_ATTACHMENT_MAX_BYTES, budget)
+        if limit <= 0:
+            item["status"] = "skipped_budget"
+            item["error"] = f"the {INBOUND_ATTACHMENT_MAX_TOTAL_BYTES}-byte budget for one message was already used"
+            out.append(item)
+            continue
+        try:
+            content = _fetch_attachment_bytes(url, limit)
+            os.makedirs(target_dir, exist_ok=True)
+            path = os.path.join(
+                target_dir,
+                f"{int(item.get('index', 0)):02d}-{item['filename']}",
+            )
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=target_dir)
+            try:
+                with os.fdopen(tmp_fd, "wb") as handle:
+                    handle.write(content)
+                os.chmod(tmp_path, 0o640)
+                os.replace(tmp_path, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
+        except Exception as exc:  # noqa: BLE001
+            # Includes the over-budget ValueError from the reader. Whatever went
+            # wrong, the message itself must still reach the session.
+            item["status"] = "failed"
+            item["error"] = str(exc) or exc.__class__.__name__
+            out.append(item)
+            continue
+        budget -= len(content)
+        item["status"] = "saved"
+        item["local_path"] = path
+        item["size"] = len(content)
+        out.append(item)
+    return out
+
+
+def inbound_attachment_envelope_lines(attachments: list[dict[str, Any]]) -> list[str]:
+    """Envelope lines naming the local files, or [] when there are none.
+
+    JSON-encoded on one line for the same reason the reply excerpt is: the
+    filename is untrusted human input and a raw newline in it would terminate
+    the line and corrupt every field after it.
+    """
+    if not attachments:
+        return []
+    saved = [item for item in attachments if item.get("status") == "saved"]
+    unsaved = [item for item in attachments if item.get("status") != "saved"]
+    payload = [
+        {
+            "filename": item.get("filename", ""),
+            "content_type": item.get("content_type", ""),
+            "size": item.get("size", 0),
+            "status": item.get("status", ""),
+            "local_path": item.get("local_path", ""),
+            "error": item.get("error", ""),
+        }
+        for item in attachments
+    ]
+    lines = [
+        f"attachments_count: {len(attachments)}",
+        f"attachments_saved_count: {len(saved)}",
+        f"attachments_json: {json.dumps(payload)}",
+    ]
+    if saved:
+        lines.append(
+            "attachments_note: the files are already on this machine at the "
+            "local_path values above; read them directly, do not ask the "
+            "sender to resend or to paste a link"
+        )
+    if unsaved:
+        # Loud on purpose, in the same spirit as reply_to_status UNRESOLVED. The
+        # sender was told to expect a transmission error to be visible, so a
+        # failure that reads as silence is the one outcome to avoid.
+        lines.append(
+            f"attachments_failed_count: {len(unsaved)}"
+        )
+        lines.append(
+            "attachments_failed_note: at least one attachment did not transfer; "
+            "say so and ask the sender to resend it or paste its link"
+        )
+    return lines
+
+
+def prune_chat_ingress_attachments() -> None:
+    """Drop saved attachment bytes on the same clock as their receipts.
+
+    _prune_dir only globs *.json, so these directories would otherwise never be
+    collected and the bytes would accumulate for the life of the machine.
+    """
+    root = chat_ingress_attachments_dir()
+    if not os.path.isdir(root):
+        return
+    now = time.time()
+    for entry in pathlib.Path(root).iterdir():
+        if not entry.is_dir():
+            continue
+        try:
+            age = now - entry.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if age > CHAT_INGRESS_RETENTION_SECONDS:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(entry, ignore_errors=True)
 
 
 def _fuzzy_match_handle(
