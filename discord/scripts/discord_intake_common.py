@@ -2229,7 +2229,10 @@ def verify_discord_signature(public_key_hex: str, timestamp: str, payload: bytes
     return bool(result and result.returncode == 0)
 
 
-ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024
+# Discord's free-tier ceiling; boosted servers and Nitro allow more. Kept as a
+# pre-flight guard so an oversized file fails with a readable reason here rather
+# than as an opaque rejection from the API. If Discord raises it, raise this.
+ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
 ATTACHMENT_MAX_COUNT = 10
 
 
