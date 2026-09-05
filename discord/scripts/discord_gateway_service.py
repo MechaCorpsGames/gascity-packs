@@ -909,6 +909,55 @@ def build_room_launch_thread_envelope(
     return "\n".join(lines)
 
 
+RECEIPT_REACTION = os.environ.get("GC_DISCORD_RECEIPT_REACTION", "\U0001F4EC")
+
+
+def mark_message_received(channel_id: str, message_id: str) -> None:
+    """React to a human message the moment the gateway claims it.
+
+    WHY THIS EXISTS. Until now the first reaction on a message was the eyes,
+    set by the agent when its session woke. That conflated two different
+    facts -- "the pipeline got this" and "the agent read this" -- so a missing
+    reaction could mean either a dead session or a dead gateway, and there was
+    no way to tell them apart from the outside.
+
+    On 2026-09-05 the discord services died and inbound stopped for 46 minutes.
+    Messages were written to chat-ingress with status "delivered" while no
+    session ever woke on them. From the sender's side that is indistinguishable
+    from being ignored.
+
+    THE MAILBOX SPLITS THEM:
+        no mailbox          the gateway never received it
+        mailbox alone       received, but no agent has processed it
+        mailbox + eyes      received AND read
+
+    IT FIRES ONCE, on the claim, because save_chat_ingress_if_absent is
+    idempotent -- a redelivery or a restart re-enters this path with
+    claimed=False and does not re-react.
+
+    FAILURE IS SWALLOWED ON PURPOSE. A reaction that cannot be set must never
+    stop a message being delivered; the receipt is a convenience for the reader,
+    and delivery is the contract.
+    """
+    if not RECEIPT_REACTION:
+        return
+    channel_id = str(channel_id or "").strip()
+    message_id = str(message_id or "").strip()
+    if not channel_id or not message_id:
+        return
+    try:
+        common.discord_api_request(
+            "PUT",
+            "channels/{}/messages/{}/reactions/{}/@me".format(
+                channel_id,
+                message_id,
+                urllib.parse.quote(RECEIPT_REACTION, safe=""),
+            ),
+        )
+    except Exception:  # noqa: BLE001 - never block delivery on a reaction
+        pass
+
+
 def persist_ingress_receipt(payload: dict[str, Any]) -> dict[str, Any]:
     return common.save_chat_ingress(payload)
 
@@ -1809,6 +1858,10 @@ def process_inbound_message(
             "app": normalized_app_name,
         }
     )
+    if claimed:
+        # RECEIVED. Set the mailbox before any delivery attempt, so the mark
+        # means "the gateway has it" and nothing more.
+        mark_message_received(channel_id, str(message.get("id", "")).strip())
     if not claimed:
         receipt_status = str(base_receipt.get("status", "")).strip()
         receipt_age = utc_age_seconds(str(base_receipt.get("updated_at", "")).strip())
