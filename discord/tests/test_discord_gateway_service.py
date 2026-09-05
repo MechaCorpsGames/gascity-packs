@@ -25,6 +25,15 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self._old_environ = os.environ.copy()
         self.addCleanup(self._restore_environment)
         os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        # The receipt reaction fires on every claimed inbound message and would
+        # add an unrelated discord_api_request call to every assertion in this
+        # class. Silence it here and assert it explicitly in its own tests, so
+        # these keep describing the thing they were written for.
+        os.environ["GC_DISCORD_RECEIPT_REACTION"] = ""
+        gateway_service.RECEIPT_REACTION = ""
+        self.addCleanup(
+            setattr, gateway_service, "RECEIPT_REACTION", "\U0001F4EC"
+        )
         gateway_service.CHANNEL_INFO_CACHE.clear()
         gateway_service.CHANNEL_INFO_FETCH_LOCKS.clear()
         gateway_service.STALE_RECLAIM_LOCKS.clear()
@@ -3999,3 +4008,40 @@ class GatewayPresenceReachesTheWireTests(unittest.TestCase):
         presences = [frame for frame in sent if frame.get("op") == 3]
         self.assertTrue(presences, f"no op 3 reached the wire: {sent}")
         self.assertEqual(presences[0]["d"]["status"], "idle")
+
+
+class ReceiptReactionTests(unittest.TestCase):
+    """The mailbox mark means the GATEWAY received it, not that an agent read it.
+
+    Before this existed the first reaction on a message was the eyes, set by an
+    agent when its session woke. A missing reaction could therefore mean a dead
+    session or a dead gateway and there was no way to tell from the outside. On
+    2026-09-05 inbound stopped for 46 minutes and the messages sat in
+    chat-ingress marked "delivered" with nobody awake to read them.
+    """
+
+    def test_reaction_is_put_on_the_message(self) -> None:
+        with mock.patch.object(common, "discord_api_request") as api:
+            gateway_service.mark_message_received("111", "222")
+        api.assert_called_once_with(
+            "PUT", "channels/111/messages/222/reactions/%F0%9F%93%AC/@me"
+        )
+
+    def test_empty_reaction_disables_it(self) -> None:
+        with mock.patch.object(gateway_service, "RECEIPT_REACTION", ""), \
+                mock.patch.object(common, "discord_api_request") as api:
+            gateway_service.mark_message_received("111", "222")
+        api.assert_not_called()
+
+    def test_missing_ids_are_skipped(self) -> None:
+        with mock.patch.object(common, "discord_api_request") as api:
+            gateway_service.mark_message_received("", "222")
+            gateway_service.mark_message_received("111", "")
+        api.assert_not_called()
+
+    def test_api_failure_never_propagates(self) -> None:
+        """A reaction that cannot be set must not stop the message being delivered."""
+        with mock.patch.object(
+            common, "discord_api_request", side_effect=RuntimeError("boom")
+        ):
+            gateway_service.mark_message_received("111", "222")
