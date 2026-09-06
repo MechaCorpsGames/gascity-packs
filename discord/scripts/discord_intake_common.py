@@ -3210,8 +3210,20 @@ def inbound_attachment_timeout_seconds() -> float:
     An unparseable or non-positive value falls back to the default instead of
     disabling the timeout, because a fetch with no timeout is how a gateway
     worker thread is lost forever.
+
+    THE FILE EXISTS BECAUSE THE ENVIRONMENT CANNOT REACH ONE SERVICE. A workspace
+    service inherits the environment of the controller that spawns it, gc has no
+    per-service environment (`env` under [service.process] is an unknown field,
+    and `gc service restart` takes no --env), so narrowing the timeout through
+    GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS alone would mean restarting the
+    supervisor: the whole city and every session, to exercise one fetch. The file
+    is read per fetch, so writing it arms the narrowed timeout and deleting it
+    restores the default, both without a restart and both effective on the very
+    next attachment.
     """
     raw = str(os.environ.get("GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS", "")).strip()
+    if not raw:
+        raw = _read_attachment_timeout_override_file()
     if not raw:
         return float(INBOUND_ATTACHMENT_TIMEOUT_SECONDS)
     try:
@@ -3221,6 +3233,25 @@ def inbound_attachment_timeout_seconds() -> float:
     if value <= 0:
         return float(INBOUND_ATTACHMENT_TIMEOUT_SECONDS)
     return value
+
+
+def inbound_attachment_timeout_override_path() -> str:
+    """The one-line file that narrows the fetch timeout without a restart."""
+    return os.path.join(data_dir(), "attachment-timeout-seconds")
+
+
+def _read_attachment_timeout_override_file() -> str:
+    """The file's contents, or "" when it is absent or unreadable.
+
+    Deliberately silent. This runs on the inbound path of a live gateway, and a
+    missing or half-written override must leave the default timeout standing
+    rather than raise inside a download.
+    """
+    try:
+        with open(inbound_attachment_timeout_override_path(), encoding="utf-8") as handle:
+            return handle.read(64).strip()
+    except OSError:
+        return ""
 INBOUND_ATTACHMENT_FILENAME_MAX = 96
 
 
