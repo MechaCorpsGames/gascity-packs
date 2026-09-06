@@ -287,6 +287,14 @@ stops the message reaching its session.
 | `GC_DISCORD_ATTACHMENT_FAILURE_REACTION` | the failure emoji, or empty to disable the failure notice and its reply |
 | `GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS` | inbound attachment fetch timeout, default 20 |
 
+A workspace service inherits the controller's environment and gc has no
+per-service environment, so the fetch timeout can also be narrowed by writing
+one number to `.gc/services/discord/data/attachment-timeout-seconds`. It is read
+per fetch: writing the file takes effect on the next attachment and deleting it
+restores the default, neither needing a restart. The environment variable wins
+when both are set, and an empty, unparseable or non-positive value leaves the
+default standing rather than removing the timeout.
+
 ## Inspect Status
 
 ```bash

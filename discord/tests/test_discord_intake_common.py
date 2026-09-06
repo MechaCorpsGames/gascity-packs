@@ -3771,9 +3771,15 @@ class AttachmentTimeoutTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
         self._old_environ = os.environ.copy()
         self.addCleanup(self._restore_environment)
         os.environ.pop("GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS", None)
+        # No city root by default: the tests that do not write an override must
+        # see the timeout a gateway with no override file sees.
+        os.environ.pop("GC_CITY_ROOT", None)
+        os.environ.pop("GC_CITY_PATH", None)
 
     def _restore_environment(self) -> None:
         os.environ.clear()
@@ -3838,6 +3844,66 @@ class AttachmentTimeoutTests(unittest.TestCase):
                     common.inbound_attachment_timeout_seconds(),
                     float(common.INBOUND_ATTACHMENT_TIMEOUT_SECONDS),
                 )
+
+    # --- the override file, which is how a live gateway is narrowed ---------
+
+    def _write_override(self, raw: str) -> None:
+        common.ensure_layout()
+        path = common.inbound_attachment_timeout_override_path()
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(raw)
+
+    def test_the_file_narrows_it_with_no_restart(self) -> None:
+        """A service inherits the controller's environment and gc has no
+        per-service env, so the file is the only lever that does not mean
+        restarting the whole city to exercise one fetch."""
+        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        self._write_override("0.001\n")
+
+        self.assertEqual(common.inbound_attachment_timeout_seconds(), 0.001)
+
+    def test_deleting_the_file_restores_the_default(self) -> None:
+        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        self._write_override("0.001")
+        self.assertEqual(common.inbound_attachment_timeout_seconds(), 0.001)
+
+        os.unlink(common.inbound_attachment_timeout_override_path())
+
+        self.assertEqual(
+            common.inbound_attachment_timeout_seconds(),
+            float(common.INBOUND_ATTACHMENT_TIMEOUT_SECONDS),
+        )
+
+    def test_a_useless_file_leaves_the_default_standing(self) -> None:
+        """A half-written override must not take the timeout off a live gateway."""
+        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        for raw in ("", "   ", "not-a-number", "0", "-3"):
+            with self.subTest(raw=raw):
+                self._write_override(raw)
+                self.assertEqual(
+                    common.inbound_attachment_timeout_seconds(),
+                    float(common.INBOUND_ATTACHMENT_TIMEOUT_SECONDS),
+                )
+
+    def test_the_environment_wins_over_the_file(self) -> None:
+        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        self._write_override("0.5")
+        os.environ["GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS"] = "0.001"
+
+        self.assertEqual(common.inbound_attachment_timeout_seconds(), 0.001)
+
+    def test_a_narrowed_timeout_from_the_file_really_times_out(self) -> None:
+        """The whole point: a real socket, a real timeout, no restart, no switch."""
+        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        port = self._listener(answer=False)
+        self._write_override("0.001")
+
+        started = time.monotonic()
+        with self.assertRaises(Exception) as caught:
+            common._fetch_attachment_bytes(f"http://127.0.0.1:{port}/shot.png", 1024)
+
+        self.assertIn("timed out", str(caught.exception).lower())
+        self.assertLess(time.monotonic() - started, 5.0)
 
     def test_a_narrowed_timeout_makes_a_real_fetch_really_time_out(self) -> None:
         port = self._listener(answer=False)
