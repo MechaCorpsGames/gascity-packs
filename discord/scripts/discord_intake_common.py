@@ -2116,6 +2116,50 @@ def validate_fix_dispatch_target(target: str, fix_formula: str) -> str:
     return f"{rig.strip()}/{pool.strip()}"
 
 
+def resolve_chat_ingress_attachment_failures(
+    ingress_id: str,
+    filenames: list[str],
+    resolved_by_ingress_id: str,
+) -> dict[str, Any] | None:
+    """Record that a resend answered some of a receipt's failed attachments.
+
+    Written in place rather than through save_chat_ingress, which stamps
+    updated_at. updated_at is what the stale-receipt reclaim ages against, so
+    refreshing it here would push back the retry window of a receipt that
+    failed for reasons that have nothing to do with an attachment.
+
+    Returns the updated record, or None when there was nothing to record.
+    """
+    ingress_id = str(ingress_id or "").strip()
+    wanted = {str(name or "").strip() for name in (filenames or [])}
+    wanted.discard("")
+    if not ingress_id or not wanted:
+        return None
+    record = load_chat_ingress(ingress_id)
+    if not isinstance(record, dict):
+        return None
+    attachments = record.get("attachments")
+    if not isinstance(attachments, list):
+        return None
+    changed = False
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status", "")).strip() == "saved":
+            continue
+        if str(item.get("resolved_by_ingress_id", "")).strip():
+            continue
+        if str(item.get("filename", "")).strip() not in wanted:
+            continue
+        item["resolved_by_ingress_id"] = str(resolved_by_ingress_id or "").strip()
+        item["resolved_at"] = utcnow()
+        changed = True
+    if not changed:
+        return record
+    atomic_write_json(chat_ingress_path(ingress_id), record)
+    return record
+
+
 def list_recent_chat_ingress(limit: int = 20) -> list[dict[str, Any]]:
     ensure_layout()
     entries: list[dict[str, Any]] = []
@@ -3150,6 +3194,33 @@ INBOUND_ATTACHMENT_MAX_COUNT = ATTACHMENT_MAX_COUNT
 # on a single inbound message; this bounds the whole message instead.
 INBOUND_ATTACHMENT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 INBOUND_ATTACHMENT_TIMEOUT_SECONDS = 20
+
+
+def inbound_attachment_timeout_seconds() -> float:
+    """The fetch timeout, overridable through the environment.
+
+    GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS exists so a download can be made to
+    genuinely fail on a running gateway. The alternative, a "pretend this one
+    failed" switch, would demonstrate the switch while the except branch that
+    has to be right when a CDN actually hiccups never runs. Narrowing the
+    timeout puts a real socket timeout through the real path, and the reason
+    the sender is shown is the reason the code produced.
+
+    Read per fetch rather than at import so a test can set it around one call.
+    An unparseable or non-positive value falls back to the default instead of
+    disabling the timeout, because a fetch with no timeout is how a gateway
+    worker thread is lost forever.
+    """
+    raw = str(os.environ.get("GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS", "")).strip()
+    if not raw:
+        return float(INBOUND_ATTACHMENT_TIMEOUT_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(INBOUND_ATTACHMENT_TIMEOUT_SECONDS)
+    if value <= 0:
+        return float(INBOUND_ATTACHMENT_TIMEOUT_SECONDS)
+    return value
 INBOUND_ATTACHMENT_FILENAME_MAX = 96
 
 
@@ -3293,7 +3364,7 @@ def _fetch_attachment_bytes(url: str, limit: int) -> bytes:
     )
     chunks: list[bytes] = []
     total = 0
-    with attachment_urlopen(request, timeout=INBOUND_ATTACHMENT_TIMEOUT_SECONDS) as response:
+    with attachment_urlopen(request, timeout=inbound_attachment_timeout_seconds()) as response:
         while True:
             chunk = response.read(65536)
             if not chunk:
