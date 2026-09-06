@@ -4045,3 +4045,273 @@ class ReceiptReactionTests(unittest.TestCase):
             common, "discord_api_request", side_effect=RuntimeError("boom")
         ):
             gateway_service.mark_message_received("111", "222")
+
+
+class AttachmentFailureMarkTests(unittest.TestCase):
+    """A file that did not arrive says so on the message that carried it.
+
+    download_inbound_attachments has recorded a per-attachment status with a
+    reason since inbound attachments existed, and its docstring says it exists
+    so "the reader can tell a transmission error from a silent one". Nothing
+    read the field. The session saw ``attachments_failed_count`` in its
+    envelope and the human who sent the screenshot saw a mailbox and had every
+    reason to believe the image was in the room.
+
+    The marks STACK, and the mailbox is never withheld:
+
+        mailbox              the gateway received the message
+        mailbox + cross      it received it and part of the delivery failed
+
+    Gating the mailbox on a clean download would make a partial failure look
+    identical to a dead gateway, which is the ambiguity the mailbox exists to
+    remove.
+    """
+
+    CROSS = "%E2%9D%8C"
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self._old_environ = os.environ.copy()
+        self.addCleanup(self._restore_environment)
+        os.environ["GC_CITY_ROOT"] = self.tempdir.name
+        # The mailbox fires on every claimed message and would add an unrelated
+        # call to each assertion here. Silenced except in the test that pins the
+        # two marks stacking.
+        gateway_service.RECEIPT_REACTION = ""
+        self.addCleanup(setattr, gateway_service, "RECEIPT_REACTION", "\U0001F4EC")
+        gateway_service.CHANNEL_INFO_CACHE.clear()
+        gateway_service.CHANNEL_INFO_FETCH_LOCKS.clear()
+        gateway_service.STALE_RECLAIM_LOCKS.clear()
+        gateway_service.INGRESS_PROCESS_LOCKS.clear()
+        gateway_service.AMBIENT_ROOM_BINDINGS_CACHE["config_signature"] = None
+        gateway_service.AMBIENT_ROOM_BINDINGS_CACHE["bindings"] = {}
+        common.set_chat_binding(common.load_config(), "dm", "55", ["sky"])
+
+    def _restore_environment(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._old_environ)
+
+    @staticmethod
+    def _attachment(name: str = "shot.png", index: int = 0) -> dict[str, object]:
+        return {
+            "id": f"a-{index}",
+            "filename": name,
+            "content_type": "image/png",
+            "size": 9,
+            "url": f"https://cdn.discordapp.com/attachments/1/2/{name}?ex=6a9a5d70&is=1&hm=2",
+        }
+
+    @staticmethod
+    def _response(body: bytes = b"PNG-BYTES"):
+        handle = mock.MagicMock()
+        handle.read.side_effect = [body, b""]
+        handle.__enter__ = mock.Mock(return_value=handle)
+        handle.__exit__ = mock.Mock(return_value=False)
+        return handle
+
+    def _message(
+        self,
+        message_id: str,
+        names: list[str],
+        author_id: str = "u-1",
+        content: str = "see attached",
+    ) -> dict[str, object]:
+        return {
+            "id": message_id,
+            "channel_id": "55",
+            "content": content,
+            "attachments": [self._attachment(name, index) for index, name in enumerate(names)],
+            "author": {"id": author_id, "username": "julius"},
+        }
+
+    def _deliver(self, message: dict[str, object], urlopen_result: dict[str, object]):
+        """Drive the real inbound path, not the mark helper on its own."""
+        api = mock.MagicMock(return_value={})
+        with mock.patch.object(
+            common, "session_index_by_name", return_value={"sky": {"session_name": "sky", "state": "active"}}
+        ), mock.patch.object(
+            common, "deliver_session_message", return_value={"status": "accepted"}
+        ) as deliver, mock.patch.object(
+            common, "attachment_urlopen", **urlopen_result
+        ), mock.patch.object(common, "discord_api_request", api):
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+        return outcome, api, deliver
+
+    def _reaction_paths(self, api: mock.MagicMock, method: str) -> list[str]:
+        return [
+            call.args[1]
+            for call in api.call_args_list
+            if call.args and call.args[0] == method and "/reactions/" in call.args[1]
+        ]
+
+    def _replies(self, api: mock.MagicMock) -> list[dict[str, object]]:
+        return [
+            call.kwargs["payload"]
+            for call in api.call_args_list
+            if call.args and call.args[0] == "POST" and call.args[1].endswith("/messages")
+        ]
+
+    def _fail(self, message: dict[str, object]):
+        return self._deliver(message, {"side_effect": urllib.error.URLError("cdn refused")})
+
+    def _succeed(self, message: dict[str, object]):
+        return self._deliver(message, {"return_value": self._response()})
+
+    # --- the mark ----------------------------------------------------------
+
+    def test_a_failed_download_gets_the_cross_and_a_reply_naming_the_file(self) -> None:
+        outcome, api, _ = self._fail(self._message("921", ["shot.png"]))
+
+        self.assertEqual(outcome["status"], "delivered")
+        self.assertEqual(
+            self._reaction_paths(api, "PUT"),
+            [f"channels/55/messages/921/reactions/{self.CROSS}/@me"],
+        )
+        replies = self._replies(api)
+        self.assertEqual(len(replies), 1)
+        self.assertIn("shot.png", replies[0]["content"])
+        self.assertIn("cdn refused", replies[0]["content"])
+        self.assertEqual(replies[0]["message_reference"]["message_id"], "921")
+
+    def test_the_mailbox_is_not_withheld_when_an_attachment_fails(self) -> None:
+        """The marks stack. A missing mailbox must keep meaning a dead gateway."""
+        gateway_service.RECEIPT_REACTION = "\U0001F4EC"
+
+        outcome, api, deliver = self._fail(self._message("922", ["shot.png"]))
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver.assert_called_once()
+        self.assertEqual(
+            self._reaction_paths(api, "PUT"),
+            [
+                "channels/55/messages/922/reactions/%F0%9F%93%AC/@me",
+                f"channels/55/messages/922/reactions/{self.CROSS}/@me",
+            ],
+        )
+
+    def test_a_clean_delivery_is_not_marked_and_says_nothing(self) -> None:
+        _, api, _ = self._succeed(self._message("923", ["shot.png"]))
+
+        self.assertEqual(self._reaction_paths(api, "PUT"), [])
+        self.assertEqual(self._replies(api), [])
+
+    def test_the_reply_names_every_file_that_failed(self) -> None:
+        _, api, _ = self._fail(self._message("924", ["shot.png", "log.txt"]))
+
+        content = self._replies(api)[0]["content"]
+        self.assertIn("2 of 2 attachments did not make it", content)
+        self.assertIn("shot.png", content)
+        self.assertIn("log.txt", content)
+
+    def test_a_skipped_file_is_reported_with_its_own_reason(self) -> None:
+        """Not only a transmission error: a refusal is just as silent."""
+        message = self._message("925", ["huge.png"])
+        message["attachments"][0]["size"] = common.INBOUND_ATTACHMENT_MAX_BYTES + 1
+
+        _, api, _ = self._deliver(
+            message, {"side_effect": AssertionError("an oversized file must not be fetched")}
+        )
+
+        content = self._replies(api)[0]["content"]
+        self.assertIn("huge.png", content)
+        self.assertIn("per-file limit", content)
+
+    def test_a_reaction_that_cannot_be_set_never_stops_the_delivery(self) -> None:
+        api = mock.MagicMock(side_effect=RuntimeError("discord is down"))
+        with mock.patch.object(
+            common, "session_index_by_name", return_value={"sky": {"session_name": "sky", "state": "active"}}
+        ), mock.patch.object(
+            common, "deliver_session_message", return_value={"status": "accepted"}
+        ) as deliver, mock.patch.object(
+            common, "attachment_urlopen", side_effect=urllib.error.URLError("cdn refused")
+        ), mock.patch.object(common, "discord_api_request", api):
+            outcome = gateway_service.process_inbound_message(
+                self._message("926", ["shot.png"]), bot_user_id="999"
+            )
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver.assert_called_once()
+
+    def test_an_empty_reaction_setting_disables_the_whole_notice(self) -> None:
+        with mock.patch.object(gateway_service, "ATTACHMENT_FAILURE_REACTION", ""):
+            _, api, _ = self._fail(self._message("927", ["shot.png"]))
+
+        self.assertEqual(self._reaction_paths(api, "PUT"), [])
+        self.assertEqual(self._replies(api), [])
+
+    # --- the reply text, which echoes attacker-controlled input -------------
+
+    def test_the_reply_cannot_ping_anyone(self) -> None:
+        """A filename is free text. "<@1234>.png" must not become a mention."""
+        _, api, _ = self._fail(self._message("928", ["<@1234>.png"]))
+
+        self.assertEqual(self._replies(api)[0]["allowed_mentions"], {"parse": []})
+
+    def test_a_filename_cannot_break_out_of_its_line(self) -> None:
+        item = {"filename": "a\nb`c", "status": "failed", "error": "boom\nsecond line"}
+
+        body = gateway_service.attachment_failure_reply_body([item], 1)
+
+        self.assertEqual(len(body.splitlines()), 3)
+        self.assertIn("- `a b'c`: boom second line", body)
+
+    def test_a_file_with_no_reason_still_reports_its_status(self) -> None:
+        reason = gateway_service.attachment_failure_reason(
+            {"filename": "shot.png", "status": "skipped_budget", "error": ""}
+        )
+
+        self.assertEqual(reason, "skipped_budget")
+
+    # --- clearing ----------------------------------------------------------
+
+    def test_a_resend_takes_the_mark_off_the_earlier_message(self) -> None:
+        self._fail(self._message("931", ["shot.png"]))
+
+        _, api, _ = self._succeed(self._message("932", ["shot.png"]))
+
+        self.assertEqual(
+            self._reaction_paths(api, "DELETE"),
+            [f"channels/55/messages/931/reactions/{self.CROSS}/@me"],
+        )
+        resolved = common.load_chat_ingress("in-931")["attachments"][0]
+        self.assertEqual(resolved["resolved_by_ingress_id"], "in-932")
+
+    def test_the_mark_stays_until_every_failed_file_is_back(self) -> None:
+        self._fail(self._message("933", ["shot.png", "log.txt"]))
+
+        _, api, _ = self._succeed(self._message("934", ["shot.png"]))
+        self.assertEqual(self._reaction_paths(api, "DELETE"), [])
+
+        _, api, _ = self._succeed(self._message("935", ["log.txt"]))
+        self.assertEqual(
+            self._reaction_paths(api, "DELETE"),
+            [f"channels/55/messages/933/reactions/{self.CROSS}/@me"],
+        )
+
+    def test_a_mark_is_cleared_once_and_not_again(self) -> None:
+        self._fail(self._message("936", ["shot.png"]))
+        self._succeed(self._message("937", ["shot.png"]))
+
+        _, api, _ = self._succeed(self._message("938", ["shot.png"]))
+
+        self.assertEqual(self._reaction_paths(api, "DELETE"), [])
+
+    def test_someone_else_sending_that_filename_does_not_clear_it(self) -> None:
+        """The flag belongs to the person who was asked to resend."""
+        self._fail(self._message("939", ["shot.png"]))
+
+        _, api, _ = self._succeed(self._message("940", ["shot.png"], author_id="u-2"))
+
+        self.assertEqual(self._reaction_paths(api, "DELETE"), [])
+
+    def test_a_resend_that_also_fails_clears_nothing(self) -> None:
+        self._fail(self._message("941", ["shot.png"]))
+
+        _, api, _ = self._fail(self._message("942", ["shot.png"]))
+
+        self.assertEqual(self._reaction_paths(api, "DELETE"), [])
+        self.assertEqual(
+            self._reaction_paths(api, "PUT"),
+            [f"channels/55/messages/942/reactions/{self.CROSS}/@me"],
+        )

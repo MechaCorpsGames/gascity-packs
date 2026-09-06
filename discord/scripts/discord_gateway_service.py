@@ -958,6 +958,272 @@ def mark_message_received(channel_id: str, message_id: str) -> None:
         pass
 
 
+# The second half of the mailbox vocabulary. The marks STACK and the mailbox is
+# never withheld:
+#
+#     mailbox              the gateway received the message
+#     mailbox + cross      it received it and part of the delivery failed
+#
+# Gating the mailbox on a clean download was considered and rejected: it would
+# make a partial failure look identical to a dead gateway, which is the exact
+# ambiguity the mailbox was invented to remove.
+#
+# Empty disables the whole failure notice, reaction and reply both, the way
+# GC_DISCORD_RECEIPT_REACTION disables the mailbox.
+ATTACHMENT_FAILURE_REACTION = os.environ.get("GC_DISCORD_ATTACHMENT_FAILURE_REACTION", "\u274C")
+# Discord caps a message at 2000 characters. Every variable part of this reply
+# came off an inbound payload, so it is built to a budget rather than trusted
+# to fit.
+ATTACHMENT_FAILURE_REPLY_MAX_CHARS = 1800
+ATTACHMENT_FAILURE_REASON_MAX_CHARS = 160
+# How far back a resend reaches to clear a mark. Receipts are kept for seven
+# days; this bounds the scan, not the retention.
+ATTACHMENT_FAILURE_SCAN_LIMIT = 50
+
+
+def unsaved_attachments(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """The attachments that did not reach disk, whatever stopped them.
+
+    "saved" is the only status that means the session can open the file.
+    Everything else -- failed, skipped_untrusted_host, skipped_too_large,
+    skipped_budget, skipped_too_many -- is a file the sender believes arrived
+    and that nobody has.
+    """
+    return [
+        item
+        for item in (attachments or [])
+        if isinstance(item, dict) and str(item.get("status", "")).strip() != "saved"
+    ]
+
+
+def _single_line(value: Any, limit: int) -> str:
+    """Collapse untrusted text to one bounded line.
+
+    A filename is free text chosen by the sender. A newline in it would break
+    the reply into lines the reader would read as the bot's own words, and a
+    backtick would escape the code span it is rendered in.
+    """
+    text = " ".join(str(value or "").split()).replace("`", "'")
+    if len(text) > limit:
+        text = text[: max(1, limit - 3)] + "..."
+    return text
+
+
+def attachment_failure_reason(item: dict[str, Any]) -> str:
+    """What to tell the sender about one file, in their words where possible.
+
+    ``error`` is written for a reader ("415000 bytes, over the ...-byte per-file
+    limit"); ``status`` is the machine vocabulary and is the fallback when the
+    reason is empty, because naming the file with no reason at all is the
+    silence this whole feature exists to end.
+    """
+    reason = _single_line(item.get("error", ""), ATTACHMENT_FAILURE_REASON_MAX_CHARS)
+    if reason:
+        return reason
+    return _single_line(item.get("status", ""), ATTACHMENT_FAILURE_REASON_MAX_CHARS) or "no reason recorded"
+
+
+def attachment_failure_reply_body(failed: list[dict[str, Any]], total: int) -> str:
+    """A direct reply naming exactly which files failed and why.
+
+    The reaction says something went wrong; only this says what. A mark with no
+    reply would leave the sender to guess which of five screenshots is missing.
+    """
+    total = max(int(total or 0), len(failed))
+    if total == 1:
+        head = "That attachment did not make it:"
+    else:
+        head = f"{len(failed)} of {total} attachments did not make it:"
+    lines = [head]
+    for item in failed:
+        name = _single_line(item.get("filename", ""), common.INBOUND_ATTACHMENT_FILENAME_MAX) or "(unnamed file)"
+        lines.append(f"- `{name}`: {attachment_failure_reason(item)}")
+        if sum(len(line) + 1 for line in lines) > ATTACHMENT_FAILURE_REPLY_MAX_CHARS:
+            lines.pop()
+            lines.append(f"- ... and {len(failed) - (len(lines) - 2)} more")
+            break
+    lines.append("Send it again and this mark comes off.")
+    return "\n".join(lines)
+
+
+def set_attachment_failure_reaction(channel_id: str, message_id: str, present: bool) -> None:
+    common.discord_api_request(
+        "PUT" if present else "DELETE",
+        "channels/{}/messages/{}/reactions/{}/@me".format(
+            channel_id,
+            message_id,
+            urllib.parse.quote(ATTACHMENT_FAILURE_REACTION, safe=""),
+        ),
+    )
+
+
+def post_attachment_failure_reply(channel_id: str, message_id: str, body: str) -> None:
+    common.discord_api_request(
+        "POST",
+        "channels/{}/messages".format(channel_id),
+        payload={
+            "content": body,
+            # parse: [] rather than post_channel_message's parse: ["users"].
+            # The variable part of this reply is a filename the sender chose,
+            # so "<@1234>.png" would otherwise ping whoever that id belongs to,
+            # from the bot, on a message they did not write.
+            "allowed_mentions": {"parse": []},
+            "message_reference": {
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "fail_if_not_exists": False,
+            },
+        },
+    )
+
+
+def mark_attachment_failure(
+    channel_id: str,
+    message_id: str,
+    attachments: list[dict[str, Any]],
+) -> None:
+    """Flag a message whose text arrived while one of its files did not.
+
+    download_inbound_attachments has recorded a per-item status with a reason
+    since inbound attachments existed, and its docstring says it exists so "the
+    reader can tell a transmission error from a silent one". Nothing read the
+    field: the session saw attachments_failed_count in its envelope and the
+    human who sent the file saw a mailbox and assumed their screenshot was in
+    the room.
+
+    FAILURE IS SWALLOWED, for the same reason the mailbox swallows it. The text
+    of the message has already been delivered by the time anything here runs,
+    and a reaction or a reply that cannot be posted must not turn a partial
+    delivery into a failed one.
+    """
+    if not ATTACHMENT_FAILURE_REACTION:
+        return
+    failed = unsaved_attachments(attachments)
+    if not failed:
+        return
+    channel_id = str(channel_id or "").strip()
+    message_id = str(message_id or "").strip()
+    if not channel_id or not message_id:
+        return
+    try:
+        set_attachment_failure_reaction(channel_id, message_id, True)
+    except Exception:  # noqa: BLE001 - never turn a partial delivery into a failure
+        pass
+    try:
+        post_attachment_failure_reply(
+            channel_id,
+            message_id,
+            attachment_failure_reply_body(failed, len(attachments or [])),
+        )
+    except Exception:  # noqa: BLE001 - same
+        pass
+
+
+def clear_attachment_failure_marks(
+    message: dict[str, Any],
+    attachments: list[dict[str, Any]],
+    ingress_id: str,
+) -> None:
+    """Take the mark off an earlier message once its files have been resent.
+
+    FILENAME MATCH, and resolved regardless of content: a human who resends
+    ``shot.png`` has answered the flag, and asking the gateway to prove the
+    bytes are the same ones would leave a mark standing on a message whose
+    sender has already done everything asked of them.
+
+    Resolution is recorded per file, so resending two failed files one at a
+    time clears the mark on the second one rather than needing both in a single
+    message.
+    """
+    if not ATTACHMENT_FAILURE_REACTION:
+        return
+    resent = {
+        str(item.get("filename", "")).strip()
+        for item in (attachments or [])
+        if isinstance(item, dict) and str(item.get("status", "")).strip() == "saved"
+    }
+    resent.discard("")
+    if not resent:
+        return
+    author_id = str((message.get("author") or {}).get("id", "")).strip()
+    channel_id = str(message.get("channel_id", "")).strip()
+    current_message_id = str(message.get("id", "")).strip()
+    if not author_id or not channel_id:
+        return
+    try:
+        records = common.list_recent_chat_ingress(limit=ATTACHMENT_FAILURE_SCAN_LIMIT)
+    except Exception:  # noqa: BLE001 - clearing a mark is never worth a raise
+        return
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("from_user_id", "")).strip() != author_id:
+            continue
+        if str(record.get("conversation_id", "")).strip() != channel_id:
+            continue
+        flagged_message_id = str(record.get("discord_message_id", "")).strip()
+        if not flagged_message_id or flagged_message_id == current_message_id:
+            continue
+        outstanding = [
+            item
+            for item in unsaved_attachments(record.get("attachments"))
+            if not str(item.get("resolved_by_ingress_id", "")).strip()
+        ]
+        if not outstanding:
+            continue
+        resolved_names = [
+            str(item.get("filename", "")).strip()
+            for item in outstanding
+            if str(item.get("filename", "")).strip() in resent
+        ]
+        if not resolved_names:
+            continue
+        try:
+            updated = common.resolve_chat_ingress_attachment_failures(
+                str(record.get("ingress_id", "")).strip(),
+                resolved_names,
+                str(ingress_id or "").strip(),
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if updated is None:
+            continue
+        still_missing = [
+            item
+            for item in unsaved_attachments(updated.get("attachments"))
+            if not str(item.get("resolved_by_ingress_id", "")).strip()
+        ]
+        if still_missing:
+            # Part of that message is still missing, so the mark still
+            # describes the message it sits on.
+            continue
+        try:
+            set_attachment_failure_reaction(channel_id, flagged_message_id, False)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def download_and_mark_attachments(
+    ingress_id: str,
+    message: dict[str, Any],
+    attachments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """The one way inbound attachments are fetched, so no route can skip the mark.
+
+    Every delivery path downloads and then has to say whether the download
+    worked; wrapping the two together is what makes that true of a path added
+    later as well.
+    """
+    attachments = common.download_inbound_attachments(ingress_id, attachments)
+    mark_attachment_failure(
+        str(message.get("channel_id", "")).strip(),
+        str(message.get("id", "")).strip(),
+        attachments,
+    )
+    clear_attachment_failure_marks(message, attachments, ingress_id)
+    return attachments
+
+
 def persist_ingress_receipt(payload: dict[str, Any]) -> dict[str, Any]:
     return common.save_chat_ingress(payload)
 
@@ -1531,7 +1797,7 @@ def process_room_launch_message(
     # delivery_protocol_version and per-target idempotency keys), so the
     # download lands before that single persist and the pre-download persist
     # plus re-persist this commit originally needed is gone.
-    attachments = common.download_inbound_attachments(ingress_id, attachments)
+    attachments = download_and_mark_attachments(ingress_id, message, attachments)
     envelope = build_room_launch_envelope(
         launcher=launcher,
         launch=launch,
@@ -1692,7 +1958,7 @@ def process_room_launch_thread_message(
     # delivery_protocol_version and per-target idempotency keys), so the
     # download lands before that single persist and the pre-download persist
     # plus re-persist this commit originally needed is gone.
-    attachments = common.download_inbound_attachments(ingress_id, attachments)
+    attachments = download_and_mark_attachments(ingress_id, message, attachments)
     envelope = build_room_launch_thread_envelope(
         launcher=launcher,
         launch=launch,
@@ -2113,7 +2379,7 @@ def process_inbound_message(
         # delivery_protocol_version and per-target idempotency keys), so the
         # download lands before that single persist and the pre-download persist
         # plus re-persist this commit originally needed is gone.
-        attachments = common.download_inbound_attachments(ingress_id, attachments)
+        attachments = download_and_mark_attachments(ingress_id, message, attachments)
         envelope = build_human_envelope(
             binding=binding,
             message=message,

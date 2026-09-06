@@ -3758,3 +3758,107 @@ class GatewayPresenceTests(unittest.TestCase):
         common.save_gateway_presence("idle", ttl_seconds=600, reason="session stalled 20 min")
 
         self.assertEqual(common.load_gateway_presence()["reason"], "session stalled 20 min")
+
+
+class AttachmentTimeoutTests(unittest.TestCase):
+    """The fetch timeout is real, and it can be narrowed on a running gateway.
+
+    GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS exists so a download can be made to
+    genuinely fail without a "pretend this one failed" switch. A switch would
+    demonstrate the switch; only a real timeout puts a real socket error through
+    the except branch in download_inbound_attachments, which is the code that
+    has to be right when a CDN actually hiccups.
+    """
+
+    def setUp(self) -> None:
+        self._old_environ = os.environ.copy()
+        self.addCleanup(self._restore_environment)
+        os.environ.pop("GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS", None)
+
+    def _restore_environment(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._old_environ)
+
+    def _listener(self, *, answer: bool) -> int:
+        """A local TCP server that either answers HTTP or accepts and says nothing."""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        self.addCleanup(server.close)
+        body = b"REAL-BYTES"
+        # The silent server holds the connection open until teardown rather
+        # than sleeping a fixed span, so this class costs milliseconds.
+        released = threading.Event()
+
+        def run() -> None:
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                return
+            with connection:
+                try:
+                    connection.recv(65536)
+                    if not answer:
+                        released.wait(10)
+                        return
+                    connection.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
+                        % (len(body), body)
+                    )
+                except OSError:
+                    return
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+
+        def release_and_join() -> None:
+            released.set()
+            thread.join(10)
+
+        self.addCleanup(release_and_join)
+        return int(server.getsockname()[1])
+
+    def test_the_default_is_the_constant(self) -> None:
+        self.assertEqual(
+            common.inbound_attachment_timeout_seconds(),
+            float(common.INBOUND_ATTACHMENT_TIMEOUT_SECONDS),
+        )
+
+    def test_the_environment_narrows_it(self) -> None:
+        os.environ["GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS"] = "0.001"
+        self.assertEqual(common.inbound_attachment_timeout_seconds(), 0.001)
+
+    def test_a_useless_value_falls_back_rather_than_disabling_the_timeout(self) -> None:
+        """A fetch with no timeout is how a gateway worker thread is lost forever."""
+        for raw in ("", "   ", "not-a-number", "0", "-3"):
+            with self.subTest(raw=raw):
+                os.environ["GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS"] = raw
+                self.assertEqual(
+                    common.inbound_attachment_timeout_seconds(),
+                    float(common.INBOUND_ATTACHMENT_TIMEOUT_SECONDS),
+                )
+
+    def test_a_narrowed_timeout_makes_a_real_fetch_really_time_out(self) -> None:
+        port = self._listener(answer=False)
+        os.environ["GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS"] = "0.001"
+
+        started = time.monotonic()
+        with self.assertRaises(Exception) as caught:
+            common._fetch_attachment_bytes(f"http://127.0.0.1:{port}/shot.png", 1024)
+
+        self.assertIn("timed out", str(caught.exception).lower())
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_the_same_fetch_succeeds_at_the_normal_timeout(self) -> None:
+        """The positive control: the timeout is what failed the fetch above.
+
+        Same function, same local server, same url shape. Without this, a fetch
+        that failed because urlopen could not reach 127.0.0.1 at all would read
+        exactly like a timeout.
+        """
+        port = self._listener(answer=True)
+
+        content = common._fetch_attachment_bytes(f"http://127.0.0.1:{port}/shot.png", 1024)
+
+        self.assertEqual(content, b"REAL-BYTES")

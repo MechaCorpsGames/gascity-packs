@@ -261,6 +261,32 @@ Inbound behavior in v0:
 - peer fanout for room publishes is opt-in per binding and disabled by default
 - peer-triggered publishes only fan out when they explicitly mention target `@session_name` values
 
+### What the reactions on your message mean
+
+The gateway marks the message it received, so a sender can tell a dead pipeline
+from a quiet agent without asking. The marks stack:
+
+| mark | meaning |
+| --- | --- |
+| nothing | the gateway never received it |
+| 📬 | received and recorded, but no agent has processed it yet |
+| 📬 👀 | received, and an agent has read it |
+| 📬 ❌ | received, and part of the delivery failed |
+
+A cross always comes with a direct reply naming each file that did not arrive
+and why. Send the file again and the cross comes off once every file that
+failed on that message is back; matching is by filename, so a resend answers
+the flag whatever the bytes are.
+
+Both marks are best-effort. A reaction or reply that cannot be posted never
+stops the message reaching its session.
+
+| variable | effect |
+| --- | --- |
+| `GC_DISCORD_RECEIPT_REACTION` | the received emoji, or empty to disable it |
+| `GC_DISCORD_ATTACHMENT_FAILURE_REACTION` | the failure emoji, or empty to disable the failure notice and its reply |
+| `GC_DISCORD_ATTACHMENT_TIMEOUT_SECONDS` | inbound attachment fetch timeout, default 20 |
+
 ## Inspect Status
 
 ```bash
