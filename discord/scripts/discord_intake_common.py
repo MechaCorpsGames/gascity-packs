@@ -381,6 +381,7 @@ def default_config() -> dict[str, Any]:
             "guild_allowlist": [],
             "channel_allowlist": [],
             "role_allowlist": [],
+            "bot_allowlist": [],
         },
         "channels": {},
         "rigs": {},
@@ -459,6 +460,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
             "guild_allowlist": _normalize_allowlist(policy.get("guild_allowlist")),
             "channel_allowlist": _normalize_allowlist(policy.get("channel_allowlist")),
             "role_allowlist": _normalize_allowlist(policy.get("role_allowlist")),
+            "bot_allowlist": _normalize_allowlist(policy.get("bot_allowlist")),
         }
     apps = raw.get("apps")
     if isinstance(apps, dict):
@@ -480,6 +482,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
                     "guild_allowlist": _normalize_allowlist(app_policy.get("guild_allowlist")),
                     "channel_allowlist": _normalize_allowlist(app_policy.get("channel_allowlist")),
                     "role_allowlist": _normalize_allowlist(app_policy.get("role_allowlist")),
+                    "bot_allowlist": _normalize_allowlist(app_policy.get("bot_allowlist")),
                 },
             }
         config["apps"] = normalized_apps
@@ -845,7 +848,7 @@ def _import_app_config_locked(
     command_name = str(app_fields.get("command_name", app.get("command_name", COMMAND_NAME_DEFAULT))).strip()
     app["command_name"] = command_name or COMMAND_NAME_DEFAULT
 
-    for key in ("guild_allowlist", "channel_allowlist", "role_allowlist"):
+    for key in ("guild_allowlist", "channel_allowlist", "role_allowlist", "bot_allowlist"):
         if key in app_fields:
             policy[key] = _normalize_allowlist(app_fields.get(key))
     return save_config(cfg)
@@ -6471,6 +6474,7 @@ def policy_reason(
     role_ids: list[str],
     *,
     app_name: str = "",
+    author_id: str = "",
 ) -> str:
     policy = resolve_app_policy(config, app_name)
     guild_allowlist = set(_normalize_allowlist(policy.get("guild_allowlist")))
@@ -6480,9 +6484,29 @@ def policy_reason(
         return "guild_not_allowed"
     if channel_allowlist and parent_channel_id not in channel_allowlist:
         return "channel_not_allowed"
+    # An allowlisted bot (a webhook such as an alerting integration) carries no
+    # member roles, so the role check could never pass for it. The guild and
+    # channel checks above still apply: the bot is admitted only where a human
+    # with the role would be.
+    if is_allowlisted_bot(config, author_id, app_name=app_name):
+        return ""
     if role_allowlist and not role_allowlist.intersection(set(role_ids)):
         return "role_not_allowed"
     return ""
+
+
+def is_allowlisted_bot(config: dict[str, Any], author_id: str, *, app_name: str = "") -> bool:
+    """True when author_id is on policy.bot_allowlist.
+
+    Bot and webhook messages are dropped at the gateway by default. A bot on
+    this list is let through so that its posts (alerts, for instance) reach the
+    bound session; it still has to pass the guild and channel allowlists.
+    """
+    author = str(author_id or "").strip()
+    if not author:
+        return False
+    policy = resolve_app_policy(config, app_name)
+    return author in set(_normalize_allowlist(policy.get("bot_allowlist")))
 
 
 def outbound_policy_reason(

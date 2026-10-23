@@ -596,6 +596,104 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertIsNone(common.load_chat_ingress("in-extmsg-bot-policy-208"))
         self.assertEqual(worker.runtime_state.snapshot()["ignored_messages"], 1)
 
+    def _bot_allowlist_room(self, *, bot_allowlist: list[str]) -> None:
+        config = common.import_app_config(
+            common.load_config(),
+            {
+                "application_id": "999",
+                "public_key": "ab" * 32,
+                "guild_allowlist": ["1"],
+                "channel_allowlist": ["22"],
+                "role_allowlist": ["dev-role"],
+                "bot_allowlist": bot_allowlist,
+            },
+        )
+        common.set_chat_binding(
+            config,
+            "room",
+            "22",
+            ["sky"],
+            guild_id="1",
+            channel_metadata={"channel_type": 0},
+        )
+
+    def _alert_message(self, message_id: str, *, author: dict, channel_id: str = "22") -> dict:
+        return {
+            "id": message_id,
+            "guild_id": "1",
+            "channel_id": channel_id,
+            "content": "<@999> FIRING: SentryScrapeFailing",
+            "mentions": [{"id": "999"}],
+            "author": author,
+        }
+
+    def test_allowlisted_bot_reaches_the_bound_session_without_a_role(self) -> None:
+        self._bot_allowlist_room(bot_allowlist=["grafana-hook"])
+        message = self._alert_message(
+            "bot-allow-301", author={"id": "grafana-hook", "username": "Grafana", "bot": True}
+        )
+
+        with mock.patch.object(common, "session_index_by_name", return_value={"sky": {"session_name": "sky", "state": "active"}}), mock.patch.object(
+            common, "deliver_session_message", return_value={"status": "accepted", "id": "gc-1"}
+        ) as deliver:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver.assert_called_once()
+
+    def test_bot_off_the_allowlist_is_still_ignored(self) -> None:
+        self._bot_allowlist_room(bot_allowlist=["grafana-hook"])
+        message = self._alert_message(
+            "bot-allow-302", author={"id": "other-bot", "username": "robot", "bot": True}
+        )
+
+        with mock.patch.object(common, "deliver_session_message") as deliver:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "bot_message")
+        deliver.assert_not_called()
+
+    def test_allowlisted_bot_still_needs_an_allowed_channel(self) -> None:
+        self._bot_allowlist_room(bot_allowlist=["grafana-hook"])
+        common.set_chat_binding(
+            common.load_config(), "room", "33", ["sky"], guild_id="1", channel_metadata={"channel_type": 0}
+        )
+        message = self._alert_message(
+            "bot-allow-303",
+            author={"id": "grafana-hook", "username": "Grafana", "bot": True},
+            channel_id="33",
+        )
+
+        with mock.patch.object(gateway_service, "_resolve_thread_parent", return_value=""), mock.patch.object(
+            common, "deliver_session_message"
+        ) as deliver:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "rejected_policy")
+        self.assertEqual(outcome["reason"], "channel_not_allowed")
+        deliver.assert_not_called()
+
+    def test_a_human_whose_id_is_on_the_bot_allowlist_still_needs_the_role(self) -> None:
+        self._bot_allowlist_room(bot_allowlist=["u-9"])
+        message = self._alert_message("bot-allow-304", author={"id": "u-9", "username": "mallory"})
+
+        with mock.patch.object(common, "deliver_session_message") as deliver:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "rejected_policy")
+        self.assertEqual(outcome["reason"], "role_not_allowed")
+        deliver.assert_not_called()
+
+    def test_the_bot_itself_is_ignored_even_if_allowlisted(self) -> None:
+        self._bot_allowlist_room(bot_allowlist=["999"])
+        message = self._alert_message("bot-allow-305", author={"id": "999", "username": "mayor", "bot": True})
+
+        outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "ignored")
+        self.assertEqual(outcome["reason"], "bot_message")
+
     def test_default_gateway_policy_does_not_persist_irrelevant_unmentioned_messages(self) -> None:
         common.import_app_config(
             common.load_config(),

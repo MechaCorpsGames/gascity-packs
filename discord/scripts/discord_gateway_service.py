@@ -2013,7 +2013,12 @@ def process_inbound_message(
     normalized_app_name = common.validate_app_name(app_name)
     ingress_id = message_ingress_id(message, normalized_app_name)
     author = message.get("author") or {}
-    if bool(author.get("bot")) or str(author.get("id", "")).strip() == bot_user_id:
+    author_id = str(author.get("id", "")).strip()
+    if author_id == bot_user_id:
+        return {"status": "ignored", "reason": "bot_message", "ingress_id": ingress_id}
+    if bool(author.get("bot")) and not common.is_allowlisted_bot(
+        common.load_config(), author_id, app_name=normalized_app_name
+    ):
         return {"status": "ignored", "reason": "bot_message", "ingress_id": ingress_id}
 
     guild_id = str(message.get("guild_id", "")).strip()
@@ -2248,6 +2253,7 @@ def process_inbound_message(
                 policy_channel_id,
                 role_ids,
                 app_name=normalized_app_name,
+                author_id=str(author.get("id", "")).strip() if bool(author.get("bot")) else "",
             )
             if policy_rejection:
                 receipt = persist_ingress_receipt(
