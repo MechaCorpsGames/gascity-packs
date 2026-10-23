@@ -429,6 +429,20 @@ class DiscordIntakeCommonTests(unittest.TestCase):
         self.assertTrue(redacted["apps"]["ollie"]["bot_token_present"])
         self.assertNotIn("bot_token", redacted["apps"]["ollie"])
 
+    def test_bot_allowlist_survives_normalization_for_default_and_named_apps(self) -> None:
+        cfg = common.normalize_config(
+            {
+                "policy": {"bot_allowlist": [" hook-1 ", ""]},
+                "apps": {"ollie": {"policy": {"bot_allowlist": ["hook-2"]}}},
+            }
+        )
+        self.assertEqual(cfg["policy"]["bot_allowlist"], ["hook-1"])
+        self.assertEqual(cfg["apps"]["ollie"]["policy"]["bot_allowlist"], ["hook-2"])
+        self.assertTrue(common.is_allowlisted_bot(cfg, "hook-1"))
+        self.assertFalse(common.is_allowlisted_bot(cfg, "hook-2"))
+        self.assertTrue(common.is_allowlisted_bot(cfg, "hook-2", app_name="ollie"))
+        self.assertFalse(common.is_allowlisted_bot(cfg, ""))
+
     def test_app_config_and_policy_resolution_fail_closed_for_unknown_name(self) -> None:
         config = common.import_app_config(
             common.load_config(),
