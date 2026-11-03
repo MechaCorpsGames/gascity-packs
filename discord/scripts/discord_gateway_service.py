@@ -147,6 +147,41 @@ def raw_message_content(message: dict[str, Any]) -> str:
     return str(value)
 
 
+def embed_text(message: dict[str, Any]) -> str:
+    """Render a message's embeds as plain text.
+
+    Alerting webhooks (Grafana) post an embed and leave `content` empty, so a
+    reader of `content` alone sees nothing and drops the alert as empty.
+    """
+    embeds = message.get("embeds") or []
+    if not isinstance(embeds, list):
+        return ""
+    lines: list[str] = []
+    for embed in embeds:
+        if not isinstance(embed, dict):
+            continue
+        for key in ("title", "description"):
+            value = str(embed.get(key) or "").strip()
+            if value:
+                lines.append(value)
+        for field in embed.get("fields") or []:
+            if not isinstance(field, dict):
+                continue
+            name = str(field.get("name") or "").strip()
+            value = str(field.get("value") or "").strip()
+            if name or value:
+                lines.append(f"{name}: {value}" if name and value else name or value)
+        footer = embed.get("footer")
+        if isinstance(footer, dict):
+            value = str(footer.get("text") or "").strip()
+            if value:
+                lines.append(value)
+        url = str(embed.get("url") or "").strip()
+        if url:
+            lines.append(url)
+    return "\n".join(lines)
+
+
 def bot_was_mentioned(message: dict[str, Any], bot_user_id: str) -> bool:
     if not bot_user_id:
         return False
@@ -321,6 +356,25 @@ def recover_message_for_routing(
     *,
     bot_token: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    recovered, debug = _recover_message_content(message, bot_token=bot_token)
+    # An embed-only post (a Grafana alert) still has nothing in `content` after
+    # the REST retry. Its text is in the embeds, so route that instead.
+    if not raw_message_content(recovered).strip():
+        if not recovered.get("embeds") and isinstance(debug.get("_fetched"), dict):
+            recovered["embeds"] = debug["_fetched"].get("embeds")
+        text = embed_text(recovered)
+        if text:
+            recovered["content"] = text
+            debug["content_source"] = "embed_fallback"
+    debug.pop("_fetched", None)
+    return recovered, debug
+
+
+def _recover_message_content(
+    message: dict[str, Any],
+    *,
+    bot_token: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     recovered = dict(message)
     gateway_content = raw_message_content(message)
     debug = {
@@ -341,6 +395,7 @@ def recover_message_for_routing(
     if not isinstance(fetched, dict) or not fetched:
         debug["content_source"] = "gateway_empty_rest_unavailable"
         return recovered, debug
+    debug["_fetched"] = fetched
     fetched_content = raw_message_content(fetched)
     debug["rest_content_length"] = len(fetched_content)
     debug["rest_fetch_succeeded"] = True
