@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pathlib
 import struct
 import tempfile
@@ -596,7 +598,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
         self.assertIsNone(common.load_chat_ingress("in-extmsg-bot-policy-208"))
         self.assertEqual(worker.runtime_state.snapshot()["ignored_messages"], 1)
 
-    def _bot_allowlist_room(self, *, bot_allowlist: list[str]) -> None:
+    def _bot_allowlist_room(self, *, bot_allowlist: list[str], ambient: bool = False) -> None:
         config = common.import_app_config(
             common.load_config(),
             {
@@ -614,6 +616,7 @@ class DiscordGatewayServiceTests(unittest.TestCase):
             "22",
             ["sky"],
             guild_id="1",
+            policy=({"ambient_read_enabled": True, "allow_untargeted_ambient_delivery": True} if ambient else None),
             channel_metadata={"channel_type": 0},
         )
 
@@ -640,6 +643,58 @@ class DiscordGatewayServiceTests(unittest.TestCase):
 
         self.assertEqual(outcome["status"], "delivered")
         deliver.assert_called_once()
+
+    def _grafana_embed_alert(self, message_id: str, *, embeds: list) -> dict:
+        # The shape Grafana really posts: empty content, the alert in an embed,
+        # no mention of the bot. Taken from the live #grafana-alerts message
+        # 1566846086902190091, which the ingress dropped as empty.
+        return {
+            "id": message_id,
+            "guild_id": "1",
+            "channel_id": "22",
+            "content": "",
+            "embeds": embeds,
+            "webhook_id": "grafana-hook",
+            "author": {"id": "grafana-hook", "username": "Grafana", "bot": True},
+        }
+
+    def test_embed_only_grafana_alert_is_delivered_with_its_embed_text(self) -> None:
+        # The live #grafana-alerts room delivers without a mention, as here.
+        self._bot_allowlist_room(bot_allowlist=["grafana-hook"], ambient=True)
+        embeds = [{
+            "title": "RESOLVED: SentryScrapeFailing",
+            "description": "Sentry scrape is back",
+            "fields": [{"name": "instance", "value": "cooljerk:9090"}],
+            "footer": {"text": "Grafana v11"},
+        }]
+        message = self._grafana_embed_alert("bot-embed-310", embeds=embeds)
+
+        with mock.patch.object(gateway_service, "fetch_message_via_rest", return_value=dict(message)), mock.patch.object(
+            common, "session_index_by_name", return_value={"sky": {"session_name": "sky", "state": "active"}}
+        ), mock.patch.object(common, "deliver_session_message", return_value={"status": "accepted", "id": "gc-1"}) as deliver:
+            outcome = gateway_service.process_inbound_message(message, bot_user_id="999")
+
+        self.assertEqual(outcome["status"], "delivered")
+        deliver.assert_called_once()
+        delivered = json.dumps(deliver.call_args.args) + json.dumps(deliver.call_args.kwargs, default=str)
+        self.assertIn("RESOLVED: SentryScrapeFailing", delivered)
+        self.assertIn("instance: cooljerk:9090", delivered)
+
+    def test_embed_recovered_from_rest_when_the_gateway_copy_has_none(self) -> None:
+        gateway_copy = self._grafana_embed_alert("bot-embed-311", embeds=[])
+        fetched = dict(gateway_copy, embeds=[{"title": "FIRING: GrafanaDown"}])
+        with mock.patch.object(gateway_service, "fetch_message_via_rest", return_value=fetched):
+            recovered, debug = gateway_service.recover_message_for_routing(gateway_copy)
+        self.assertEqual(recovered["content"], "FIRING: GrafanaDown")
+        self.assertEqual(debug["content_source"], "embed_fallback")
+        self.assertNotIn("_fetched", debug)
+
+    def test_message_with_no_content_and_no_embed_is_still_empty(self) -> None:
+        bare = self._grafana_embed_alert("bot-embed-312", embeds=[])
+        with mock.patch.object(gateway_service, "fetch_message_via_rest", return_value=dict(bare)):
+            recovered, debug = gateway_service.recover_message_for_routing(bare)
+        self.assertEqual(recovered["content"], "")
+        self.assertEqual(debug["content_source"], "gateway_empty_rest_empty")
 
     def test_bot_off_the_allowlist_is_still_ignored(self) -> None:
         self._bot_allowlist_room(bot_allowlist=["grafana-hook"])
